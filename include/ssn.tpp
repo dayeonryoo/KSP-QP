@@ -467,7 +467,8 @@ T exact_line_search(const SsnLineSearchParams<T>& p,
         const T dx_i = dx(i);
         const T li = lx(i), ui = ux(i);
 
-        if ((li > -inf && s_i < li - eps_zero) || (ui < inf && s_i > ui + eps_zero))
+        const T s_eps = s_i + eps_zero * dx_i; // position just after tau = 0
+        if ((li > -inf && s_eps < li) || (ui < inf && s_eps > ui))
             m += mu * dx_i * dx_i;
 
         if (std::abs(dx_i) < eps_direction) continue;
@@ -489,7 +490,8 @@ T exact_line_search(const SsnLineSearchParams<T>& p,
         const T dv_i = ls_dv_scratch(i);
         const T li = lw(i), ui = uw(i);
 
-        if ((li > -inf && v_i < li - eps_zero) || (ui < inf && v_i > ui + eps_zero))
+        const T v_eps = v_i + eps_zero * dv_i; // position just after tau = 0
+        if ((li > -inf && v_eps < li) || (ui < inf && v_eps > ui))
             m += mu / alpha * dv_i * dv_i;
 
         if (std::abs(dv_i) < eps_direction) continue;

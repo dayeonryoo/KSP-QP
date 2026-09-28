@@ -217,7 +217,8 @@ public:
                                       // be violated, so the capacitance math can't be trusted.
         MuChangedSinceSnapshot,       // mu drifted since the snapshot. The (1/mu)I block spans every
                                       // row of P/P_hat, so this is a full-rank shift.
-        RankZeroOrExceedsThreshold,   // Active-set delta rank is 0 or exceeds the SMW update-size threshold.
+        RankExceedsThreshold,         // Active-set delta rank exceeds the SMW update-size threshold.
+        ReusedSnapshot,               // Rank 0: the active sets match the snapshot, whose factorization is reused as is.
         SingularCapacitance,          // Capacitance matrix was (near-)singular; fell back to full rebuild.
     };
 
@@ -387,7 +388,8 @@ private:
     void build() {
         use_smw_ = false;
 
-        // Case 1. Skip build() and reuse the cached factorization via low-rank SMW update.
+        // Case 1. Skip build() and reuse the cached factorization, via a low-rank SMW update or,
+        // if the active sets are back to the snapshot's, as is.
         if (initialized_ && info_ == Eigen::Success && try_build_smw()) {
             rebuild_ = false;
             return;
@@ -595,10 +597,15 @@ private:
     }
 
     // SMW Setup Phase. Returns true and arms use_smw_ iff 0 < h+p+q <= kSmwRankThreshold.
+    // Also returns true, with use_smw_ left false, if h+p+q == 0: the cached factorization is reused.
     bool try_build_smw() {
         smw_last_reject_reason_ = SmwRejectReason::None;
         if (!smw_gate_open())              return false;
         if (!classify_active_set_delta())  return false;
+        if (h_ + p_ + q_ == 0) {           // P equals the snapshot's P_old
+            reuse_snapshot_factorization();
+            return true;
+        }
 
         const Mat M_sub = build_capacitance_setup();
         compute_y_all();
@@ -653,7 +660,7 @@ private:
     }
 
     // Phase 2: classify the active-set delta (K flips, W row add/delete) against the snapshot;
-    // reject if the resulting update rank is 0 or exceeds kSmwRankThreshold.
+    // reject if the resulting update rank exceeds kSmwRankThreshold.
     bool classify_active_set_delta() {
         s_old_ = static_cast<int>(G_old_.rows());
         const int N = static_cast<int>(G_old_.cols());
@@ -691,8 +698,8 @@ private:
         q_ = static_cast<int>(added_new_rows_.size());
         const int rank = h_ + p_ + q_;
         smw_last_rank_ = rank;
-        if (rank == 0 || rank > kSmwRankThreshold) {
-            smw_last_reject_reason_ = SmwRejectReason::RankZeroOrExceedsThreshold;
+        if (rank > kSmwRankThreshold) {
+            smw_last_reject_reason_ = SmwRejectReason::RankExceedsThreshold;
             return false;
         }
         return true;
@@ -845,18 +852,31 @@ private:
         smw_count_++;
     }
 
+    // Rank-0 case of try_build_smw(): the active sets are back to the snapshot's, so the cached
+    // factorization is exactly the current preconditioner. Reuse it without refactorizing.
+    void reuse_snapshot_factorization() {
+        V_plus_.resize(0, 0);
+        Y_all_.resize(0, 0);
+        s_current_        = s_old_;
+        mu_at_last_fact_  = mu_;   // equal to mu_old_ and rho_old_ (checked by smw_gate_open())
+        rho_at_last_fact_ = rho_;
+        pattern_dirty_    = false; // the cached symbolic analysis and values match P again
+        numeric_dirty_    = false;
+        smw_last_reject_reason_ = SmwRejectReason::ReusedSnapshot;
+    }
+
     // Helper: snapshot last full-rebuild state for next SMW attempt.
     void snapshot_state(bool structural_change) {
         if (structural_change) {
             G_old_        = *G_;
             active_K_old_ = *active_K_;
             if (active_W_) active_W_old_ = *active_W_;
+            snapshot_wiped_by_fail_streak_ = false; // only a structural snapshot restores what a fail streak wiped
         }
         H_diag_old_   = *H_diag_;
         mu_old_       = mu_;
         rho_old_      = rho_;
         has_snapshot_ = true;
-        snapshot_wiped_by_fail_streak_ = false;
     }
 
     // ------ Setup: external data ------
@@ -929,7 +949,7 @@ private:
     int  smw_fail_streak_ = 0;
     int  smw_fail_total_  = 0;
     static constexpr int    kMaxSmwFailStreak = 5;
-    static constexpr int    kSmwRankThreshold = 50; // try_build_smw() rejects rank 0 or rank > this.
+    static constexpr int    kSmwRankThreshold = 50; // try_build_smw() rejects rank > this; rank 0 reuses the snapshot.
     SmwRejectReason smw_last_reject_reason_ = SmwRejectReason::None;
     int             smw_last_rank_          = 0;
 

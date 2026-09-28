@@ -569,7 +569,7 @@ TEST(SmwBranch, FallsBackToFullRebuildWhenDeltaRankExceedsThreshold) {
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);
   EXPECT_EQ(prec.smw_last_rank(), N);
-  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankZeroOrExceedsThreshold);
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankExceedsThreshold);
 }
 
 TEST(SmwBranch, ForceFullRebuildBypassesEligibleSmw) {
@@ -1812,7 +1812,7 @@ TEST(SmwCumulativeUpdates, SmwSucceedsWhenDeltaRankExactlyEqualsThreshold) {
   EXPECT_TRUE(got.isApprox(P2.colPivHouseholderQr().solve(b), kTol));
 }
 
-TEST(SmwCumulativeUpdates, SmwRejectsZeroRankDeltaWithExplicitReason) {
+TEST(SmwCumulativeUpdates, SmwReusesSnapshotFactorizationOnZeroRankDelta) {
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});
   const SpMat G = DenseToSparse(G_dense);
@@ -1827,15 +1827,60 @@ TEST(SmwCumulativeUpdates, SmwRejectsZeroRankDeltaWithExplicitReason) {
   ASSERT_EQ(prec.fact_count(), 1);
 
   // Identical active_K/active_W/G, but rebuild=true forces build() to run try_build_smw() anyway:
-  // h=p=q=0 so the rank==0 sub-case of RankZeroOrExceedsThreshold fires specifically.
+  // h=p=q=0, so the cached factorization is exactly P and is reused without refactorizing.
   prec.arm(G, G_tr, f.H_diag, active_K, active_W, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/false, false);
   prec.compute(0);
 
   EXPECT_FALSE(prec.used_smw());
-  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 0);
-  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankZeroOrExceedsThreshold);
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ReusedSnapshot);
+
+  Eigen::VectorXd b(1);
+  b << 2.5;
+  const Eigen::MatrixXd P = DenseSchurComplement(G_dense, f.H_diag, {true, true, true}, f.mu);
+  EXPECT_TRUE(prec.solve(b).isApprox(P.colPivHouseholderQr().solve(b), kTol));
+}
+
+TEST(SmwCumulativeUpdates, ReuseAfterReturnToSnapshotSupportsLaterMuOnlyUpdate) {
+  // Flags as SSN::prepare_newton_system() sets them on an active-set change (rebuild and
+  // prec_pattern_changed both true). After the rank-0 reuse, a mu-only change must take the
+  // in-place path on the reused factorization and stay exact, for both callbacks.
+  for (const bool use_ldlt : {false, true}) {
+    Fixture f;
+    const RowMajorSpMat B_rm = f.B_rm();
+    const std::vector<bool> w = {false, false}, k0 = {true, true, true}, k1 = {true, true, false};
+    const Eigen::MatrixXd G_dense = f.StackG(w);
+    const SpMat G = DenseToSparse(G_dense);
+    const SpMat G_tr = DenseToSparse(G_dense.transpose());
+    const BoolArr active_W = ToBoolArr(w);
+    const BoolArr active_K0 = ToBoolArr(k0);
+    const BoolArr active_K1 = ToBoolArr(k1);
+
+    Prec prec;
+    prec.arm(G, G_tr, f.H_diag, active_K0, active_W, B_rm, f.mu, f.rho, true, true, use_ldlt);
+    prec.compute(0);
+    prec.arm(G, G_tr, f.H_diag, active_K1, active_W, B_rm, f.mu, f.rho, true, true, use_ldlt);
+    prec.compute(0);
+    ASSERT_TRUE(prec.used_smw()) << "use_ldlt=" << use_ldlt;
+    prec.arm(G, G_tr, f.H_diag, active_K0, active_W, B_rm, f.mu, f.rho, true, true, use_ldlt);
+    prec.compute(0);
+    EXPECT_FALSE(prec.used_smw()) << "use_ldlt=" << use_ldlt;
+    EXPECT_EQ(prec.fact_count(), 1) << "use_ldlt=" << use_ldlt;
+    EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ReusedSnapshot)
+        << "use_ldlt=" << use_ldlt;
+
+    const double mu2 = 2.0 * f.mu;
+    prec.arm(G, G_tr, f.H_diag, active_K0, active_W, B_rm, mu2, f.rho, false, false, use_ldlt);
+    prec.compute(0);
+    EXPECT_EQ(prec.fact_count(), 2) << "use_ldlt=" << use_ldlt;
+    Eigen::VectorXd b(1);
+    b << 2.5;
+    const Eigen::MatrixXd P = DenseSchurComplement(G_dense, f.H_diag, k0, mu2);
+    EXPECT_TRUE(prec.solve(b).isApprox(P.colPivHouseholderQr().solve(b), kTol))
+        << "use_ldlt=" << use_ldlt;
+  }
 }
 
 TEST(SmwCumulativeUpdates, SmwRejectsWithNoSnapshotAfterFailStreakClearsSnapshot) {
@@ -1868,6 +1913,48 @@ TEST(SmwCumulativeUpdates, SmwRejectsWithNoSnapshotAfterFailStreakClearsSnapshot
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::NoSnapshot);
+}
+
+TEST(SmwCumulativeUpdates, NumericOnlyRefactorAfterFailStreakWipeKeepsSnapshotInvalid) {
+  // After a fail-streak wipe, a mu-only (in-place) refactorization re-snapshots only H_diag/mu/rho.
+  // It must not mark the snapshot valid again: G_old_ and the old active sets are still empty, so an
+  // SMW attempt (or a rank-0 reuse) against them would read out of bounds or reuse a stale factor.
+  Fixture f;
+  const Eigen::MatrixXd G_dense = f.StackG({false, false});
+  const SpMat G = DenseToSparse(G_dense);
+  const SpMat G_tr = DenseToSparse(G_dense.transpose());
+  const BoolArr active_W = ToBoolArr({false, false});
+  const RowMajorSpMat B_rm = f.B_rm();
+  const std::vector<bool> k1 = {true, true, true}, k2 = {true, true, false};
+  const BoolArr active_K1 = ToBoolArr(k1);
+  const BoolArr active_K2 = ToBoolArr(k2);
+  const double mu2 = 2.0 * f.mu;
+
+  Prec prec;
+  prec.arm(G, G_tr, f.H_diag, active_K1, active_W, B_rm, f.mu, f.rho, true, true, false);
+  prec.compute(0);
+  for (int i = 0; i < 5; ++i) prec.record_smw_rebuild();  // wipes the snapshot, suppresses SMW
+  ASSERT_TRUE(prec.smw_suppressed());
+
+  // Suppressed: full refactorization without a snapshot.
+  prec.arm(G, G_tr, f.H_diag, active_K2, active_W, B_rm, f.mu, f.rho, true, true, false);
+  prec.compute(0);
+  prec.reset_smw_fail_streak();
+
+  // mu-only change with unchanged active sets: in-place refactorization, numeric-only snapshot.
+  prec.arm(G, G_tr, f.H_diag, active_K2, active_W, B_rm, mu2, f.rho, false, false, false);
+  prec.compute(0);
+
+  // Active-set change: the snapshot is still invalid, so no SMW and no reuse.
+  prec.arm(G, G_tr, f.H_diag, active_K1, active_W, B_rm, mu2, f.rho, true, true, false);
+  prec.compute(0);
+
+  EXPECT_FALSE(prec.used_smw());
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::NoSnapshot);
+  Eigen::VectorXd b(1);
+  b << 2.5;
+  const Eigen::MatrixXd P = DenseSchurComplement(G_dense, f.H_diag, k1, mu2);
+  EXPECT_TRUE(prec.solve(b).isApprox(P.colPivHouseholderQr().solve(b), kTol));
 }
 
 TEST(SmwCumulativeUpdates, SmwSuppressedExactlyAtFailStreakThresholdNotBelow) {
@@ -2437,26 +2524,26 @@ TEST(SnapshotDesync, RapidActiveSetOscillationNeverDriftsFromSnapshotClassificat
   EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
-  // Step 2: revert K col 2 -- exactly back to the snapshot's own state. Must be rejected as
-  // rank 0 (not silently treated as "still rank 1" or some other stale value) and force a
-  // fresh full rebuild, which becomes the new snapshot.
+  // Step 2: revert K col 2 -- exactly back to the snapshot's own state. Must be recognized as
+  // rank 0 (not silently treated as "still rank 1" or some other stale value), so the
+  // snapshot's factorization is exactly P and is reused without refactorizing.
   step(k_base, w_base);
   EXPECT_FALSE(prec.used_smw());
-  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 0);
-  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankZeroOrExceedsThreshold);
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ReusedSnapshot);
 
-  // Step 3: flip a *different* K column (col 1) off. rank=1 vs. the new snapshot.
+  // Step 3: flip a *different* K column (col 1) off. rank=1 vs. the snapshot.
   step({true, false, true}, {false, false});
   EXPECT_TRUE(prec.used_smw());
-  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
   // Step 4: revert col 1 and activate W row 0 in the same call. Net delta vs. the snapshot is
   // just the W row (K matches the snapshot again): rank=1.
   step({true, true, true}, {true, false});
   EXPECT_TRUE(prec.used_smw());
-  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
   // Step 5: deactivate W row 0 again (back to matching the snapshot) and flip K col 0 off in
@@ -2464,17 +2551,17 @@ TEST(SnapshotDesync, RapidActiveSetOscillationNeverDriftsFromSnapshotClassificat
   // state).
   step({false, true, true}, {false, false});
   EXPECT_TRUE(prec.used_smw());
-  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
-  // Step 6: revert everything -- exactly back to the (second) snapshot's state again. Must be
-  // rejected as rank 0 a second time, proving the zero-delta detection doesn't "wear out" or
-  // drift after repeated oscillation.
+  // Step 6: revert everything -- exactly back to the snapshot's state again. Must be recognized
+  // as rank 0 a second time, proving the zero-delta detection doesn't "wear out" or drift after
+  // repeated oscillation; the snapshot's factorization is reused again.
   step(k_base, w_base);
   EXPECT_FALSE(prec.used_smw());
-  EXPECT_EQ(prec.fact_count(), 3);
+  EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 0);
-  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankZeroOrExceedsThreshold);
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ReusedSnapshot);
 }
 
 TEST(SnapshotDesync, LongDeterministicOscillationMatchesIndependentlyComputedRankAtEveryStep) {
@@ -2482,8 +2569,8 @@ TEST(SnapshotDesync, LongDeterministicOscillationMatchesIndependentlyComputedRan
   const RowMajorSpMat B_rm = f.B_rm();
 
   // Each state is (K0, K1, K2, W0, W1). Includes a revisited non-snapshot state (s1 == s3) and
-  // two exact returns to the live snapshot (s8 == s0, s14 == s8), each of which must force a
-  // full rebuild (rank 0) rather than silently drifting.
+  // two exact returns to the live snapshot (s8 == s0, s14 == s8), each of which must be
+  // recognized as rank 0 and reuse the snapshot's factorization rather than silently drifting.
   struct State {
     bool k0, k1, k2, w0, w1;
   };
@@ -2533,17 +2620,18 @@ TEST(SnapshotDesync, LongDeterministicOscillationMatchesIndependentlyComputedRan
     }
     prec.compute(0);
 
-    if (i == 0 || expected_rank == 0) {
-      // Baseline, or an exact return to the current snapshot: must force a full rebuild.
+    if (i == 0) {
+      // Baseline: full factorization, which becomes the snapshot.
       EXPECT_FALSE(prec.used_smw()) << "step " << i;
       EXPECT_GT(prec.fact_count(), last_fact_count) << "step " << i;
-      if (i > 0) {
-        EXPECT_EQ(prec.smw_last_rank(), 0) << "step " << i;
-        EXPECT_EQ(prec.smw_last_reject_reason(),
-                  Prec::SmwRejectReason::RankZeroOrExceedsThreshold)
-            << "step " << i;
-      }
       snapshot = s;
+    } else if (expected_rank == 0) {
+      // Exact return to the current snapshot: its factorization is reused as is.
+      EXPECT_FALSE(prec.used_smw()) << "step " << i;
+      EXPECT_EQ(prec.fact_count(), last_fact_count) << "step " << i;
+      EXPECT_EQ(prec.smw_last_rank(), 0) << "step " << i;
+      EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ReusedSnapshot)
+          << "step " << i;
     } else {
       EXPECT_TRUE(prec.used_smw()) << "step " << i;
       EXPECT_EQ(prec.fact_count(), last_fact_count) << "step " << i;

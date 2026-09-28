@@ -71,15 +71,13 @@ PDE-constrained QPs are generated in Python (`python/pde_generator.py`) rather t
 driver, so that `include/` holds solver code only — see
 [the PDE benchmark](#pde-constrained-qp-benchmarks-smooth-l2-regularized) below.
 
-`ksp_qp_netlib` and `ksp_qp_maros_meszaros` each take `--name`, `--tol`,
-`--max-iter`, and `--time-limit` flags. `--name` picks a single problem to solve, or `all` to
-sweep every problem the driver knows about (both also
-take `--root` to point at a different data directory, and write a CSV when `--name all` is
-used). Run either of them with `--help` for the full flag list. Run them from the repo root so
-their default (relative) data paths resolve, or pass `--root`. Each driver still hardcodes its
-`PrintWhen`/`PrintWhat` settings and (beyond the flags above) some legacy alternates only
-reachable by editing `main()` — see
-["Running the C++ drivers"](#running-the-c-drivers) below.
+`ksp_qp_netlib` and `ksp_qp_maros_meszaros` each take `--name`, `--tol`, `--max-iter`, and
+`--time-limit` flags. `--name` picks a single problem to solve, or `all` to sweep the whole set
+and write a CSV (both also take `--root` and `--in` to point at a different data directory, and
+`ksp_qp_netlib` takes `--set feasible|infeasible`). Run either of them with `--help` for the
+full flag list. Run them from the repo root so their default (relative) data paths resolve, or
+pass `--root`. The `PrintWhen`/`PrintWhat` verbosity is the one setting still hardcoded in each
+driver's `main()` — see ["Running the C++ drivers"](#running-the-c-drivers) below.
 
 ### Option B — Python bindings
 
@@ -157,9 +155,9 @@ int main() {
     Solution<T> sol = solver.solve();
 
     sol.print_summary();
-    // sol.opt == 0  →  optimal
-    // sol.obj_val   →  optimal objective value
-    // sol.x         →  primal solution vector
+    // sol.opt == TerminationStatus::Optimal  →  optimal
+    // sol.obj_val                            →  optimal objective value
+    // sol.x                                  →  primal solution vector
     return 0;
 }
 ```
@@ -208,7 +206,7 @@ result = ksp_qp_bind.solve_from_sif(
 
 print("Status      :", result["status"])       # 0 = optimal
 print("Objective   :", result["obj_val"])
-print("Solve time  :", result["solving_time"], "s")
+print("Solve time  :", result["run_time"], "s")  # setup + solve
 print("PMM iters   :", result["pmm_iter"])
 print("SSN iters   :", result["ssn_iter"])
 print("Krylov iters:", result["krylov_iter"])
@@ -259,35 +257,58 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 
 | Field | Type | Description |
 |---|---|---|
-| `opt` | `int` | Termination status (see table below) |
+| `opt` | `TerminationStatus` | Termination status (see table below) |
 | `x` | `Vec` | Primal solution |
 | `y1` | `Vec` | Dual variables for `Ax = b` |
 | `y2` | `Vec` | Dual variables for `lw ≤ Bx ≤ uw` |
 | `z` | `Vec` | Dual variables for variable bounds |
 | `obj_val` | `T` | Primal objective value |
-| `PMM_iter` | `int` | PMM outer iterations performed |
-| `SSN_iter` | `int` | Total SSN inner iterations |
-| `Krylov_iter` | `int` | Total Krylov iterations |
-| `solving_time` | `double` | Wall-clock solve time in seconds |
+| `pmm_iter` | `int` | PMM outer iterations performed |
+| `ssn_iter` | `int` | Total SSN inner iterations |
+| `krylov_iter` | `int` | Total Krylov iterations |
+| `fact` | `int` | Preconditioner factorizations performed |
+| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates performed |
+| `pmm_tol_achieved` | `T` | Final PMM (outer) residual |
+| `ssn_tol_achieved` | `T` | Final SSN (inner) residual |
+| `setup_time` | `double` | Wall-clock seconds in the `KSP_QP<T>` constructor |
+| `solve_time` | `double` | Wall-clock seconds in `solve()` |
+| `run_time` | `double` | `setup_time + solve_time` |
+| `linesearch_fail` | `int` | Line-search failures |
+| `krylov_fail` | `int` | Krylov failures (fell back to a direct factorization) |
 
 ### Termination status codes
 
-| `opt` | Meaning |
-|---|---|
-| `0` | Optimal solution found |
-| `-2` | Primal infeasibility detected |
-| `-3` | Dual infeasibility detected |
-| `-1` | Numerical error |
-| `1` | Maximum PMM iterations reached |
-| `2` | Maximum SSN iterations reached |
-| `3` | Line search failed |
-| `4` | Time limit exceeded |
+`opt` is a scoped enum, `TerminationStatus` (`include/solution.hpp`); the underlying
+`int` values are what the result CSVs and the Python bindings report.
+
+| `TerminationStatus` | `int` | Meaning |
+|---|---|---|
+| `Optimal` | `0` | Optimal solution found |
+| `PrimalInfeasible` | `-2` | Primal infeasibility detected |
+| `DualInfeasible` | `-3` | Dual infeasibility detected |
+| `NumericalError` | `-1` | Numerical error (setup or solve exception) |
+| `MaxPmmIterations` | `1` | Maximum PMM iterations reached |
+| `MaxSsnIterations` | `2` | Maximum SSN iterations reached |
+| `TimeLimit` | `3` | Time limit exceeded |
+| `Interrupted` | `4` | Solve was interrupted before converging |
+
+`to_string(TerminationStatus)` gives the short label used by `print_summary()`.
 
 ### Python `ksp_qp_bind`
 
 **`solve_from_sif(filename, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0)`**
 Parse and solve a SIF/MPS file. Returns a dict with keys:
-`status`, `obj_val`, `solving_time`, `pmm_iter`, `ssn_iter`, `krylov_iter`.
+`status`, `obj_val`, `setup_time`, `solve_time`, `run_time`, `pmm_iter`, `ssn_iter`,
+`krylov_iter`, `fact`, `smw_count`, `pmm_tol_achieved`, `x`, `y1`, `y2`, `z`.
+`x` and the multipliers are returned in the original, unscaled units, so they can be
+checked directly against the problem data as given.
+
+**`solve_from_data(pd, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, trace_path="", rho_init=-1.0)`**
+Same, but takes already-parsed problem data — the dict returned by `parse_sif()`, or the one
+built by `pde_generator.py` / `mpc_generator.py`. Returns the same keys as `solve_from_sif`.
+`trace_path` is diagnostic-only: when set, it writes a per-iteration CSV trace (active-set
+sizes, `mu`, `rho`, residuals) and turns on per-inner-iteration reporting, which has
+non-trivial overhead — leave it empty for timing runs.
 
 **`parse_sif(filename)`**
 Parse a SIF/MPS file and return problem data as numpy arrays.
@@ -306,30 +327,51 @@ to point at your clone from elsewhere. No editing or rebuilding is needed just t
 ### `ksp_qp_netlib` — Netlib LPs (`src/netlib.cpp`)
 
 ```bash
-./build/ksp_qp_netlib [--root DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--out FILE]
+./build/ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all] \
+                      [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S] [--ref FILE]
 ```
 
-Solves `<root>/<PROBLEM>.mps` (default: `data/netlib/AFIRO.mps`), printing the solution summary.
-Pass `--name all` to sweep every Netlib LP with a known reference objective value (the same
-`name -> obj_val` map used historically), checking each result against it and appending a row
-to `<root>/results/netlib_all.csv` (override with `--out`). For a QPALM/OSQP comparison with
-performance profiles, use `python/benchmark_netlib.py` instead (see below).
+`--set` picks the problem set and, with it, the default input directory, default problem, and
+default output CSV:
 
-Two infeasibility-detection alternates are also included, commented out at the bottom of the
-file (sweep the Netlib-infeasible set, or solve one infeasible LP by name) — these predate
-`--name` and still require editing `main()` (uncomment, remove the `/* ... */`, rebuild) since
-they check for *detected infeasibility* rather than an objective value.
+| `--set` | Directory | Default `--name` | Success criterion |
+|---|---|---|---|
+| `feasible` (default) | `data/netlib-main/feasible/` | `AFIRO` | Objective matches the reference value |
+| `infeasible` | `data/netlib-main/infeasible/` | `KLEIN1` | Solver *detects* infeasibility |
+
+With a problem name it solves that one LP and prints the solution summary (`--set infeasible`
+also prints a feasibility breakdown of the final iterate, showing *how* the problem fails to
+admit a solution). Names are case-insensitive; the `.mps` files themselves are lowercase.
+
+Pass `--name all` to sweep the set, appending a row per problem to
+`<root>/results/netlib_feasible_all.csv` or `<root>/results/netlib_infeasible_all.csv`
+(override with `--out`). The sweep is the directory listing, so adding or removing an `.mps`
+file is all it takes to change the set — the same convention `python/benchmark_netlib.py` uses.
+
+Both sets write the same CSV schema (`include/record_result.hpp`). Two columns are read
+differently per set: on the infeasible set `agree` means "infeasibility was detected" (rather
+than "objective matched"), `abs_err`/`rel_err` are `-1` since there is no objective to compare,
+and `diverged` is always `0` because a large residual is the expected outcome there.
+
+Reference objectives for the feasible set are not hardcoded — they ship with the dataset in
+`data/netlib-main/feasible_gurobi_1e-8.csv` (Gurobi 10 at 1e-8; override with `--ref`). Those
+disagree with the long-standing published Netlib optima on a handful of problems (E226 and
+CRE-A among them), so treat either source with care.
+
+For a QPALM/OSQP comparison with performance profiles, use `python/benchmark_netlib.py` and
+`python/benchmark_infeas.py` instead (see below).
 
 ### `ksp_qp_maros_meszaros` — Maros-Meszaros QPs (`src/maros_meszaros.cpp`)
 
 ```bash
-./build/ksp_qp_maros_meszaros [--root DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S]
+./build/ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S]
 ```
 
 Solves `<root>/<PROBLEM>.SIF` (default: `data/maros_meszaros/AUG2DCQP.SIF`), printing the
 solution summary. Pass `--name all` to sweep the full Maros-Meszaros set against its built-in
 reference objectives, appending a row to `<root>/results/maros_meszaros_all.csv` (override with
-`--out`) for each — `--cooldown` (default 0s) sleeps between problems in this mode.
+`--out`) for each — `--cooldown` (default 3s) sleeps between problems in this mode, which keeps
+a long sweep from being distorted by CPU thermal throttling.
 
 For comparing against QPALM/OSQP rather than just checking against reference objectives, use
 the Python benchmark instead (see below) — that's what produces performance profiles.
@@ -397,9 +439,32 @@ cd python
 python3 benchmark_netlib.py
 ```
 
-Runs the full Netlib LP test set. Writes `results/comparison_netlib.csv` plus Dolan-Moré
-performance profiles (`results/performance_profile_netlib*.pdf/.png`). Same flags as
-`benchmark_mm.py`.
+Runs the full Netlib LP test set (`data/netlib-main/feasible/`, 114 instances). Writes
+`results/comparison_netlib.csv` plus Dolan-Moré performance profiles
+(`results/performance_profile_netlib*.pdf/.png`). Same flags as `benchmark_mm.py`.
+
+### Netlib infeasible LP benchmark
+
+```bash
+cd python
+python3 benchmark_infeas.py
+```
+
+Runs the 29 primal-infeasible Netlib instances (`data/netlib-main/infeasible/`). Every problem
+is known to be infeasible, so the metric is *detection*, not solve time: a solver succeeds when
+it terminates with an infeasibility status. Writes `results/comparison_infeas.csv` with a
+`*_detected` column per solver and the raw `*_status` alongside, so primal-vs-dual infeasibility
+and the failure modes (time limit, iteration cap, or a false claim of optimality) stay
+recoverable.
+
+```
+--root DIR             override project root (default: parent of script)
+--tol 1e-6             solver tolerance
+--time-limit 60        per-solver time limit in seconds
+--solver {ksp-qp,qpalm,osqp} [...]   default: all three
+--out PREFIX           output file prefix (default: comparison_infeas)
+--cooldown 0           seconds between solver runs
+```
 
 ### PDE-constrained QP benchmarks (smooth, L2-regularized)
 
@@ -424,6 +489,65 @@ Produces three tables — `poisson_control`, `poisson_state`, `convdiff_both` �
 --discretization {fem,fd}   spatial discretization (default: fem)
 --out PREFIX            output file prefix
 ```
+
+### MPC benchmark (platoon / vehicle-chain)
+
+```bash
+cd python
+python3 benchmark_mpc.py --out 0926          # -> results/0926_mpc_sweep.csv
+```
+
+Benchmarks KSP-QP against QPALM on the platoon linear-MPC QP built by `mpc_generator.py` — a
+native smooth QP (quadratic tracking cost, linear dynamics equalities, box bounds, no general
+inequality rows) whose constraint matrix is banded with at most 6 nonzeros per row.
+
+The problem has **two** size axes and they are not interchangeable, so the sweep is a grid
+rather than a curve: `M` (vehicle count) grows the band *width* and the dense `2M × 2M` DARE
+terminal cost block, while `N` (horizon) grows the band *length* at fixed bandwidth. Sweeping
+one at a time through the corner of the `(M, N)` plane is misleading. Output is long format —
+one row per (instance × solver × repeat) — in `results/<prefix>_mpc_sweep.csv`.
+
+```
+--root DIR             override project root (default: parent of script)
+--tol 1e-6             solver tolerance
+--time-limit 300       per-problem time limit in seconds
+--M 5 10 20 50 100 200 300   vehicle counts to sweep
+--N 20 50 100 200 400        horizons to sweep
+--max-nz 65000         skip (M, N) configurations larger than this nonzero count
+--T 6                  MPC rollout steps per configuration
+--reps 4               timed repeats per instance (repeat 0 is discarded as warm-up)
+--solver {ksp-qp,qpalm} [...]   default: both
+--loop-mode {shared,own}        default: shared
+--cooldown 0           seconds to sleep between problems
+--out PREFIX           output file prefix
+```
+
+`validate_mpc_generator.py` checks the generated QPs independently (DARE residual, dynamics
+consistency, KKT conditions of the solved instance) — run it after changing the generator:
+
+```bash
+cd python
+python3 validate_mpc_generator.py [--max-M N]
+```
+
+---
+
+## Tests
+
+```bash
+# C++ (GoogleTest, built by the main CMakeLists when KSP_QP_BUILD_TESTS=ON, the default)
+cmake --build build
+ctest --test-dir build --output-on-failure
+
+# Python generators (unittest)
+cd python
+python3 -m unittest discover -s tests -v
+```
+
+The C++ suite is one binary per header under test, mirroring `include/` — a broken
+`solution` test cannot stop the `ssn` tests from running, and each binary stays fast to
+rebuild while iterating. The Python suite covers the PDE generators (`fem_q1.py`,
+`pde_generator.py`) and a KKT-residual check.
 
 ---
 
@@ -498,38 +622,60 @@ across iterations.
 
 ## Project structure
 
+The solver is header-only: everything under `include/` is the library, and `src/` holds only
+benchmark drivers.
+
 ```
 KSP-QP/
-├── include/
-│   ├── problem.hpp          # Problem data structure
-│   ├── solution.hpp         # Solution data structure
-│   ├── ksp_qp.hpp/.tpp     # Main solver
-│   ├── ssn.hpp/.tpp         # SSN inner solver
-│   ├── mps_format_parser.hpp/.tpp # MPS/SIF/QPS file parser
-│   ├── ksp_qp_types.hpp       # ParsedModel/KSPQPdata data structures
-│   ├── schur_operator.hpp    # Schur complement linear operator
-│   ├── schur_preconditioner.hpp
-│   ├── printing.hpp         # PrintWhen/PrintWhat runtime printing
-│   └── record_result.hpp
-├── src/
-│   ├── netlib.cpp           # Netlib LP benchmark runner
-│   └── maros_meszaros.cpp   # Maros-Meszaros QP benchmark runner
+├── include/                            # header-only solver library
+│   ├── ksp_qp.hpp/.tpp                 # PMM outer loop (main solver)
+│   ├── ssn.hpp/.tpp                    # semismooth Newton inner solver
+│   ├── schur_operator.hpp              # Schur complement as a matrix-free linear operator
+│   ├── schur_preconditioner.hpp        # preconditioner (factorization reuse, SMW low-rank updates)
+│   ├── problem.hpp                     # Problem<T>: problem data + solver settings
+│   ├── solution.hpp                    # Solution<T> and the TerminationStatus enum
+│   ├── ksp_qp_types.hpp                # ParsedModel / KSPQPdata data structures
+│   ├── mps_format_parser.hpp/.tpp      # MPS / SIF / QPS file parser
+│   ├── printing.hpp                    # PrintWhen / PrintWhat runtime printing
+│   ├── record_result.hpp               # TestResult + benchmark CSV writers
+│   └── cli_args.hpp                    # minimal --flag value parsing for the drivers
+├── src/                                # benchmark drivers (no solver code)
+│   ├── netlib.cpp                      # Netlib LP driver (--set feasible|infeasible)
+│   └── maros_meszaros.cpp              # Maros-Meszaros QP driver
+├── tests/                              # GoogleTest suite, one binary per header
+│   ├── test_ksp_qp.cpp
+│   ├── test_ssn.cpp
+│   ├── test_schur_operator.cpp
+│   ├── test_schur_preconditioner.cpp
+│   ├── test_mps_format_parser.cpp
+│   ├── test_problem.cpp
+│   ├── test_solution.cpp
+│   ├── test_printing.cpp
+│   └── CMakeLists.txt
 ├── python/
-│   ├── ksp_qp_bind.cpp          # pybind11 bindings
-│   ├── fem_q1.py                 # Q1 finite-element reference-element kernels
-│   ├── pde_generator.py          # Builds PDE-constrained QPs (Q1 FEM / FD)
-│   ├── benchmark_common.py       # shared QPALM/OSQP conversion + runner helpers
-│   ├── benchmark_mm.py           # Maros-Meszaros benchmark vs QPALM/OSQP
-│   ├── benchmark_netlib.py       # Netlib LP benchmark vs QPALM/OSQP
-│   ├── benchmark_infeas.py       # infeasible-instance benchmark vs QPALM/OSQP
-│   ├── benchmark_l2pde.py        # L2 PDE-constrained benchmark vs QPALM/OSQP
-│   ├── tests/                    # unittest suite for the Python generators
-│   └── CMakeLists.txt            # Python binding build config
+│   ├── ksp_qp_bind.cpp                 # pybind11 bindings
+│   ├── fem_q1.py                       # Q1 finite-element reference-element kernels
+│   ├── pde_generator.py                # builds PDE-constrained QPs (Q1 FEM / FD)
+│   ├── mpc_generator.py                # builds platoon linear-MPC QPs
+│   ├── validate_mpc_generator.py       # independent checks on the generated MPC QPs
+│   ├── benchmark_common.py             # shared QPALM/OSQP conversion + runner helpers
+│   ├── benchmark_mm.py                 # Maros-Meszaros benchmark vs QPALM/OSQP
+│   ├── benchmark_netlib.py             # Netlib LP benchmark vs QPALM/OSQP
+│   ├── benchmark_infeas.py             # Netlib infeasible-set detection benchmark
+│   ├── benchmark_l2pde.py              # L2 PDE-constrained benchmark vs QPALM/OSQP
+│   ├── benchmark_mpc.py                # platoon MPC benchmark vs QPALM
+│   ├── tests/                          # unittest suite for the Python generators
+│   └── CMakeLists.txt                  # Python binding build config
 ├── data/
-│   ├── netlib/              # Netlib LP instances (.mps)
-│   ├── netlib_infeas/       # Infeasible Netlib instances (.mps)
-│   ├── maros_meszaros/      # Maros-Meszaros QP instances (.SIF)
-│   └── kennington/          # Kennington LP instances (.mps)
-├── results/                 # Output CSVs and plots
-└── CMakeLists.txt           # Main build configuration
+│   ├── maros_meszaros/                 # Maros-Meszaros QP instances (.SIF)
+│   └── netlib-main/
+│       ├── feasible/                   # 114 feasible Netlib LPs (.mps, lowercase names)
+│       ├── infeasible/                 # 29 primal-infeasible Netlib LPs (.mps)
+│       ├── netlib_grbp/                # the feasible set presolved by Gurobi
+│       └── feasible_gurobi_1e-8.csv    # reference optimal objectives
+├── results/                            # generated CSVs and plots (git-ignored)
+└── CMakeLists.txt                      # main build configuration
 ```
+
+The Kennington family (`CRE-*`, `KEN-*`, `OSA-*`, `PDS-*`) is blended into
+`data/netlib-main/feasible/` rather than kept in a separate directory.

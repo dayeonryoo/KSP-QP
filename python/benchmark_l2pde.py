@@ -41,7 +41,7 @@ Settings: tol = 1e-6, time limit = 600 s (10 min), max iterations = infinity by 
         --out:        to prepend a prefix to the output filenames (default: none, i.e. l2_*.csv).
         --solver:     to select which solvers to run among ksp-qp, qpalm, osqp (default: all three).
         --table:      to select which tables to run among poisson_control, poisson_state, convdiff_both (default: all three).
-        --nc:         to select which grid exponents to run for vary-n tables (default: 7 8 9 10; see sweep parameters).
+        --nc:         to select which grid exponents to run for vary-n tables (default: 5 6 7 8 9 10; see sweep parameters).
         --tol:        to change the solver tolerance (default: 1e-6).
         --time-limit: to change the solver time limit in seconds (default: 600).
         --cooldown:   to change the cooldown time in seconds between solver runs (default: 0).
@@ -87,22 +87,29 @@ DEFAULT_EPS = 0.01
 INF = math.inf
 
 # 2D Poisson control, control-constrained (0 <= u <= u_upper)
-TABLE1_NC    = [7, 8, 9, 10]
-TABLE1_BETAS = [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
-TABLE1_U_UPPER = {
-    1.0: 0.01, 1e-1: 0.1, 1e-2: 1.0, 1e-3: 3.0, 1e-4: 20.0, 1e-5: 100.0, 1e-6: 300.0,
-}
+TABLE1_NC    = [5, 6, 7, 8, 9, 10]
+TABLE1_BETAS = [1e-2]
+TABLE1_U_UPPER = {1e-2: 1.0}
+# TABLE1_BETAS = [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
+# TABLE1_U_UPPER = {
+#     1.0: 0.01, 1e-1: 0.1, 1e-2: 1.0, 1e-3: 3.0, 1e-4: 20.0, 1e-5: 100.0, 1e-6: 300.0,
+# }
 
 # 2D Poisson control, state-constrained (-0.1 <= y <= y_upper)
-TABLE2_NC    = [7, 8, 9, 10]
-TABLE2_BETAS = [1.0, 1e-2, 1e-4, 1e-6]
-TABLE2_Y_UPPER = {1.0: 0.002, 1e-2: 0.175, 1e-4: 0.9, 1e-6: 1.0}
+TABLE2_NC    = [5, 6, 7, 8, 9, 10]
+TABLE2_BETAS = [1e-2]
+TABLE2_Y_UPPER = {1e-2: 0.175}
+# TABLE2_BETAS = [1.0, 1e-2, 1e-4, 1e-6]
+# TABLE2_Y_UPPER = {1.0: 0.002, 1e-2: 0.175, 1e-4: 0.9, 1e-6: 1.0}
 
 # 2D convection-diffusion control, both state and control bounds
-TABLE3_NC    = [7, 8, 9, 10]
-TABLE3_BETAS = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5]
-TABLE3_Y_UPPER = {1e-1: 0.2, 1e-2: 0.5, 1e-3: 0.5, 1e-4: 0.75, 1e-5: 0.75}
-TABLE3_U_BOUND = {1e-1: 0.75, 1e-2: 2.0, 1e-3: 3.0, 1e-4: 5.0, 1e-5: 6.0}
+TABLE3_NC    = [5, 6, 7, 8, 9, 10]
+TABLE3_BETAS = [1e-2]
+TABLE3_Y_UPPER = {1e-2: 0.5}
+TABLE3_U_BOUND = {1e-2: 2.0}
+# TABLE3_BETAS = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5]
+# TABLE3_Y_UPPER = {1e-1: 0.2, 1e-2: 0.5, 1e-3: 0.5, 1e-4: 0.75, 1e-5: 0.75}
+# TABLE3_U_BOUND = {1e-1: 0.75, 1e-2: 2.0, 1e-3: 3.0, 1e-4: 5.0, 1e-5: 6.0}
 
 ALL_TABLES = ["poisson_control", "poisson_state", "convdiff_both"]
 

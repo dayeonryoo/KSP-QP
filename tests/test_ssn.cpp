@@ -620,6 +620,54 @@ TEST(ExactLineSearch, SlopeSafeguardHandlesNearZeroAccumulatedSlopeFromRounding)
   EXPECT_GT(tau, 1.0);
 }
 
+TEST(ExactLineSearch, CountsOutwardMovingComponentOnABoundInTheInitialSlope) {
+  // s(0) = z/mu + x_curr = 0 lies exactly on lx = 0 and dx = -1 moves it outward, so it is
+  // outside K for every t > 0 and adds mu*dx^2 = 1 to the slope from t = 0 on.
+  // eta = dx^2/rho = 1, zeta = c*dx = -1, dist_K_s = 0, so psi'(t) = -1 + 2t and tau = 0.5
+  // (ignoring the bound would give tau = 1).
+  LineSearchCase lc(1);
+  lc.lx(0) = 0.0;
+  lc.ux(0) = std::numeric_limits<double>::infinity();
+  lc.c(0) = 1.0;
+  const auto p = lc.Params();
+
+  Vec x_curr = Vec::Zero(1), y2_curr = Vec::Zero(0), dx(1), dy2 = Vec::Zero(0);
+  dx << -1.0;
+  Vec Ax = Vec::Zero(0), Bx = Vec::Zero(0), Adx = Vec::Zero(0), Bdx = Vec::Zero(0);
+  Vec dist_K_s = Vec::Zero(1), dist_W_v = Vec::Zero(0);
+  Vec ls_s(1), ls_v(0), ls_dv(0);
+  std::vector<SsnBreakpoint<double>> breakpoints;
+
+  const double tau = exact_line_search(p, x_curr, y2_curr, dx, dy2, Ax, Bx, Adx, Bdx, dist_K_s,
+                                        dist_W_v, ls_s, ls_v, ls_dv, breakpoints);
+  EXPECT_NEAR(tau, 0.5, 1e-12);
+}
+
+TEST(ExactLineSearch, CountsOutwardMovingWComponentOnABoundInTheInitialSlope) {
+  // W-block analogue: K is unbounded, B = [1], v(0) = B x_curr = 0 lies exactly on lw = 0 and
+  // dv = B dx = -1 moves it outward. With alpha = 1: eta = 1, zeta = -1, dist_W_v = 0, and the
+  // outward W component adds mu/alpha*dv^2 = 1 to the slope, so tau = 0.5.
+  LineSearchCase lc(1, /*l=*/1);
+  lc.lx(0) = -std::numeric_limits<double>::infinity();
+  lc.ux(0) = std::numeric_limits<double>::infinity();
+  lc.lw(0) = 0.0;
+  lc.uw(0) = std::numeric_limits<double>::infinity();
+  lc.c(0) = 1.0;
+  const auto p = lc.Params();
+
+  Vec x_curr = Vec::Zero(1), y2_curr = Vec::Zero(1), dx(1), dy2 = Vec::Zero(1);
+  dx << -1.0;
+  Vec Ax = Vec::Zero(0), Bx = Vec::Zero(1), Adx = Vec::Zero(0), Bdx(1);
+  Bdx << -1.0;
+  Vec dist_K_s = Vec::Zero(1), dist_W_v = Vec::Zero(1);
+  Vec ls_s(1), ls_v(1), ls_dv(1);
+  std::vector<SsnBreakpoint<double>> breakpoints;
+
+  const double tau = exact_line_search(p, x_curr, y2_curr, dx, dy2, Ax, Bx, Adx, Bdx, dist_K_s,
+                                        dist_W_v, ls_s, ls_v, ls_dv, breakpoints);
+  EXPECT_NEAR(tau, 0.5, 1e-12);
+}
+
 // =====================================================================================
 // Tests for solve_ssn()'s decomposed per-iteration phases
 // =====================================================================================

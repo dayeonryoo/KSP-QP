@@ -13,12 +13,18 @@ CMakeFiles/
 cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
+compile_commands.json
 
 ############################################
 # CMake presets (user / local)
 ############################################
 CMakeUserPresets.json
 CMakePresets.json
+
+############################################
+# CTest scratch output
+############################################
+Testing/
 
 ############################################
 # Compiled objects / binaries
@@ -31,12 +37,10 @@ CMakePresets.json
 *.dylib
 *.dll
 *.exe
-*.out
 
 ############################################
 # Debug / profiling
 ############################################
-*.log
 *.tmp
 *.prof
 *.gprof
@@ -47,6 +51,8 @@ core.*
 ############################################
 # IDE / Editor files
 ############################################
+# Machine-specific (compiler paths, IntelliSense config); each developer keeps
+# their own, as is conventional for open-source C++ solvers.
 .vscode/
 .idea/
 .claude/
@@ -64,21 +70,29 @@ core.*
 Thumbs.db
 
 ############################################
-# Python (if used for plotting / testing)
+# Python (bindings, generators, benchmarks)
 ############################################
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 .venv/
+venv/
 .env
+# pybind11 module built in place by python/CMakeLists.txt
+python/ksp_qp_bind*.so
 
 ############################################
-# Personal experiment data and results (not for upload)
+# Benchmark output (CSVs, performance profiles)
+#
+# Regenerate with python/benchmark_*.py or the C++ drivers' --name all sweeps.
+# Note that data/ is deliberately NOT ignored: the Maros-Meszaros and Netlib
+# instances are tracked so benchmarks are reproducible from a fresh clone.
 ############################################
 results/
 
 ############################################
-# LaTeX / notes (if you keep derivations)
+# LaTeX / notes
 ############################################
 *.aux
 *.log
