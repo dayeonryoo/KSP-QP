@@ -284,9 +284,9 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `TerminationStatus` | `int` | Meaning |
 |---|---|---|
 | `Optimal` | `0` | Optimal solution found |
+| `NumericalError` | `-1` | Numerical error (setup or solve exception) |
 | `PrimalInfeasible` | `-2` | Primal infeasibility detected |
 | `DualInfeasible` | `-3` | Dual infeasibility detected |
-| `NumericalError` | `-1` | Numerical error (setup or solve exception) |
 | `MaxPmmIterations` | `1` | Maximum PMM iterations reached |
 | `MaxSsnIterations` | `2` | Maximum SSN iterations reached |
 | `TimeLimit` | `3` | Time limit exceeded |
@@ -426,7 +426,7 @@ performance profiles (`results/performance_profile_mm*.pdf/.png`, by time and by
 ```
 --root DIR             override project root (default: parent of script)
 --tol 1e-6             primal-dual tolerance
---time-limit 600       per-problem time limit in seconds
+--time-limit 60        per-problem time limit in seconds
 --solver {ksp-qp,qpalm,osqp} [...]   which solvers to run (default: all three)
 --out PREFIX           output file prefix (default: comparison_mm)
 --cooldown 0           seconds to sleep between problems (avoids CPU throttling)
