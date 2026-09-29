@@ -113,7 +113,7 @@ public:
 
     // set_L_from_LLT regularization constants (see ksp_qp.tpp): on a negative LDLT pivot beyond
     // noise level, the diagonal regularization is escalated by 10x, up to this many attempts.
-    static constexpr int kLdltMaxAttempts = 6;
+    static constexpr int kLdltMaxAttempts = 4;
     static constexpr T   kLdltVerifyTol   = T(1e-5);
 
     // Constant parameters

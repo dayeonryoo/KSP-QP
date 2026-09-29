@@ -405,6 +405,13 @@ res = ksp_qp_bind.solve_from_data(pd, 1e-6, 10**9, 600.0)
 consistent Q1 mass matrix for the lumped one, and `discretization` selects `"fem"` (default)
 or `"fd"` (5-point stencil with first-order upwind convection; always lumped).
 
+The generated QP is normalized by the mesh size `h = 2^-nc`: the objective and the interior
+(non-Dirichlet) rows of the state equation are divided by `h²` (`scale_by_mesh_size`). Every
+mass-matrix entry is O(h²), so without this the KKT residuals, and with them every solver's
+stopping test, would shrink as O(h²), making a fixed `tol` less demanding on finer meshes. The
+solution `x = [y; u]` is unchanged, but objective values, including the `*_obj` columns written
+by `benchmark_l2pde.py`, come out divided by `h²`.
+
 ---
 
 ## Running the benchmarks
@@ -482,7 +489,7 @@ Produces three tables — `poisson_control`, `poisson_state`, `convdiff_both` �
 --tol 1e-6              solver tolerance
 --time-limit 600        per-problem time limit in seconds (10 min default)
 --table {poisson_control,poisson_state,convdiff_both} [...]   default: all three
---nc N [N ...]          grid exponents to sweep (default: 7 8 9 10)
+--nc N [N ...]          grid exponents to sweep (default: 5 6 7 8 9)
 --solver {ksp-qp,qpalm,osqp} [...]   default: all three
 --cooldown 0            seconds to sleep between problems
 --lumped-mass {0,1}     0 = consistent mass matrix (default), 1 = lumped

@@ -24,7 +24,7 @@ to get the numpy/CSC dict that ksp_qp_bind.solve_from_data() and
 benchmark_common.kspqp_to_qpalm() consume.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import numpy as np
@@ -554,9 +554,43 @@ def make_problem_l2_from_mats(D_op, M, rhs, yhat, beta,
                      obj_const=obj_const)
 
 
+# -----------------------------------------------------------------------
+# Mesh-size normalization, applied to the assembled QP as a final step:
+#
+#   Q, c, obj_const  <-  (Q, c, obj_const) / h^2
+#   A(r,:), b_r      <-  (A(r,:), b_r) / h^2       for r not in bc_nodes
+#
+# On the uniform grid (h = 2^-nc) every entry of M is O(h^2) -- exactly h^2
+# on the lumped interior diagonal, h^2 times a fixed stencil for the
+# consistent mass -- and hence so are Q and c. An interior row
+# D_op*y - M*u - rhs of the state equation is O(h^2) as well at smooth
+# (y, u), since D_op*y ~ h^2 * (D y)(x_p) there. Left as is, every KKT
+# residual block shrinks as O(h^2) under refinement, so a fixed solver tol
+# becomes less demanding as the mesh is refined; dividing by h^2 brings them
+# all to the mesh-independent O(1) scale of the continuous optimality system.
+# The Dirichlet rows y_p = g_p set by apply_dirichlet_bc are already O(1)
+# and are left alone.
+#
+# The primal solution x = [y; u] is unchanged. The multipliers change as
+# z -> z / h^2 and, on the Dirichlet rows only, y1 -> y1 / h^2; the interior
+# entries of y1 (the discrete adjoint) are unchanged. h is a power of two, so
+# the scaling is exact in floating point.
+# -----------------------------------------------------------------------
+
+def scale_by_mesh_size(pb, bc_nodes, h):
+    """Returns a copy of pb with the objective and the interior rows of
+    A x = b divided by h^2. pb is not modified in place."""
+    inv_h2 = 1.0 / (h * h)
+    row_scale = np.full(pb.m, inv_h2)
+    row_scale[np.asarray(bc_nodes, dtype=np.int64)] = 1.0
+    return replace(pb, Q=(inv_h2 * pb.Q).tocsc(), c=inv_h2 * pb.c,
+                   obj_const=inv_h2 * pb.obj_const,
+                   A=(sp.diags(row_scale) @ pb.A).tocsc(), b=row_scale * pb.b)
+
+
 # ===== QP generators =====
 # All three are the L2-regularized PDE-constrained control problems of
-# (Pearson & Gondzio, 2017).
+# (Pearson & Gondzio, 2017), normalized by the mesh size (scale_by_mesh_size).
 
 
 def make_poisson_l2_control(nc, beta, y_lower=-INF, y_upper=INF,
@@ -581,8 +615,9 @@ def make_poisson_l2_control(nc, beta, y_lower=-INF, y_upper=INF,
     D, rhs = apply_dirichlet_bc(D, rhs, bc_nodes, np.zeros(bc_nodes.size))
     M = apply_dirichlet_bc_mass(M, bc_nodes)
 
-    return make_problem_l2_from_mats(D, M, rhs, yhat, beta,
-                                     y_lower, y_upper, u_lower, u_upper)
+    pb = make_problem_l2_from_mats(D, M, rhs, yhat, beta,
+                                   y_lower, y_upper, u_lower, u_upper)
+    return scale_by_mesh_size(pb, bc_nodes, g.x1d[1] - g.x1d[0])
 
 
 def make_poisson_l2_state_control(nc, beta, y_lower=-INF, y_upper=INF,
@@ -607,8 +642,9 @@ def make_poisson_l2_state_control(nc, beta, y_lower=-INF, y_upper=INF,
     D, rhs = apply_dirichlet_bc(D, rhs, bc_nodes, yhat[bc_nodes])
     M = apply_dirichlet_bc_mass(M, bc_nodes)
 
-    return make_problem_l2_from_mats(D, M, rhs, yhat, beta,
-                                     y_lower, y_upper, u_lower, u_upper)
+    pb = make_problem_l2_from_mats(D, M, rhs, yhat, beta,
+                                   y_lower, y_upper, u_lower, u_upper)
+    return scale_by_mesh_size(pb, bc_nodes, g.x1d[1] - g.x1d[0])
 
 
 def make_convdiff_l2_control(nc, beta, y_lower=-INF, y_upper=INF,
@@ -634,8 +670,9 @@ def make_convdiff_l2_control(nc, beta, y_lower=-INF, y_upper=INF,
     D, rhs = apply_dirichlet_bc(D, rhs, bc_nodes, np.zeros(bc_nodes.size))
     M = apply_dirichlet_bc_mass(M, bc_nodes)
 
-    return make_problem_l2_from_mats(D, M, rhs, yhat, beta,
-                                     y_lower, y_upper, u_lower, u_upper)
+    pb = make_problem_l2_from_mats(D, M, rhs, yhat, beta,
+                                   y_lower, y_upper, u_lower, u_upper)
+    return scale_by_mesh_size(pb, bc_nodes, g.x1d[1] - g.x1d[0])
 
 
 _L2_GENERATORS = {
@@ -663,6 +700,12 @@ def generate_pde_l2_qp(choice, nc, beta, y_lower=-INF, y_upper=INF,
                   discretization='fd'.
     discretization = 'fem' (default, Q1 finite elements) or 'fd' (5-point
                   finite-difference stencil with first-order upwind convection).
+
+    The QP is normalized by the mesh size (see scale_by_mesh_size): its
+    objective and the interior rows of its state equation are divided by
+    h^2 = 4^-nc, so that a fixed solver tol asks for the same accuracy on every
+    mesh. The solution x = [y; u] is unchanged, but objective values come out
+    divided by h^2.
 
     Returns the CSC/numpy dict consumed by ksp_qp_bind.solve_from_data() and
     benchmark_common.kspqp_to_qpalm().

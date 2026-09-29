@@ -372,7 +372,7 @@ void KSP_QP<T>::set_L_from_LLT(const SpMat& Q) {
     for (int outer = 0; outer < L.outerSize(); ++outer) {
         for (typename SpMat::InnerIterator it(L, outer); it; ++it)
             if (is_null_row[it.row()]) it.valueRef() = T(0);
-    }
+    } // TODO: this leaves explicit zeros in L which could be removed by compressing L, but that would break the cached diag_idx above.
 
     // When pivots were clamped, verify L*L^T actually approximates Q before accepting it.
     if (!clamped) {

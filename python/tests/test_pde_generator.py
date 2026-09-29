@@ -25,6 +25,7 @@ from pde_generator import (
     make_poisson_l2_control,
     make_poisson_l2_state_control,
     make_problem_l2_from_mats,
+    scale_by_mesh_size,
 )
 
 TIGHT = 1e-12
@@ -361,6 +362,46 @@ class TestMakeProblemL2FromMats(unittest.TestCase):
         np.testing.assert_array_equal(pb.ux, np.full(4, INF))
 
 
+# ===================== scale_by_mesh_size =====================
+
+class TestScaleByMeshSize(unittest.TestCase):
+    def test_divides_objective_and_interior_rows_by_h_squared(self):
+        # Node 0 is a Dirichlet node: identity row/col in D, zero row/col in M,
+        # as left by apply_dirichlet_bc / apply_dirichlet_bc_mass.
+        D = sp.csc_matrix(np.array([[1.0, 0.0, 0.0],
+                                    [0.0, 2.0, -1.0],
+                                    [0.0, -1.0, 3.0]]))
+        M = sp.csc_matrix(np.diag([0.0, 1.0, 2.0]))
+        pb = make_problem_l2_from_mats(D, M, np.array([5.0, 7.0, 11.0]),
+                                       np.array([1.0, 2.0, 3.0]), 4.0,
+                                       -1.0, 1.0, -2.0, 2.0)
+        Q0, A0 = dense(pb.Q), dense(pb.A)
+        c0, b0, obj0 = pb.c.copy(), pb.b.copy(), pb.obj_const
+
+        scaled = scale_by_mesh_size(pb, [0], 0.5)  # 1/h^2 = 4
+
+        # 1/h^2 is a power of two, so every comparison below is exact.
+        np.testing.assert_array_equal(dense(scaled.Q), 4.0 * Q0)
+        np.testing.assert_array_equal(scaled.c, 4.0 * c0)
+        self.assertEqual(scaled.obj_const, 4.0 * obj0)
+        # Dirichlet row 0 is untouched; interior rows 1, 2 are multiplied by 4.
+        np.testing.assert_array_equal(dense(scaled.A)[0], A0[0])
+        np.testing.assert_array_equal(dense(scaled.A)[1:], 4.0 * A0[1:])
+        np.testing.assert_array_equal(scaled.b, [5.0, 28.0, 44.0])
+
+        self.assertEqual((scaled.n, scaled.m, scaled.l), (pb.n, pb.m, pb.l))
+        self.assertEqual(scaled.B.shape, pb.B.shape)
+        for name in ("lx", "ux", "lw", "uw"):
+            np.testing.assert_array_equal(getattr(scaled, name), getattr(pb, name))
+
+        # The input is not modified in place.
+        np.testing.assert_array_equal(dense(pb.Q), Q0)
+        np.testing.assert_array_equal(dense(pb.A), A0)
+        np.testing.assert_array_equal(pb.c, c0)
+        np.testing.assert_array_equal(pb.b, b0)
+        self.assertEqual(pb.obj_const, obj0)
+
+
 # ===================== QP generators (integration smoke tests) =====================
 
 class GeneratorTestCase(unittest.TestCase):
@@ -451,9 +492,11 @@ class TestMakeConvdiffL2Control(GeneratorTestCase):
         np.testing.assert_allclose(pb_fd.b[bc_nodes], 0.0, atol=TIGHT)
 
     def test_eps_scales_only_the_diffusion_part_of_the_operator(self):
-        # D_op = eps*A_stiff + N_conv, so D(eps1) - D(eps2) = (eps1-eps2)*A_stiff.
+        # D_op = eps*A_stiff + N_conv and interior rows are divided by h^2
+        # (scale_by_mesh_size), so D(eps1) - D(eps2) = (eps1-eps2)*A_stiff/h^2 there.
         g = GridQ1(2)
         n = g.n_nodes
+        h = g.x1d[1] - g.x1d[0]
         pb1 = make_convdiff_l2_control(2, 1.0, eps=0.10)
         pb2 = make_convdiff_l2_control(2, 1.0, eps=0.05)
         diff = dense(pb1.A)[:, :n] - dense(pb2.A)[:, :n]
@@ -462,7 +505,41 @@ class TestMakeConvdiffL2Control(GeneratorTestCase):
         bc_nodes = fem_boundary_nodes(g)
         interior = np.setdiff1d(np.arange(n), bc_nodes)
         np.testing.assert_allclose(diff[np.ix_(interior, interior)],
-                                   0.05 * stiff[np.ix_(interior, interior)], atol=TIGHT)
+                                   0.05 * stiff[np.ix_(interior, interior)] / h**2, atol=TIGHT)
+
+
+class TestGeneratorsAreMeshNormalized(GeneratorTestCase):
+    def test_lumped_mass_objective_is_the_same_on_every_mesh(self):
+        # M_lump is h^2 on the interior diagonal (FEM and FD alike) and zero on
+        # the boundary, so after scale_by_mesh_size Q = blkdiag(I, beta*I) and
+        # c = -yhat on the interior nodes, independently of nc.
+        beta = 1e-2
+        for disc in Discretization:
+            for nc in (2, 3, 4):
+                with self.subTest(disc=disc.value, nc=nc):
+                    g = GridQ1(nc)
+                    n = g.n_nodes
+                    bc_nodes = fem_boundary_nodes(g)
+                    interior = np.setdiff1d(np.arange(n), bc_nodes)
+                    x, y = g.node_coords()
+                    yhat = np.exp(-64.0 * ((x - 0.5) ** 2 + (y - 0.5) ** 2))
+                    pb = make_poisson_l2_control(nc, beta, lump_mass=True, disc=disc)
+
+                    q = pb.Q.diagonal()
+                    np.testing.assert_allclose(q[interior], 1.0, rtol=TIGHT)
+                    np.testing.assert_allclose(q[n + interior], beta, rtol=TIGHT)
+                    np.testing.assert_allclose(pb.c[interior], -yhat[interior], rtol=TIGHT)
+                    self.assert_boundary_rows_are_identity(pb, g, bc_nodes)
+
+    def test_consistent_mass_objective_is_the_same_on_every_mesh(self):
+        # M_cons is h^2 times a fixed stencil (interior diagonal 4h^2/9), so
+        # after scale_by_mesh_size its interior diagonal is 4/9 on every mesh.
+        for nc in (2, 3, 4):
+            with self.subTest(nc=nc):
+                g = GridQ1(nc)
+                interior = np.setdiff1d(np.arange(g.n_nodes), fem_boundary_nodes(g))
+                pb = make_poisson_l2_control(nc, 1e-2)
+                np.testing.assert_allclose(pb.Q.diagonal()[interior], 4.0 / 9.0, rtol=TIGHT)
 
 
 # ===================== generate_pde_l2_qp (dict façade) =====================
