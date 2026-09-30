@@ -1086,6 +1086,54 @@ TEST(DualInfeas, ReturnsFalseWhenFiniteBxBoundConditionFails) {
   EXPECT_FALSE(ns.dual_infeas(delta_x, Adx, Bdx));
 }
 
+TEST(DualInfeas, DetectsCertificateInNullspaceOfNonDiagonalQ) {
+  // min -1000 x1 + 0.5 (x1 + x2)^2  s.t.  x1 + x2 = 0.  Unbounded along (1, -1), which lies in
+  // null(Q) and null(A).  Non-diagonal Q lifts x to [x; v] with v = L^T x and appends rows
+  // [L^T, -I] to A, but a PMM iterate only satisfies v = L^T x approximately.  delta_v is set
+  // inconsistent with L^T delta_x on purpose: the certificate is on the original variables, so
+  // neither delta_v nor the lifted rows of Adx may affect the verdict.
+  SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1.0, 1.0, 1.0, 1.0).finished());
+  SpMat A = DenseToSparse((Eigen::MatrixXd(1, 2) << 1.0, 1.0).finished());
+  Vec c(2);
+  c << -1000.0, 0.0;
+  auto problem = MakeProblem(2, 1, 0, Q, A, SpMat(0, 2), c, Vec::Zero(1), 0.0,
+                              Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
+  KSP_QP<double> ns(problem);
+  ASSERT_FALSE(ns.setup_failed);
+  ASSERT_EQ(ns.Q_info, 2);
+
+  Vec dx(2);
+  dx << 1.0, -1.0;  // unscaled: Q dx = 0 and A dx = 0 exactly
+  Vec delta_x(ns.N);
+  delta_x.head(2) = dx.cwiseQuotient(ns.D2_diag);
+  delta_x.tail(2) << 5.0, 5.0;  // delta_v != L^T delta_x_hat
+  Vec Adx = ns.A * delta_x;     // original row is 0, lifted rows L^T delta_x_hat - delta_v are not
+  Vec Bdx(0);
+  EXPECT_TRUE(ns.dual_infeas(delta_x, Adx, Bdx));
+}
+
+TEST(DualInfeas, ReturnsFalseWhenNonDiagonalQDeltaXConditionFails) {
+  // Same Q and c, no constraints: c^T dx = -1000 keeps condition 2 passing and conditions 3-5 are
+  // vacuous, but Q dx = (2, 2), so only the final original-Q check (condition 1) can reject it.
+  SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1.0, 1.0, 1.0, 1.0).finished());
+  Vec c(2);
+  c << -1000.0, 0.0;
+  auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), c, Vec(0), 0.0,
+                              Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
+  KSP_QP<double> ns(problem);
+  ASSERT_FALSE(ns.setup_failed);
+  ASSERT_EQ(ns.Q_info, 2);
+
+  Vec dx(2);
+  dx << 1.0, 1.0;  // unscaled
+  Vec delta_x(ns.N);
+  delta_x.head(2) = dx.cwiseQuotient(ns.D2_diag);
+  delta_x.tail(2) = ns.L.transpose() * delta_x.head(2);  // consistent lifted iterate
+  Vec Adx = ns.A * delta_x;
+  Vec Bdx(0);
+  EXPECT_FALSE(ns.dual_infeas(delta_x, Adx, Bdx));
+}
+
 // ===================== end-to-end regressions =====================
 // Hand-verified tiny QPs/LPs, solved via the public solve() entry point end-to-end.
 

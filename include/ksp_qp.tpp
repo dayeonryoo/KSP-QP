@@ -789,22 +789,29 @@ bool KSP_QP<T>::dual_infeas(const Vec& delta_x, const Vec& Adx, const Vec& Bdx) 
        (B delta_x)_i >= -eps_dinf * ||delta_x||_inf for finite lower bounds on (Bx)_i,
        (B delta_x)_i <= eps_dinf  * ||delta_x||_inf for finite upper bounds on (Bx)_i.
 
+    For general Q, delta_x = [delta_x_hat; delta_v] is the lifted change, but the certificate is
+    checked on the original problem: delta_v and the L^T delta_x_hat - delta_v rows of Adx are
+    ignored, ||delta_x||_inf is taken over the original n variables, and condition 1 uses the stored
+    original Q, as D2^{-1} Q_hat delta_x_hat = Q (D2 delta_x_hat). Being the only condition that
+    needs a sparse product, it is checked last.
+
     Infeasibility is determined in unscaled scope.
     */
-    const T delta_x_inf = inf_norm(delta_x.cwiseProduct(D2_ext));
+    const Vec dx_unscaled = delta_x.head(n).cwiseProduct(D2_diag); // original variables only
+    const T delta_x_inf = inf_norm(dx_unscaled);
     if (delta_x_inf < eps_zero) return false;
     const T rhs = eps_dinf * delta_x_inf;
 
-    // Conditions 1, 2, 3
-    if (Q_info != 0 && inf_norm(Q_diag.cwiseProduct(delta_x).cwiseQuotient(D2_ext)) > rhs) return false;
+    // Conditions 1 (diagonal Q), 2, 3
+    if (Q_info == 1 && inf_norm(Q_diag.cwiseProduct(delta_x).cwiseQuotient(D2_ext)) > rhs) return false;
     if (c.dot(delta_x) > -rhs) return false;
-    if (M > 0 && inf_norm(Adx.cwiseQuotient(D1A_ext)) > rhs) return false;
+    if (m > 0 && inf_norm(Adx.head(m).cwiseQuotient(D1A_diag)) > rhs) return false;
 
     // Condition 4
-    for (int i = 0; i < N; ++i) {
+    for (int i = 0; i < n; ++i) {
         const bool has_lx = lx(i) > -inf;
         const bool has_ux = ux(i) < inf;
-        const T dx_i_unscaled = delta_x(i) * D2_ext(i);
+        const T dx_i_unscaled = dx_unscaled(i);
         if (has_lx && has_ux) { if (std::abs(dx_i_unscaled) > rhs) return false; }
         else if (has_lx)      { if (dx_i_unscaled < -rhs)          return false; }
         else if (has_ux)      { if (dx_i_unscaled >  rhs)          return false; }
@@ -818,6 +825,13 @@ bool KSP_QP<T>::dual_infeas(const Vec& delta_x, const Vec& Adx, const Vec& Bdx) 
         if (has_lw && has_uw) { if (std::abs(Bdx_i_unscaled) > rhs) return false; }
         else if (has_lw)      { if (Bdx_i_unscaled < -rhs)          return false; }
         else if (has_uw)      { if (Bdx_i_unscaled >  rhs)          return false; }
+    }
+
+    // Condition 1 (general Q), checked last so its sparse product only runs once 2-5 pass:
+    // D2^{-1} Q_hat delta_x_hat = Q (D2 delta_x_hat), with Q the stored original (lower triangle).
+    if (Q_info == 2) {
+        const Vec Qdx = Q.template selfadjointView<Eigen::Lower>() * dx_unscaled;
+        if (inf_norm(Qdx) > rhs) return false;
     }
     return true;
 }
