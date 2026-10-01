@@ -911,6 +911,7 @@ Solution<T> KSP_QP<T>::solve() {
     // Neutral by default: report_'s default body just calls print() with this->when/what,
     // same values NS was constructed with.
     NS.report_ = report_;
+    NS.direct_solve = direct_solve;
 
     // Print header.
     print_header(when, what);
@@ -1037,7 +1038,9 @@ Solution<T> KSP_QP<T>::solve() {
     krylov_iter = NS.krylov_iter;
     fact = NS.fact;
     krylov_fail = NS.krylov_fail;
-    kkt_ldlt_used = NS.kkt_ldlt_used;
+    pcg_failed = NS.pcg_failed;
+    kkt_ldlt_fact = NS.kkt_ldlt_fact;
+    schur_chol_fact = NS.schur_chol_fact;
 
     return Solution<T>(opt, x_sol, y1_sol, y2_sol, z_sol, obj_val, pmm_iter, ssn_iter, krylov_iter, fact, NS.smw_count, pmm_tol_achieved, ssn_tol_achieved, setup_time, solve_time, linesearch_fail, krylov_fail);
 }

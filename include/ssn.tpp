@@ -109,13 +109,15 @@ bool SSN<T>::choose_schur_ldlt(const SpMat& G, const BoolArr& active_K) {
     |K| = nnz in the KKT matrix [-H_act_K, G_act_K^T; G_act_K, (1/mu)I] (active_K columns only).
     |S| is overestimated via the densest active_K column and the pigeonhole principle.
     Returns true (prefer LDLT on K) when ratio < kSchurLdltRatioThreshold.
+    The direct solver passes an all-true mask, since the exact K and S contain every column.
     */
     const int s = G.rows();
+    const int n_cols = G.cols();
 
     // Count active_K columns (t), their total nnz, and the densest one (hat_k, G_hat).
     long long t = 0, G_act_nnz = 0;
     int G_hat = 0, hat_k = -1;
-    for (int k = 0; k < N; ++k) {
+    for (int k = 0; k < n_cols; ++k) {
         if (!active_K(k)) continue;
         ++t;
         int a_k = G.isCompressed()
@@ -129,7 +131,7 @@ bool SSN<T>::choose_schur_ldlt(const SpMat& G, const BoolArr& active_K) {
 
     // Overestimate |S|: s (diagonal) + off-diagonal from densest block + pigeonhole corrections.
     long long S_nnz = (long long)s + (long long)G_hat * G_hat - G_hat;
-    for (int k = 0; k < N; ++k) {
+    for (int k = 0; k < n_cols; ++k) {
         if (!active_K(k) || k == hat_k) continue;
         int a_k = G.isCompressed()
                 ? G.outerIndexPtr()[k + 1] - G.outerIndexPtr()[k]
@@ -157,9 +159,9 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
                                             bool schur_use_ldlt) {
     using Vec = typename SSN<T>::Vec;
 
-    // Once PCG has failed, permanently switch to LDLT on the augmented KKT system.
-    if (kkt_ldlt_used)
-        return solve_using_ldlt(G, H_diag, r1, r2);
+    // Direct solver: throughout in direct mode, and permanently once PCG has failed.
+    if (direct_solve || pcg_failed)
+        return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
 
     const int s = G.rows();
     const int n = G.cols();
@@ -228,10 +230,10 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         return true;
     };
 
-    // Release the PCG state (unused anymore) if solve switches to LDLT on the augmented KKT system.
-    auto switch_to_ldlt = [&]() {
+    // Release the PCG state (unused anymore) when the solve permanently switches to the direct solver.
+    auto switch_to_direct = [&]() {
         krylov_converged = false;
-        kkt_ldlt_used = true;
+        pcg_failed = true;
         cg.preconditioner().release();
         prev_dy_.resize(0);
         cg_Hinv_r1_.resize(0);
@@ -241,7 +243,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
 
     // Set up and attempt to solve by PCG.
     // bad_alloc can come from build() (P_base_ = G E G^T) or from Eigen's CG iteration internals;
-    // in either case, fall back to solving the KKT system directly via LDLT.
+    // in either case, fall back to the direct solver.
     Vec dy_;
     bool ok = false;
     try {
@@ -250,8 +252,8 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     } catch (const std::bad_alloc&) {
         std::cout << "[PCG] CG failed due to bad_alloc.\n";
         krylov_fail++;
-        switch_to_ldlt();
-        return solve_using_ldlt(G, H_diag, r1, r2);
+        switch_to_direct();
+        return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
     }
 
     // If CG succeeded and the preconditioner used SMW, reset the SMW fail streak.
@@ -259,7 +261,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         cg.preconditioner().reset_smw_fail_streak();
 
     // If CG failed and the preconditioner used SMW, retry after a full rebuild.
-    // If it already used a full factorization: fall back to LDLT.
+    // If it already used a full factorization: fall back to the direct solver.
     if (!ok && cg.preconditioner().should_retry_after_failure()) {
         try {
             setup_prec(true);
@@ -267,16 +269,16 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         } catch (const std::bad_alloc&) {
             std::cout << "[PCG] CG failed due to bad_alloc.\n";
             krylov_fail++;
-            switch_to_ldlt();
-            return solve_using_ldlt(G, H_diag, r1, r2);
+            switch_to_direct();
+            return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
         }
     }
 
-    // If CG failed again, fall back to LDLT.
+    // If CG failed again, fall back to the direct solver.
     if (!ok) {
-        std::cout << "[PCG] CG failed, falling back to solving the augmented Lagrangian system via LDLT.\n";
-        switch_to_ldlt();
-        return solve_using_ldlt(G, H_diag, r1, r2);
+        std::cout << "[PCG] CG failed, falling back to the direct solver (LDLT on the KKT system or Cholesky on its Schur complement).\n";
+        switch_to_direct();
+        return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
     }
 
     prev_dy_ = dy_;
@@ -290,7 +292,31 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     return result;
 }
 
-template <typename T> // Fallback of PCG
+template <typename T>
+void SSN<T>::decide_direct_system(const SpMat& G) {
+    // Same cost model and threshold as the preconditioner's choice, but over all columns:
+    // the exact K and S contain every column, not just the active_K ones.
+    if (all_cols_.size() != G.cols()) all_cols_ = BoolArr::Constant(G.cols(), true);
+    direct_use_ldlt = choose_schur_ldlt(G, all_cols_);
+    ++direct_ldlt_decisions_made_;
+    if (direct_use_ldlt) release_chol(); // no-op unless switching away from the Schur complement
+}
+
+template <typename T> // Direct solver: dispatches to LDLT on K or Cholesky on S
+typename SSN<T>::Vec SSN<T>::solve_direct(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv,
+                                          const Vec& r1, const Vec& r2) {
+    // No rows in G: K = -H, so dx = -H^{-1} r1 exactly and there is nothing to factorize.
+    if (G.rows() == 0) return -H_diag_inv.cwiseProduct(r1);
+
+    // First direct solve without a decision yet (right after PCG failed): decide now.
+    if (direct_ldlt_decisions_made_ == 0) decide_direct_system(G);
+
+    if (direct_use_ldlt || schur_chol_failed_)
+        return solve_using_ldlt(G, H_diag, r1, r2);
+    return solve_using_chol(G, G_tr, H_diag, H_diag_inv, r1, r2);
+}
+
+template <typename T> // Direct solver: LDLT on the KKT system K
 typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag, const Vec& r1, const Vec& r2) {
     using Vec = typename SSN<T>::Vec;
     using SpMat = typename SSN<T>::SpMat;
@@ -365,6 +391,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
             throw std::runtime_error("LDLT factorization of the augmented Lagrangian system failed.");
         ldlt_numeric_dirty_ = false;
         fact++;
+        kkt_ldlt_fact++;
     }
 
     Vec result;
@@ -375,6 +402,118 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
     if (ldlt_.info() != Eigen::Success)
         throw std::runtime_error("Solving the augmented Lagrangian system via LDLT failed.");
     return result;
+}
+
+template <typename T> // Direct solver: Cholesky on the Schur complement S
+typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv,
+                                              const Vec& r1, const Vec& r2) {
+    /*
+    Solve K [dx; dy] = [r1; r2] through the Schur complement S = G H^{-1} G^T + (1/mu)I (SPD):
+    S dy = G H^{-1} r1 + r2, then dx = H^{-1} (G^T dy - r1).
+    S's sparsity follows G's structure only, so a K-only or mu/rho change reuses the symbolic analysis
+    and only reassembles and refactorizes S. If Cholesky fails, fall back to LDLT on K for the rest of the run.
+    */
+    using Vec = typename SSN<T>::Vec;
+    using SpMat = typename SSN<T>::SpMat;
+
+    const int s = G.rows();
+    const int n = G.cols();
+
+    // If the stored factorization is for a different system size, force re-analyze.
+    if (chol_ && chol_->rows() != s) {
+        chol_pattern_dirty_ = true;
+        chol_numeric_dirty_ = true;
+    }
+
+    bool ok = true;
+    const char* reason = "";
+    if (!chol_ || chol_pattern_dirty_ || chol_numeric_dirty_) {
+        try {
+            {
+                SSN_TIMER_BLOCK(timer_chol_assembly);
+                // Free the old S first: the temporaries of the product below are the memory peak.
+                SpMat().swap(S_chol_);
+
+                // Lower triangle of S = (G H^{-1/2}) (G H^{-1/2})^T + (1/mu)I; SimplicialLLT only reads that.
+                // No prune: H_diag_inv > 0, so S's pattern depends only on G's structure.
+                SpMat G_scaled = G;
+                for (int k = 0; k < G_scaled.outerSize(); ++k) {
+                    const T scale = std::sqrt(H_diag_inv(k));
+                    for (typename SpMat::InnerIterator it(G_scaled, k); it; ++it)
+                        it.valueRef() *= scale;
+                }
+                S_chol_.template selfadjointView<Eigen::Lower>().rankUpdate(G_scaled, T(0));
+
+                SpMat mu_diag(s, s);
+                mu_diag.setIdentity();
+                mu_diag *= T(1) / mu;
+                S_chol_ += mu_diag;
+                S_chol_.makeCompressed();
+            }
+
+            // A changed nonzero count means a changed pattern, even if no flag said so.
+            if (S_chol_.nonZeros() != chol_nnz_at_analyze_) chol_pattern_dirty_ = true;
+
+            if (!chol_ || chol_pattern_dirty_) {
+                SSN_TIMER_BLOCK(timer_chol_analyze);
+                chol_ = std::make_unique<Eigen::SimplicialLLT<SpMat>>();
+                chol_->analyzePattern(S_chol_);
+                chol_nnz_at_analyze_ = S_chol_.nonZeros();
+                chol_pattern_dirty_ = false;
+            }
+            {
+                SSN_TIMER_BLOCK(timer_chol_factorize);
+                chol_->factorize(S_chol_);
+            }
+            fact++;
+            schur_chol_fact++;
+            if (chol_->info() != Eigen::Success) {
+                ok = false;
+                reason = "not numerically positive definite";
+            } else {
+                chol_numeric_dirty_ = false;
+            }
+        } catch (const std::bad_alloc&) {
+            ok = false;
+            reason = "bad_alloc";
+        }
+    }
+
+    if (!ok) {
+        std::cout << "[Direct] Cholesky on the Schur complement failed (" << reason
+                  << "), falling back to LDLT on the KKT system.\n";
+        schur_chol_failed_ = true;
+        release_chol();
+        return solve_using_ldlt(G, H_diag, r1, r2);
+    }
+
+    // Solve S dy = G H^{-1} r1 + r2, then recover dx = H^{-1} (G^T dy - r1).
+    chol_Hinv_r1_.noalias() = H_diag_inv.cwiseProduct(r1);
+    chol_rhs_.noalias() = G * chol_Hinv_r1_ + r2;
+    Vec dy;
+    {
+        SSN_TIMER_BLOCK(timer_chol_solve);
+        dy = chol_->solve(chol_rhs_);
+    }
+    if (chol_->info() != Eigen::Success)
+        throw std::runtime_error("Solving the Schur complement system via Cholesky failed.");
+
+    Vec result(n + s);
+    result.head(n) = H_diag_inv.cwiseProduct(G_tr * dy - r1);
+    result.tail(s) = dy;
+    return result;
+}
+
+template <typename T>
+void SSN<T>::release_chol() {
+    // Free the Schur complement and its factorization; the next solve_using_chol() rebuilds both.
+    chol_.reset();
+    SpMat().swap(S_chol_);
+    chol_Hinv_r1_.resize(0);
+    chol_rhs_.resize(0);
+    chol_pattern_dirty_ = true;
+    chol_numeric_dirty_ = true;
+    chol_nnz_at_analyze_ = -1;
 }
 
 template <typename T>
@@ -581,12 +720,14 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     bool update_prec = delta.k_changed || delta.w_changed; // true means rebuilding prec is needed.
     bool prec_pattern_changed = delta.k_changed || delta.w_changed; // true means analyzePattern() is needed.
 
-    // These are for PCG's fallback (LDLT on full KKT system).
-    if (delta.w_changed) ldlt_pattern_dirty_ = true;
-    if (delta.k_changed || delta.w_changed) ldlt_numeric_dirty_ = true; 
-
     // Recompute H if active_K changed or mu/rho drifted since H_diag was last built.
     bool recompute_H = delta.k_changed || (mu != H_diag_mu_) || (rho != H_diag_rho_);
+
+    // These are for the direct solver (LDLT on K, Cholesky on S): their sparsity follows G (active_W),
+    // and their values change exactly when H_diag is recomputed or G is rebuilt.
+    if (delta.w_changed) ldlt_pattern_dirty_ = chol_pattern_dirty_ = true;
+    if (recompute_H || delta.w_changed) ldlt_numeric_dirty_ = chol_numeric_dirty_ = true;
+
     if (recompute_H) {
         SSN_TIMER_BLOCK(timer_prep);
         if (delta.k_changed) {
@@ -640,8 +781,13 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     r2_.tail(n_active_W) = -dist_W_v_active_.head(n_active_W) - (alpha / mu) * y2_active_W_.head(n_active_W);
     }
 
-    // Determines the factorization method for a preconditioner; locked after the first 3 decisions.
-    if ((delta.k_changed || delta.w_changed) && schur_ldlt_decisions_made_ < 3) {
+    // Determines the factorization method, each locked after its first 3 decisions:
+    // for the direct solver (K or S, over all columns) once it is in use, otherwise for the PCG preconditioner.
+    const bool use_direct = direct_solve || pcg_failed;
+    if ((delta.k_changed || delta.w_changed) && use_direct && direct_ldlt_decisions_made_ < 3) {
+        SSN_TIMER_BLOCK(timer_prep);
+        decide_direct_system(G);
+    } else if ((delta.k_changed || delta.w_changed) && !use_direct && schur_ldlt_decisions_made_ < 3) {
         SSN_TIMER_BLOCK(timer_prep);
         schur_use_ldlt = choose_schur_ldlt(G, active_K);
         ++schur_ldlt_decisions_made_;
@@ -818,6 +964,7 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
         timer_prep = timer_linear_solve = timer_prec_setup = timer_krylov_solve = 0.0;
         timer_prec_assembly = timer_prec_analyze = timer_prec_factorize = 0.0;
         timer_ldlt_analyze = timer_ldlt_factorize = timer_ldlt_solve = 0.0;
+        timer_chol_assembly = timer_chol_analyze = timer_chol_factorize = timer_chol_solve = 0.0;
         timer_linesearch = timer_state_update = 0.0;
 #endif
         auto [update_prec, prec_pattern_changed] = prepare_newton_system();
@@ -849,12 +996,18 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
                 timer_prec_assembly, timer_prec_analyze, timer_prec_factorize, timer_krylov_solve,
                 timer_linesearch, timer_state_update);
 
-            // If PCG fell back to solve_using_ldlt(), report it.
+            // If the direct solver ran (direct mode, or after PCG failed), report LDLT on K and Cholesky on S.
             const double ldlt_total = timer_ldlt_analyze + timer_ldlt_factorize + timer_ldlt_solve;
             if (ldlt_total > 0.0) {
                 fprintf(stderr,
-                    "[Timer]   ldlt_fallback total=%.4fs | analyzePattern=%.4f factorize=%.4f solve=%.4f\n",
+                    "[Timer]   kkt_ldlt total=%.4fs | analyzePattern=%.4f factorize=%.4f solve=%.4f\n",
                     ldlt_total, timer_ldlt_analyze, timer_ldlt_factorize, timer_ldlt_solve);
+            }
+            const double chol_total = timer_chol_assembly + timer_chol_analyze + timer_chol_factorize + timer_chol_solve;
+            if (chol_total > 0.0) {
+                fprintf(stderr,
+                    "[Timer]   schur_chol total=%.4fs | assembly=%.4f analyzePattern=%.4f factorize=%.4f solve=%.4f\n",
+                    chol_total, timer_chol_assembly, timer_chol_analyze, timer_chol_factorize, timer_chol_solve);
             }
         }
 #endif

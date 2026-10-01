@@ -28,7 +28,7 @@ using Triplet = Eigen::Triplet<T>;
 int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
-            "Usage: ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S]\n"
+            "Usage: ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--direct] [--out FILE] [--cooldown S]\n"
             "  Solves one Maros-Meszaros QP from ROOT/IN/PROBLEM.SIF, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in and --out are resolved relative to this (default: ./)\n"
             "  --in DIR         directory containing the .SIF files, relative to --root (default: data/maros_meszaros/)\n"
@@ -37,7 +37,10 @@ int main(int argc, char** argv) {
             "  --tol T          primal-dual tolerance (default: 1e-6)\n"
             "  --max-iter N     max PMM iterations (default: 3000)\n"
             "  --time-limit S   time limit in seconds (default: 60)\n"
-            "  --out FILE       (--name all only) output CSV path, relative to --root (default: results/maros_meszaros_all.csv)\n"
+            "  --direct         experimental: skip PCG and factorize the KKT system (LDLT) or its Schur\n"
+            "                   complement (Cholesky) exactly at every SSN iteration\n"
+            "  --out FILE       (--name all only) output CSV path, relative to --root\n"
+            "                   (default: results/pcg_mm.csv, or results/direct_mm.csv with --direct)\n"
             "  --cooldown S     (--name all only) seconds to sleep between problems (default: 3)\n";
         return 0;
     }
@@ -52,6 +55,7 @@ int main(int argc, char** argv) {
     T tol = cli::get_double(argc, argv, "--tol", 1e-6);
     double time_limit = cli::get_double(argc, argv, "--time-limit", 60.0); // in seconds
     int max_iter = cli::get_int(argc, argv, "--max-iter", 3000);
+    bool direct = cli::has_flag(argc, argv, "--direct");
 
     if (name == "all") {
         // Filenames and objective values of Maros/Meszaros QPs
@@ -200,7 +204,8 @@ int main(int argc, char** argv) {
         PrintWhat what = PrintWhat::TUNING;
         int cooldown_sec = cli::get_int(argc, argv, "--cooldown", 3);
 
-        std::string csv_path = root + cli::get_str(argc, argv, "--out", "results/maros_meszaros_all.csv");
+        std::string default_out = direct ? "results/direct_mm.csv" : "results/pcg_mm.csv";
+        std::string csv_path = root + cli::get_str(argc, argv, "--out", default_out);
         write_csv_header(csv_path);
 
         for (const auto& [qp_name, ref_obj_val] : QPs) {
@@ -225,6 +230,7 @@ int main(int argc, char** argv) {
                 // Construct the problem and solver
                 Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
                 KSP_QP<T> solver(prob);
+                solver.direct_solve = direct;
 
                 // Solve the QP
                 Solution<T> sol = solver.solve();
@@ -237,7 +243,8 @@ int main(int argc, char** argv) {
                 bool diverged = sol.pmm_tol_achieved > 1e0;
 
                 // Record result
-                std::string system = solver.kkt_ldlt_used ? "L" : "S";
+                std::string system = system_label(solver.direct_solve || solver.pcg_failed,
+                                                  solver.kkt_ldlt_fact, solver.schur_chol_fact);
 
                 TestResult<T> result = {
                     system,
@@ -282,10 +289,15 @@ int main(int argc, char** argv) {
 
     Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
     KSP_QP<T> solver(prob);
+    solver.direct_solve = direct;
 
     // Solve:
     Solution<T> sol = solver.solve();
     sol.print_summary();
+    if (solver.direct_solve || solver.pcg_failed) {
+        std::cout << "Direct-solver factorizations: KKT system (LDLT) = " << solver.kkt_ldlt_fact
+                  << ", Schur complement (Cholesky) = " << solver.schur_chol_fact << "\n";
+    }
 
     return 0;
 }

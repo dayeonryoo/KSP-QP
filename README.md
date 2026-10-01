@@ -344,7 +344,7 @@ also prints a feasibility breakdown of the final iterate, showing *how* the prob
 admit a solution). Names are case-insensitive; the `.mps` files themselves are lowercase.
 
 Pass `--name all` to sweep the set, appending a row per problem to
-`<root>/results/netlib_feasible_all.csv` or `<root>/results/netlib_infeasible_all.csv`
+`<root>/results/pcg_netlib.csv` or `<root>/results/pcg_infeas.csv`
 (override with `--out`). The sweep is the directory listing, so adding or removing an `.mps`
 file is all it takes to change the set — the same convention `python/benchmark_netlib.py` uses.
 
@@ -369,7 +369,7 @@ For a QPALM/OSQP comparison with performance profiles, use `python/benchmark_net
 
 Solves `<root>/<PROBLEM>.SIF` (default: `data/maros_meszaros/AUG2DCQP.SIF`), printing the
 solution summary. Pass `--name all` to sweep the full Maros-Meszaros set against its built-in
-reference objectives, appending a row to `<root>/results/maros_meszaros_all.csv` (override with
+reference objectives, appending a row to `<root>/results/pcg_mm.csv` (override with
 `--out`) for each — `--cooldown` (default 3s) sleeps between problems in this mode, which keeps
 a long sweep from being distorted by CPU thermal throttling.
 
@@ -619,8 +619,9 @@ When enabled, every SSN iteration prints a line like this to **stderr** (indepen
 [Timer] ssn_iter=3 total=0.1234s | prep=0.0012 linear_solve=0.1180 (prec_setup=0.0500 [assembly=0.0100 analyze=0.0150 factorize=0.0250] krylov_solve=0.0680) linesearch=0.0030 state_update=0.0012
 ```
 
-If the Krylov solve falls back to a dense LDLT factorization for that iteration, a second line
-reports the LDLT analyze/factorize/solve breakdown. This is the tool to use when profiling
+If the Krylov solve has fallen back to the direct solver, further lines report its breakdown:
+`kkt_ldlt` (LDLT on the KKT system: analyze/factorize/solve) and `schur_chol` (Cholesky on the
+Schur complement: assembly/analyze/factorize/solve). This is the tool to use when profiling
 *where* time goes inside the solver (e.g. preconditioner factorization vs. CG iterations);
 `PrintWhat::TUNING` is the tool for watching *convergence behavior* (residuals, PMM parameters)
 across iterations.

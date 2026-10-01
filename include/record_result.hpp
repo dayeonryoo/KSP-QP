@@ -36,6 +36,17 @@ struct TestResult {
     int krylov_fail;
 };
 
+// System column: "S" if every Newton system was solved by PCG on the Schur complement; otherwise
+// (direct mode, or after PCG failed) "D" followed by "K" if the KKT system was factorized (LDLT)
+// and "S" if its Schur complement was (Cholesky).
+inline std::string system_label(bool direct_solver_used, int kkt_ldlt_fact, int schur_chol_fact) {
+    if (!direct_solver_used) return "S";
+    std::string label = "D";
+    if (kkt_ldlt_fact > 0)   label += "K";
+    if (schur_chol_fact > 0) label += "S";
+    return label;
+}
+
 template <typename T>
 void print_feasibility(const KSPQPdata<T>& pd,
                        const Eigen::Matrix<T, Eigen::Dynamic, 1>& x,

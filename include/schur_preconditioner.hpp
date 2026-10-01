@@ -35,7 +35,7 @@ struct SchurPrecScopedTimer {
 // =================================================================================================
 // Flag-dependency chain (SSN + SchurPreconditioner)
 // -------------------------------------------------------------------------------------------------
-// "PCG with SMW update and LDLT fallback" needs independent flag tracking at three layers, all
+// "PCG with SMW update and direct-solver fallback" needs independent flag tracking at three layers, all
 // driven by the active sets, K and W, changes, computed once per SSN iteration in
 // SSN::prepare_newton_system() as SSN::ActiveSetDelta{k_changed, w_changed}:
 //
@@ -43,14 +43,17 @@ struct SchurPrecScopedTimer {
 //   SSN::PrepResult{update_prec, prec_pattern_changed}: both are (k_changed || w_changed).
 //   Threaded down through SSN::solve_newton_direction() -> SSN::solve_using_cg() -> here (arm()).
 //
-// Layer 2 -- SSN's own full-KKT LDLT fallback (K_ldlt_; see ssn.hpp/.tpp):
-//   ldlt_pattern_dirty_ : set on w_changed only -- active_W changes G's/K_ldlt_'s sparsity.
-//   ldlt_numeric_dirty_ : set on k_changed, w_changed, or every update_ssn_system() call (mu/rho
-//                         may have changed). Guards K_ldlt_'s factorize(). This flag's freshness
-//                         depends on H_diag itself being fresh -- see SSN::H_diag_mu_/H_diag_rho_
-//                         in ssn.hpp, which independently guard H_diag's own recompute against a
-//                         mu/rho-only drift (prepare_newton_system() rebuilds H whenever it
-//                         differs from H_diag_mu_/H_diag_rho_, not just on k_changed).
+// Layer 2 -- SSN's own direct solver (see ssn.hpp/.tpp), used throughout when SSN::direct_solve is
+//            set and permanently once PCG has failed (SSN::pcg_failed): LDLT on the full KKT matrix
+//            (K_ldlt_) or Cholesky on its exact Schur complement (S_chol_), as chosen by
+//            SSN::decide_direct_system():
+//   ldlt_pattern_dirty_ / chol_pattern_dirty_ : set on w_changed only -- active_W changes G's, hence
+//                         K_ldlt_'s and S_chol_'s, sparsity.
+//   ldlt_numeric_dirty_ / chol_numeric_dirty_ : set on w_changed or whenever prepare_newton_system()
+//                         recomputes H_diag (k_changed, or a mu/rho drift from SSN::H_diag_mu_/
+//                         H_diag_rho_) -- exactly when K's and S's values change, so an unchanged
+//                         matrix keeps its factorization across SSN and PMM iterations. Guard
+//                         K_ldlt_'s / S_chol_'s factorize().
 //   K_ldlt_built_       : whether the triplet-assembled K_ldlt_ exists yet, so a numeric-only
 //                         update can skip full triplet reassembly.
 //

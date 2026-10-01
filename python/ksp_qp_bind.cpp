@@ -11,6 +11,7 @@
 #include "ksp_qp.hpp"
 #include "problem.hpp"
 #include "mps_format_parser.hpp"
+#include "record_result.hpp"
 
 namespace py = pybind11;
 using T      = double;
@@ -117,6 +118,10 @@ Returns dict:
   fact              – total number of factorizations
   smw_count         – total number of SMW preconditioner applications
   pmm_tol_achieved  – tolerance achieved by PMM at termination
+  system            – "S" (PCG only), or "D" + "K"/"S" for the systems the direct
+                      solver factorized (direct mode, or after PCG failed)
+  kkt_ldlt_fact     – direct-solver LDLT factorizations of the KKT system
+  schur_chol_fact   – direct-solver Cholesky factorizations of the Schur complement
   x                 – primal solution vector (original, unscaled units)
   y1, y2, z         – multipliers for Ax = b, Bx = w and the box constraints on x,
                       in the same original, unscaled units as x
@@ -124,9 +129,11 @@ Returns dict:
 py::dict solve_from_sif(const std::string& filename,
                         double tol         = 1e-6,
                         long long max_iter = 1'000'000'000LL,
-                        double time_limit  = 600.0) {
-    int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count;
+                        double time_limit  = 600.0,
+                        bool direct        = false) {
+    int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
     double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved;
+    std::string system;
     Vec x_sol, y1_sol, y2_sol, z_sol;
     {
         py::gil_scoped_release release;
@@ -137,7 +144,12 @@ py::dict solve_from_sif(const std::string& filename,
         Problem<T>  prob(pd, (T)tol, (int)max_iter, time_limit,
                          PrintWhen::NEVER, PrintWhat::NONE);
         KSP_QP<T>  solver(prob);
+        solver.direct_solve = direct;
         Solution<T> sol = solver.solve();
+        system           = system_label(solver.direct_solve || solver.pcg_failed,
+                                        solver.kkt_ldlt_fact, solver.schur_chol_fact);
+        kkt_ldlt_fact    = solver.kkt_ldlt_fact;
+        schur_chol_fact  = solver.schur_chol_fact;
         opt              = static_cast<int>(sol.opt);
         obj_val          = (double)sol.obj_val;
         setup_time       = sol.setup_time;
@@ -167,6 +179,9 @@ py::dict solve_from_sif(const std::string& filename,
     out["fact"]             = fact;
     out["smw_count"]        = smw_count;
     out["pmm_tol_achieved"] = pmm_tol_achieved;
+    out["system"]           = system;
+    out["kkt_ldlt_fact"]    = kkt_ldlt_fact;
+    out["schur_chol_fact"]  = schur_chol_fact;
     out["x"]                = eigen_vec_to_array(x_sol);
     out["y1"]               = eigen_vec_to_array(y1_sol);
     out["y2"]               = eigen_vec_to_array(y2_sol);
@@ -235,11 +250,13 @@ py::dict solve_from_data(const py::dict& pd_dict,
                          long long max_iter = 1'000'000'000LL,
                          double time_limit  = 600.0,
                          std::string trace_path = "",
-                         double rho_init = -1.0) {
+                         double rho_init = -1.0,
+                         bool direct = false) {
     KSPQPdata<T> pd = dict_to_kspqp(pd_dict); // reads Python objects
 
-    int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count;
+    int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
     double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved;
+    std::string system;
     Vec x_sol, y1_sol, y2_sol, z_sol;
     {
         py::gil_scoped_release release;
@@ -259,6 +276,7 @@ py::dict solve_from_data(const py::dict& pd_dict,
         // dynamics used to get there. Sentinel -1 (default) leaves rho at its usual rho_limit
         // start, matching prior behavior exactly.
         if (rho_init > 0.0) solver.rho = (T)rho_init;
+        solver.direct_solve = direct;
         std::ofstream trace_file;
         if (trace) {
             trace_file.open(trace_path);
@@ -271,6 +289,10 @@ py::dict solve_from_data(const py::dict& pd_dict,
         }
         Solution<T> sol = solver.solve();
         if (trace) trace_file.close();
+        system           = system_label(solver.direct_solve || solver.pcg_failed,
+                                        solver.kkt_ldlt_fact, solver.schur_chol_fact);
+        kkt_ldlt_fact    = solver.kkt_ldlt_fact;
+        schur_chol_fact  = solver.schur_chol_fact;
         opt              = static_cast<int>(sol.opt);
         obj_val          = (double)sol.obj_val;
         setup_time       = sol.setup_time;
@@ -300,6 +322,9 @@ py::dict solve_from_data(const py::dict& pd_dict,
     out["fact"]             = fact;
     out["smw_count"]        = smw_count;
     out["pmm_tol_achieved"] = pmm_tol_achieved;
+    out["system"]           = system;
+    out["kkt_ldlt_fact"]    = kkt_ldlt_fact;
+    out["schur_chol_fact"]  = schur_chol_fact;
     out["x"]                = eigen_vec_to_array(x_sol);
     out["y1"]               = eigen_vec_to_array(y1_sol);
     out["y2"]               = eigen_vec_to_array(y2_sol);
@@ -325,15 +350,21 @@ The sparse matrices are in CSC format (data / indices / indptr / shape).)");
           py::arg("tol")        = 1e-6,
           py::arg("max_iter")   = 1'000'000'000LL,
           py::arg("time_limit") = 600.0,
+          py::arg("direct")     = false,
           R"(Parse a SIF/MPS file and solve it with the KSP-QP solver.
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
-krylov_iter, fact, smw_count, pmm_tol_achieved, x, y1, y2, z (x and the multipliers y1/y2/z
-are returned in the original, unscaled units, so they can be checked against the problem data
-as given).
+krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact, x, y1,
+y2, z (x and the multipliers y1/y2/z are returned in the original, unscaled units, so they can be
+checked against the problem data as given).
 status == 0  → optimal solution found
 status <  0  → infeasibility detected
-status >  0  → iteration / time limit reached)");
+status >  0  → iteration / time limit reached
+
+direct: experimental, default False. When True, skips PCG and factorizes the KKT system (LDLT)
+or its Schur complement (Cholesky) exactly at every SSN iteration. system is "S" when only PCG
+ran, otherwise "D" followed by "K" and/or "S" for the systems the direct solver factorized
+(direct mode, or after PCG failed); kkt_ldlt_fact/schur_chol_fact count those factorizations.)");
 
     m.def("solve_from_data", &solve_from_data,
           py::arg("pd"),
@@ -342,12 +373,15 @@ status >  0  → iteration / time limit reached)");
           py::arg("time_limit") = 600.0,
           py::arg("trace_path") = "",
           py::arg("rho_init") = -1.0,
+          py::arg("direct") = false,
           R"(Solve with KSP-QP using already-parsed problem data (dict from parse_sif).
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
-krylov_iter, fact, smw_count, pmm_tol_achieved, x, y1, y2, z (x and the multipliers y1/y2/z
-are returned in the original, unscaled units, so they can be checked against the problem data
-as given).
+krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact, x, y1,
+y2, z (x and the multipliers y1/y2/z are returned in the original, unscaled units, so they can be
+checked against the problem data as given).
+
+direct: experimental, default False; same meaning as in solve_from_sif.
 
 trace_path: diagnostic-only, default "" (no tracing, matches prior behavior exactly). When
 set, writes a per-PMM-iteration and per-SSN-inner-iteration CSV trace to that path with columns

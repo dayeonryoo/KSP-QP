@@ -126,6 +126,7 @@ public:
     T rho_limit = 1e7;
     T alpha = 0.95;
     double time_limit = 600.0; // in seconds
+    bool direct_solve = false; // experimental: skip PCG and factorize K (LDLT) or its Schur complement (Cholesky) every SSN iteration
     int linesearch_fail = 0;
 
     // Primal/dual infeasibility certificate tolerances.
@@ -147,9 +148,11 @@ public:
     int krylov_iter = 0, fact = 0, krylov_fail = 0;
     T pmm_tol_achieved, ssn_tol_achieved;
     ResVec res_norms;
-    bool   kkt_ldlt_used = false; // mirrors SSN::kkt_ldlt_used: was the full-KKT LDLT fallback used
-    double setup_time    = 0.0;   // wall-clock time spent in this constructor, in seconds
-    bool   setup_failed  = false; // true if an error occurred during setup
+    bool   pcg_failed      = false; // mirrors SSN::pcg_failed: PCG failed and the direct solver took over
+    int    kkt_ldlt_fact   = 0;     // mirrors SSN::kkt_ldlt_fact: direct-solver LDLT factorizations of K
+    int    schur_chol_fact = 0;     // mirrors SSN::schur_chol_fact: direct-solver Cholesky factorizations of S
+    double setup_time      = 0.0;   // wall-clock time spent in this constructor, in seconds
+    bool   setup_failed    = false; // true if an error occurred during setup
 
     // Clock used for setup_time/solve_time and the time_limit check in solve().
     std::function<std::chrono::steady_clock::time_point()> now_ = [] { return std::chrono::steady_clock::now(); };

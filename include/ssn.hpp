@@ -2,6 +2,7 @@
 #include <string>
 #include <limits>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
@@ -150,6 +151,7 @@ public:
     int iter, ssn_iter;
     T tol_achieved, obj_val;
     int krylov_iter = 0, fact = 0, smw_count = 0;
+    int kkt_ldlt_fact = 0, schur_chol_fact = 0; // direct-solver factorizations of K (LDLT) and S (Cholesky); included in fact
     int linesearch_fail = 0, krylov_fail = 0;
     bool krylov_converged = true;
 
@@ -166,6 +168,10 @@ public:
     double timer_ldlt_analyze   = 0.0; // subset of timer_linear_solve: solve_using_ldlt()'s ldlt_.analyzePattern()
     double timer_ldlt_factorize = 0.0; // subset of timer_linear_solve: solve_using_ldlt()'s ldlt_.factorize()
     double timer_ldlt_solve     = 0.0; // subset of timer_linear_solve: solve_using_ldlt()'s ldlt_.solve()
+    double timer_chol_assembly  = 0.0; // subset of timer_linear_solve: solve_using_chol()'s assembly of S
+    double timer_chol_analyze   = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->analyzePattern()
+    double timer_chol_factorize = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->factorize()
+    double timer_chol_solve     = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->solve()
     double timer_linesearch     = 0.0; // exact_linesearch
     double timer_state_update   = 0.0; // x, y2 update + termination check
 #endif
@@ -224,8 +230,16 @@ public:
     Vec Gtr_dy_;                              // size n = N (iterative_refine_dxdy scratch)
     Vec G_dx_;                                // size s = G.rows() (iterative_refine_dxdy scratch)
 
-    // Fallback of PCG: LDLT on KKT system [-H, G^T; G, (1/mu)I].
-    bool kkt_ldlt_used = false; // True means LDLT on KKT system was used at least once.
+    // Direct solver: factorizes the Newton system exactly, either the KKT system K = [-H, G^T; G, (1/mu)I]
+    // by LDLT (solve_using_ldlt()) or its Schur complement S = G H^{-1} G^T + (1/mu)I by Cholesky
+    // (solve_using_chol()), chosen by decide_direct_system(). Used throughout when direct_solve is set,
+    // and permanently once PCG has failed.
+    bool direct_solve = false;           // True means skip PCG and use the direct solver from the first SSN iteration (experimental).
+    bool pcg_failed = false;             // True means PCG failed once; the direct solver handles every later Newton solve.
+    bool direct_use_ldlt = false;        // decide_direct_system()'s return; true means LDLT on K, false means Cholesky on S.
+    int direct_ldlt_decisions_made_ = 0; // decide_direct_system() call count; locked after the first 3.
+    bool schur_chol_failed_ = false;     // True means Cholesky on S failed once; LDLT on K handles the rest of the run.
+    BoolArr all_cols_;                   // All-true mask over G's columns for choose_schur_ldlt(); built on first use.
 
     // Cached KKT matrix K = [-H, G^T; G, (1/mu)I].
     // When active_W changes (G's sparsity changes): rebuild K from triplets.
@@ -242,6 +256,15 @@ public:
     Eigen::SimplicialLDLT<SpMat> ldlt_;
     bool ldlt_pattern_dirty_ = true; // means K's dimension changed (n_active_W changed), requires analyzePattern.
     bool ldlt_numeric_dirty_ = true; // means K's values changed (H_diag or G rows swapped), requires factorize.
+
+    // Cached lower triangle of the Schur complement S = G H^{-1} G^T + (1/mu)I and its Cholesky factorization.
+    // Held by pointer so that a pattern change reseats a fresh solver and release_chol() frees it.
+    SpMat S_chol_;
+    std::unique_ptr<Eigen::SimplicialLLT<SpMat>> chol_;
+    bool chol_pattern_dirty_ = true;        // means S's sparsity changed (active_W changed), requires analyzePattern.
+    bool chol_numeric_dirty_ = true;        // means S's values changed (H_diag, mu or G rows), requires reassembly and factorize.
+    Eigen::Index chol_nnz_at_analyze_ = -1; // S's nonzero count at the last analyzePattern; a mismatch forces re-analysis.
+    Vec chol_Hinv_r1_, chol_rhs_;           // size n, s
 
     SSN(const int Q_info, const Vec& Q_diag, const SpMat& L,
         const SpMat& A, const SpMat& B, const SpMat& A_tr, const SpMat& B_tr,
@@ -299,7 +322,6 @@ public:
         this->delta_y1 = delta_y1;
         this->delta_z = delta_z;
 
-        ldlt_numeric_dirty_ = true;  // mu, rho may have changed.
         A_tr_y1_ = A_tr * y1;        // y1 is fixed for the entire SSN run; cache A^T y1 once.
         linesearch_fail = 0;         // Reset line search failure count for this SSN iteration.
         cg.preconditioner().reset_smw_fail_streak(); // Reset SMW suppression.
@@ -341,7 +363,11 @@ public:
     void retrieve_row_order(const Vec& u_sel, const Vec& u_unsel, const BoolArr& mask, Vec& out);
     bool choose_schur_ldlt(const SpMat& G, const BoolArr& active_K);
     Vec solve_using_cg(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv, const BoolArr& active_K, const Vec& r1, const Vec& r2, T mu, T tol, int max_iter, bool update_prec, bool G_pattern_changed, bool schur_use_ldlt);
+    void decide_direct_system(const SpMat& G);
+    Vec solve_direct(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv, const Vec& r1, const Vec& r2);
     Vec solve_using_ldlt(const SpMat& G, const Vec& H_diag, const Vec& r1, const Vec& r2);
+    Vec solve_using_chol(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv, const Vec& r1, const Vec& r2);
+    void release_chol();
     void iterative_refine_dxdy();
     SsnLineSearchParams<T> make_line_search_params();
     void solve_ssn(const T ssn_tol);
