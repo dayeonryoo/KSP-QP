@@ -12,6 +12,7 @@ function(ksp_qp_add_test name)
   gtest_discover_tests(${name})
 endfunction()
 
+ksp_qp_add_test(test_amd_ordering)
 ksp_qp_add_test(test_mps_format_parser)
 ksp_qp_add_test(test_problem)
 ksp_qp_add_test(test_solution)

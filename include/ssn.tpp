@@ -523,7 +523,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
 
             if (!chol_ || chol_pattern_dirty_) {
                 SSN_TIMER_BLOCK(timer_chol_analyze);
-                chol_ = std::make_unique<Eigen::SimplicialLLT<SpMat>>();
+                chol_ = std::make_unique<SimplicialLLT64<SpMat>>();
                 chol_->analyzePattern(S_chol_);
                 chol_nnz_at_analyze_ = S_chol_.nonZeros();
                 chol_pattern_dirty_ = false;

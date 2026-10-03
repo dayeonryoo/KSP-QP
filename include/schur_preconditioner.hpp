@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <memory>
 #include <variant>
+#include "amd_ordering.hpp"
 
 // Timer master switch; 0 (off) by default; set via -DSSN_ENABLE_TIMERS=1.
 #ifndef SSN_ENABLE_TIMERS
@@ -945,8 +946,10 @@ private:
 
     // Held by pointer, not by value: a pattern rebuild needs a solver with no stale symbolic
     // state, and Eigen's solvers are not copy-assignable, so the handle is simply reseated.
-    using LltType  = Eigen::SimplicialLLT<SpMat>;  // both default to Eigen::AMDOrdering<StorageIndex>
-    using LdltType = Eigen::SimplicialLDLT<SpMat>;
+    // Both order by AMD in 64-bit indices (amd_ordering.hpp): SpMat is int-indexed, and Eigen's
+    // default AMDOrdering<int> overflows on large patterns.
+    using LltType  = SimplicialLLT64<SpMat>;
+    using LdltType = SimplicialLDLT64<SpMat>;
     struct CholSolver {
         SpMat P;
         std::unique_ptr<LltType> llt;

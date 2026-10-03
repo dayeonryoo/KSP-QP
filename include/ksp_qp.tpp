@@ -336,8 +336,8 @@ void KSP_QP<T>::set_L_from_LLT(const SpMat& Q) {
         diag_idx[k] = static_cast<int>(&Q_reg.coeffRef(k, k) - Q_reg.valuePtr());
 
     // analyzePattern()+factorize() retry loop: on a meaningfully negative pivot, escalate the
-    // diagonal regularization and refactorize. Eigen's default ordering here is AMD.
-    Eigen::SimplicialLDLT<SpMat> ldlt;
+    // diagonal regularization and refactorize. The ordering is AMD, run in 64-bit indices (amd_ordering.hpp).
+    SimplicialLDLT64<SpMat> ldlt;
     ldlt.analyzePattern(Q_reg); // sparsity pattern is fixed across retries below; analyze once
 
     bool accepted = false;

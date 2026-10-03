@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <unsupported/Eigen/IterativeSolvers>
+#include "amd_ordering.hpp"
 #include "printing.hpp"
 #include "schur_operator.hpp"
 #include "schur_preconditioner.hpp"
@@ -256,14 +257,14 @@ public:
     std::vector<int> ldlt_diag_bot_idx_; // size s, bottom-right (1/mu)I block
 
     // Stored LDLT factorization of K.
-    Eigen::SimplicialLDLT<SpMat> ldlt_;
+    SimplicialLDLT64<SpMat> ldlt_;
     bool ldlt_pattern_dirty_ = true; // means K's dimension changed (n_active_W changed), requires analyzePattern.
     bool ldlt_numeric_dirty_ = true; // means K's values changed (H_diag or G rows swapped), requires factorize.
 
     // Cached lower triangle of the Schur complement S = G H^{-1} G^T + (1/mu)I and its Cholesky factorization.
     // Held by pointer so that a pattern change reseats a fresh solver and release_chol() frees it.
     SpMat S_chol_;
-    std::unique_ptr<Eigen::SimplicialLLT<SpMat>> chol_;
+    std::unique_ptr<SimplicialLLT64<SpMat>> chol_;
     bool chol_pattern_dirty_ = true;        // means S's sparsity changed (active_W changed), requires analyzePattern.
     bool chol_numeric_dirty_ = true;        // means S's values changed (H_diag, mu or G rows), requires reassembly and factorize.
     Eigen::Index chol_nnz_at_analyze_ = -1; // S's nonzero count at the last analyzePattern; a mismatch forces re-analysis.

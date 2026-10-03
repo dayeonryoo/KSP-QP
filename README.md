@@ -676,6 +676,7 @@ KSP-QP/
 │   ├── mps_format_parser.hpp/.tpp      # MPS / SIF / QPS file parser
 │   ├── printing.hpp                    # PrintWhen / PrintWhat runtime printing
 │   ├── record_result.hpp               # TestResult + benchmark CSV writers
+│   ├── amd_ordering.hpp                # AMD ordering in 64-bit indices for the sparse factorizations
 │   └── cli_args.hpp                    # minimal --flag value parsing for the drivers
 ├── src/                                # benchmark drivers (no solver code)
 │   ├── netlib.cpp                      # Netlib LP driver (--set feasible|infeasible)
@@ -690,6 +691,7 @@ KSP-QP/
 │   ├── test_problem.cpp
 │   ├── test_solution.cpp
 │   ├── test_printing.cpp
+│   ├── test_amd_ordering.cpp
 │   └── CMakeLists.txt
 ├── python/
 │   ├── ksp_qp_bind.cpp                 # pybind11 bindings
