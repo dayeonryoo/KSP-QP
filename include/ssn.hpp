@@ -230,11 +230,9 @@ public:
     Vec Gtr_dy_;                              // size n = N (iterative_refine_dxdy scratch)
     Vec G_dx_;                                // size s = G.rows() (iterative_refine_dxdy scratch)
 
-    // Direct solver: factorizes the Newton system exactly, either the KKT system K = [-H, G^T; G, (1/mu)I]
-    // by LDLT (solve_using_ldlt()) or its Schur complement S = G H^{-1} G^T + (1/mu)I by Cholesky
-    // (solve_using_chol()), chosen by decide_direct_system(). Used throughout when direct_solve is set,
-    // and permanently once PCG has failed.
-    bool direct_solve = false;           // True means skip PCG and use the direct solver from the first SSN iteration (experimental).
+    // Direct solver: PCG's fallback. Factorizes the Newton system exactly, either the KKT system
+    // K = [-H, G^T; G, (1/mu)I] by LDLT (solve_using_ldlt()) or its Schur complement S = G H^{-1} G^T + (1/mu)I
+    // by Cholesky (solve_using_chol()), chosen by decide_direct_system(). Used permanently once PCG has failed.
     bool pcg_failed = false;             // True means PCG failed once; the direct solver handles every later Newton solve.
     bool direct_use_ldlt = false;        // decide_direct_system()'s return; true means LDLT on K, false means Cholesky on S.
     int direct_ldlt_decisions_made_ = 0; // decide_direct_system() call count; locked after the first 3.

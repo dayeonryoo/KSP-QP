@@ -43,10 +43,9 @@ struct SchurPrecScopedTimer {
 //   SSN::PrepResult{update_prec, prec_pattern_changed}: both are (k_changed || w_changed).
 //   Threaded down through SSN::solve_newton_direction() -> SSN::solve_using_cg() -> here (arm()).
 //
-// Layer 2 -- SSN's own direct solver (see ssn.hpp/.tpp), used throughout when SSN::direct_solve is
-//            set and permanently once PCG has failed (SSN::pcg_failed): LDLT on the full KKT matrix
-//            (K_ldlt_) or Cholesky on its exact Schur complement (S_chol_), as chosen by
-//            SSN::decide_direct_system():
+// Layer 2 -- SSN's own direct solver (see ssn.hpp/.tpp), used permanently once PCG has failed
+//            (SSN::pcg_failed): LDLT on the full KKT matrix (K_ldlt_) or Cholesky on its exact
+//            Schur complement (S_chol_), as chosen by SSN::decide_direct_system():
 //   ldlt_pattern_dirty_ / chol_pattern_dirty_ : set on w_changed only -- active_W changes G's, hence
 //                         K_ldlt_'s and S_chol_'s, sparsity.
 //   ldlt_numeric_dirty_ / chol_numeric_dirty_ : set on w_changed or whenever prepare_newton_system()

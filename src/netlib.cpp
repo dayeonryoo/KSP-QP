@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
             "Usage: ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all]\n"
-            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct] [--out FILE] [--cooldown S] [--ref FILE]\n"
+            "                     [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S] [--ref FILE]\n"
             "  Solves one Netlib LP from ROOT/IN/PROBLEM.mps, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in, --ref and --out are resolved relative to this (default: ./)\n"
             "  --set SET        which problem set to use: feasible or infeasible (default: feasible)\n"
@@ -116,11 +116,8 @@ int main(int argc, char** argv) {
             "  --tol T          primal-dual tolerance (default: 1e-6)\n"
             "  --max-iter N     max PMM iterations (default: 3000)\n"
             "  --time-limit S   time limit in seconds (default: 60)\n"
-            "  --direct         experimental: skip PCG and factorize the KKT system (LDLT) or its Schur\n"
-            "                   complement (Cholesky) exactly at every SSN iteration\n"
             "  --out FILE       (--name all only) output CSV path, relative to --root\n"
-            "                   (default: results/pcg_netlib.csv or results/pcg_infeas.csv, per --set;\n"
-            "                   direct_ instead of pcg_ with --direct)\n"
+            "                   (default: results/pcg_netlib.csv or results/pcg_infeas.csv, per --set)\n"
             "  --cooldown S     (--name all only) seconds to sleep between problems (default: 0)\n"
             "  --ref FILE       (feasible set only) reference objectives CSV, relative to --root\n"
             "                   (default: data/netlib-main/feasible_gurobi_1e-8.csv)\n";
@@ -149,7 +146,12 @@ int main(int argc, char** argv) {
     T tol = cli::get_double(argc, argv, "--tol", 1e-6);
     double time_limit = cli::get_double(argc, argv, "--time-limit", 60.0); // in seconds
     int max_iter = cli::get_int(argc, argv, "--max-iter", 3000);
-    bool direct = cli::has_flag(argc, argv, "--direct");
+
+    // Unknown flags are otherwise ignored; fail loudly instead of silently running PCG.
+    if (cli::has_flag(argc, argv, "--direct")) {
+        std::cerr << "ERROR: --direct (forced direct factorization) is only available on branch direct-vs-pcg\n";
+        return 1;
+    }
 
     if (to_lower(name) == "all") {
         std::vector<std::string> stems = list_problems(data_dir);
@@ -170,8 +172,7 @@ int main(int argc, char** argv) {
         PrintWhat what = PrintWhat::TUNING;
         int cooldown_sec = cli::get_int(argc, argv, "--cooldown", 0);
 
-        std::string default_out = std::string("results/") + (direct ? "direct" : "pcg")
-                                + (infeasible_set ? "_infeas.csv" : "_netlib.csv");
+        std::string default_out = infeasible_set ? "results/pcg_infeas.csv" : "results/pcg_netlib.csv";
         std::string csv_path = root + cli::get_str(argc, argv, "--out", default_out);
         write_csv_header(csv_path);
 
@@ -193,7 +194,6 @@ int main(int argc, char** argv) {
                 // Construct the problem and solver
                 Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
                 KSP_QP<T> solver(prob);
-                solver.direct_solve = direct;
 
                 // Solve the LP
                 Solution<T> sol = solver.solve();
@@ -223,8 +223,7 @@ int main(int argc, char** argv) {
                 bool diverged = !infeasible_set && sol.pmm_tol_achieved > 1e0;
 
                 // Record result
-                std::string system = system_label(solver.direct_solve || solver.pcg_failed,
-                                                  solver.kkt_ldlt_fact, solver.schur_chol_fact);
+                std::string system = system_label(solver.pcg_failed, solver.kkt_ldlt_fact, solver.schur_chol_fact);
 
                 TestResult<T> result = {
                     system,
@@ -269,12 +268,11 @@ int main(int argc, char** argv) {
 
     Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
     KSP_QP<T> solver(prob);
-    solver.direct_solve = direct;
 
     // Solve:
     Solution<T> sol = solver.solve();
     sol.print_summary();
-    if (solver.direct_solve || solver.pcg_failed) {
+    if (solver.pcg_failed) {
         std::cout << "Direct-solver factorizations: KKT system (LDLT) = " << solver.kkt_ldlt_fact
                   << ", Schur complement (Cholesky) = " << solver.schur_chol_fact << "\n";
     }

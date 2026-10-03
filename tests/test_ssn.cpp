@@ -999,7 +999,7 @@ TEST(PrepareNewtonSystem, SchurLdltDecisionLocksAfterThreeActiveSetChanges) {
   EXPECT_EQ(ns.schur_ldlt_decisions_made_, 3);  // locked after the first 3 decisions
 }
 
-TEST(PrepareNewtonSystem, DirectModeDecidesOverAllColumnsWhereThePreconditionerDecidesOverActiveK) {
+TEST(PrepareNewtonSystem, DirectFallbackDecidesOverAllColumnsWhereThePreconditionerDecidesOverActiveK) {
   // One dense column over 10 equality rows, with x far outside its box so active_K is all false.
   // Preconditioner (active_K columns only): t = 0, K_nnz = S_nnz = 10, ratio 1 -> Cholesky.
   // Direct solver (all columns): K_nnz = 31, S_nnz = 100, ratio (10/11)*(31/100)^2 ~ 0.087 -> LDLT on K.
@@ -1022,7 +1022,7 @@ TEST(PrepareNewtonSystem, DirectModeDecidesOverAllColumnsWhereThePreconditionerD
   EXPECT_FALSE(ns_pcg.schur_use_ldlt);
 
   SSN<double> ns_direct = f.Make();
-  ns_direct.direct_solve = true;
+  ns_direct.pcg_failed = true;
   set_up(ns_direct);
   auto prep = ns_direct.prepare_newton_system();
   ASSERT_FALSE(ns_direct.active_K(0));
@@ -1035,14 +1035,14 @@ TEST(PrepareNewtonSystem, DirectModeDecidesOverAllColumnsWhereThePreconditionerD
   EXPECT_EQ(ns_direct.krylov_iter, 0);
 }
 
-TEST(PrepareNewtonSystem, DirectModeDecisionFollowsGThenLocksAfterThreeDecisions) {
+TEST(PrepareNewtonSystem, DirectFallbackDecisionFollowsGThenLocksAfterThreeDecisions) {
   // G = [ones(9,1); active rows of B], B = [1]. W inactive: s = 9, ratio (9/10)*(28/81)^2 ~ 0.1075
   // -> Cholesky on S. W active: s = 10, ratio (10/11)*(31/100)^2 ~ 0.087 -> LDLT on K.
   const SpMat A = DenseToSparse(Eigen::MatrixXd::Ones(9, 1));
   const SpMat B = DenseToSparse(Eigen::MatrixXd::Ones(1, 1));
   SsnFixture f(A, B);
   SSN<double> ns = f.Make();
-  ns.direct_solve = true;
+  ns.pcg_failed = true;
   Vec x0 = Vec::Zero(1), y10 = Vec::Zero(9), y20 = Vec::Zero(1), z0 = Vec::Zero(1);
   Vec dy10 = Vec::Zero(9), dz0 = Vec::Zero(1);
   ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, 1.0, 1.0, 0.95, 0);
@@ -1145,8 +1145,8 @@ TEST(SolveNewtonDirection, SatisfiesKktResidualWithDirectFallbackSchurPath) {
 namespace {
 
 // DefaultA/DefaultB state with dim 0 of x outside its box (nonzero r1_), at mu = rho = 1.
-void SetUpDirectModeDefaultState(SSN<double>& ns) {
-  ns.direct_solve = true;
+void SetUpDirectFallbackDefaultState(SSN<double>& ns) {
+  ns.pcg_failed = true;
   Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
   Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
   ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, /*mu=*/1.0, /*rho=*/1.0, 0.95, 0);
@@ -1159,16 +1159,16 @@ void SetUpDirectModeDefaultState(SSN<double>& ns) {
 
 }  // namespace
 
-TEST(SolveNewtonDirection, DirectModeSchurPathSatisfiesKktResidualWithoutKrylov) {
+TEST(SolveNewtonDirection, DirectFallbackDecidesSchurAndRefinementReusesItsFactorization) {
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
-  SetUpDirectModeDefaultState(ns);
+  SetUpDirectFallbackDefaultState(ns);
 
   auto prep = ns.prepare_newton_system();
   // G = A = [1, 1, 1] over all 3 columns: ratio = (1/4)*(10/1)^2 = 25, not < 0.1 -> Cholesky on S.
   EXPECT_FALSE(ns.direct_use_ldlt);
   EXPECT_EQ(ns.direct_ldlt_decisions_made_, 1);
-  EXPECT_EQ(ns.schur_ldlt_decisions_made_, 0);  // the preconditioner's choice isn't made in direct mode
+  EXPECT_EQ(ns.schur_ldlt_decisions_made_, 0);  // the preconditioner's choice isn't made once PCG has failed
   ns.solve_newton_direction(prep.update_prec, prep.prec_pattern_changed);
 
   ExpectNewtonSystemSolved(ns);
@@ -1176,15 +1176,15 @@ TEST(SolveNewtonDirection, DirectModeSchurPathSatisfiesKktResidualWithoutKrylov)
   EXPECT_EQ(ns.kkt_ldlt_fact, 0);
   EXPECT_EQ(ns.fact, 1);  // iterative refinement reused the factorization
   EXPECT_EQ(ns.krylov_iter, 0);
-  EXPECT_FALSE(ns.pcg_failed);
+  EXPECT_TRUE(ns.pcg_failed);  // the fallback is permanent
 }
 
-TEST(SolveNewtonDirection, DirectModeReusesAnUnchangedFactorizationAcrossSsnAndPmmIterations) {
+TEST(SolveNewtonDirection, DirectFallbackReusesAnUnchangedFactorizationAcrossSsnAndPmmIterations) {
   for (const bool use_ldlt : {false, true}) {
     SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
     SsnFixture f(DefaultA(), DefaultB());
     SSN<double> ns = f.Make();
-    SetUpDirectModeDefaultState(ns);
+    SetUpDirectFallbackDefaultState(ns);
     Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
     Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
 
@@ -1218,10 +1218,10 @@ TEST(SolveNewtonDirection, DirectModeReusesAnUnchangedFactorizationAcrossSsnAndP
   }
 }
 
-TEST(SolveNewtonDirection, DirectModeIterativeRefinementReusesTheFactorization) {
+TEST(SolveNewtonDirection, DirectFallbackIterativeRefinementReusesTheFactorization) {
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
-  SetUpDirectModeDefaultState(ns);
+  SetUpDirectFallbackDefaultState(ns);
 
   auto prep = ns.prepare_newton_system();
   ns.solve_newton_direction(prep.update_prec, prep.prec_pattern_changed);
@@ -1536,7 +1536,7 @@ TEST(SolveUsingChol, CholeskyFailureFallsBackToLdltOnKForTheRestOfTheRun) {
   // mu < 0 with a structurally empty G makes S = (1/mu)I = -I, which is not positive definite.
   SsnFixture f(DefaultA(), DefaultB());  // shape is irrelevant here; only used to construct SSN
   SSN<double> ns = f.Make();
-  ns.direct_solve = true;
+  ns.pcg_failed = true;
   ns.mu = -1.0;
 
   SpMat G(1, 1);  // structurally empty: no stored nonzero entries at all
@@ -1781,10 +1781,10 @@ void ExpectAllSolvePathsAgree(const SpMat& A, const SpMat& B, const BoolArr& act
       << "SMW-from-LDLT path did not actually engage SMW; the agreement check below would be "
          "vacuous.";
 
-  // The direct solver (direct mode), pinned to each of its systems: no PCG/preconditioner at all.
-  auto solve_direct_mode = [&](SSN<double>& ns, bool use_ldlt) {
+  // The direct solver (PCG's fallback), pinned to each of its systems: no PCG/preconditioner at all.
+  auto solve_direct_fallback = [&](SSN<double>& ns, bool use_ldlt) {
     setup_ns(ns);
-    ns.direct_solve = true;
+    ns.pcg_failed = true;
     ns.direct_use_ldlt = use_ldlt;
     ns.direct_ldlt_decisions_made_ = 1;
     return ns.solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1, r2, mu, ns.krylov_tol,
@@ -1792,11 +1792,11 @@ void ExpectAllSolvePathsAgree(const SpMat& A, const SpMat& B, const BoolArr& act
                              /*prec_pattern_changed=*/true, /*schur_use_ldlt=*/false);
   };
   SSN<double> ns_direct_kkt = f.Make();
-  const Vec sol_direct_kkt = solve_direct_mode(ns_direct_kkt, /*use_ldlt=*/true);
+  const Vec sol_direct_kkt = solve_direct_fallback(ns_direct_kkt, /*use_ldlt=*/true);
   ASSERT_EQ(ns_direct_kkt.kkt_ldlt_fact, 1) << "direct LDLT-on-K path was not actually taken";
   ASSERT_EQ(ns_direct_kkt.krylov_iter, 0);
   SSN<double> ns_direct_schur = f.Make();
-  const Vec sol_direct_schur = solve_direct_mode(ns_direct_schur, /*use_ldlt=*/false);
+  const Vec sol_direct_schur = solve_direct_fallback(ns_direct_schur, /*use_ldlt=*/false);
   ASSERT_EQ(ns_direct_schur.schur_chol_fact, 1) << "direct Cholesky-on-S path was not actually taken";
   ASSERT_EQ(ns_direct_schur.krylov_iter, 0);
 
@@ -2478,14 +2478,14 @@ TEST(SolveSsn, ConvergesToStrictlyInteriorMinimizerWithNoEqualityOrInequalityCon
   EXPECT_EQ(ns.n_active_W, 0);
 }
 
-// Direct-mode twins of the two tests above. M=0, l=0 makes G a 0-row matrix, so K = -H and every
+// Direct-fallback twins of the two tests above. M=0, l=0 makes G a 0-row matrix, so K = -H and every
 // Newton solve is exact without any factorization: solve_direct()'s s == 0 short-circuit end to end.
-TEST(SolveSsn, DirectModeConvergesToAnalyticMinimizerWithNoEqualityOrInequalityConstraints) {
+TEST(SolveSsn, DirectFallbackConvergesToAnalyticMinimizerWithNoEqualityOrInequalityConstraints) {
   SpMat A(0, 1), B(0, 1);  // M = 0, l = 0
   SsnFixture f(A, B);
   f.c(0) = 1.0;
   SSN<double> ns = f.Make();
-  ns.direct_solve = true;
+  ns.pcg_failed = true;
 
   Vec x0(1);
   x0 << 0.0;
@@ -2501,12 +2501,12 @@ TEST(SolveSsn, DirectModeConvergesToAnalyticMinimizerWithNoEqualityOrInequalityC
   EXPECT_EQ(ns.krylov_iter, 0);
 }
 
-TEST(SolveSsn, DirectModeConvergesToStrictlyInteriorMinimizerWithNoEqualityOrInequalityConstraints) {
+TEST(SolveSsn, DirectFallbackConvergesToStrictlyInteriorMinimizerWithNoEqualityOrInequalityConstraints) {
   SpMat A(0, 1), B(0, 1);  // M = 0, l = 0
   SsnFixture f(A, B);
   f.c(0) = 0.2;
   SSN<double> ns = f.Make();
-  ns.direct_solve = true;
+  ns.pcg_failed = true;
 
   Vec x0(1);
   x0 << 0.0;

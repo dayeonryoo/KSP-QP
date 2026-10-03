@@ -159,8 +159,8 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
                                             bool schur_use_ldlt) {
     using Vec = typename SSN<T>::Vec;
 
-    // Direct solver: throughout in direct mode, and permanently once PCG has failed.
-    if (direct_solve || pcg_failed)
+    // Direct solver: permanently once PCG has failed.
+    if (pcg_failed)
         return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
 
     const int s = G.rows();
@@ -782,12 +782,11 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     }
 
     // Determines the factorization method, each locked after its first 3 decisions:
-    // for the direct solver (K or S, over all columns) once it is in use, otherwise for the PCG preconditioner.
-    const bool use_direct = direct_solve || pcg_failed;
-    if ((delta.k_changed || delta.w_changed) && use_direct && direct_ldlt_decisions_made_ < 3) {
+    // for the direct solver (K or S, over all columns) once PCG has failed, otherwise for the PCG preconditioner.
+    if ((delta.k_changed || delta.w_changed) && pcg_failed && direct_ldlt_decisions_made_ < 3) {
         SSN_TIMER_BLOCK(timer_prep);
         decide_direct_system(G);
-    } else if ((delta.k_changed || delta.w_changed) && !use_direct && schur_ldlt_decisions_made_ < 3) {
+    } else if ((delta.k_changed || delta.w_changed) && !pcg_failed && schur_ldlt_decisions_made_ < 3) {
         SSN_TIMER_BLOCK(timer_prep);
         schur_use_ldlt = choose_schur_ldlt(G, active_K);
         ++schur_ldlt_decisions_made_;
@@ -996,7 +995,7 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
                 timer_prec_assembly, timer_prec_analyze, timer_prec_factorize, timer_krylov_solve,
                 timer_linesearch, timer_state_update);
 
-            // If the direct solver ran (direct mode, or after PCG failed), report LDLT on K and Cholesky on S.
+            // If the direct solver ran (after PCG failed), report LDLT on K and Cholesky on S.
             const double ldlt_total = timer_ldlt_analyze + timer_ldlt_factorize + timer_ldlt_solve;
             if (ldlt_total > 0.0) {
                 fprintf(stderr,

@@ -150,7 +150,7 @@ def _worker_ssn(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumpe
         pd_data = _generate(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass,
                              discretization)
         result["n_vars"] = pd_data["n"]
-        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, direct=True)
+        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit)
     except Exception as e:
         result["error"] = str(e)
     conn.send(result)

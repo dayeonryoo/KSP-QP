@@ -126,7 +126,6 @@ public:
     T rho_limit = 1e7;
     T alpha = 0.95;
     double time_limit = 600.0; // in seconds
-    bool direct_solve = false; // experimental: skip PCG and factorize K (LDLT) or its Schur complement (Cholesky) every SSN iteration
     int linesearch_fail = 0;
 
     // Primal/dual infeasibility certificate tolerances.

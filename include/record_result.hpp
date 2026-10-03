@@ -37,8 +37,8 @@ struct TestResult {
 };
 
 // System column: "S" if every Newton system was solved by PCG on the Schur complement; otherwise
-// (direct mode, or after PCG failed) "D" followed by "K" if the KKT system was factorized (LDLT)
-// and "S" if its Schur complement was (Cholesky).
+// (PCG failed and the direct solver took over) "D" followed by "K" if the KKT system was factorized
+// (LDLT) and "S" if its Schur complement was (Cholesky).
 inline std::string system_label(bool direct_solver_used, int kkt_ldlt_fact, int schur_chol_fact) {
     if (!direct_solver_used) return "S";
     std::string label = "D";

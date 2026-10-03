@@ -1800,127 +1800,10 @@ TEST(SolvePrimalInfeasCertificateOrdering, FreshDeltaY1AfterMultiplierUpdateDete
   EXPECT_FALSE(pmm.primal_infeas(stale_delta_y1, cert_y2_vec, stale_delta_z));
 }
 
-// ===================== direct mode =====================
-// Hand-verified problems from the end-to-end regressions above, with every SSN Newton system
-// factorized exactly (LDLT on the KKT system or Cholesky on its Schur complement) instead of PCG.
+// ===================== direct fallback =====================
+// The direct solver only takes over after PCG fails, so a problem PCG solves never touches it.
 
-namespace {
-
-// Direct-mode bookkeeping: no Krylov work, every factorization is K's or S's, and at most one
-// factorization per Newton solve (iterative refinement and unchanged matrices reuse it).
-void ExpectDirectModeAccounting(const KSP_QP<double>& ns, const Solution<double>& sol) {
-  EXPECT_EQ(sol.krylov_iter, 0);
-  EXPECT_FALSE(ns.pcg_failed);
-  EXPECT_EQ(ns.kkt_ldlt_fact + ns.schur_chol_fact, sol.fact);
-  EXPECT_LE(sol.fact, sol.ssn_iter + sol.pmm_iter + 1);
-}
-
-}  // namespace
-
-TEST(KspQpSolveDirectMode, BoxConstrainedQpActivatesUpperBound) {
-  SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 2.0, 0.0, 0.0, 4.0).finished());
-  Vec c(2);
-  c << -4.0, -8.0;
-  auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), c, Vec(0), 0.0,
-                              Vec::Constant(2, -1.0), Vec::Constant(2, 1.0), Vec(0), Vec(0));
-  KSP_QP<double> ns(problem);
-  ASSERT_FALSE(ns.setup_failed);
-  ns.direct_solve = true;
-  auto sol = ns.solve();
-
-  EXPECT_EQ(sol.opt, TerminationStatus::Optimal);
-  Vec expected_x(2);
-  expected_x << 1.0, 1.0;
-  EXPECT_TRUE(sol.x.isApprox(expected_x, kTol));
-  EXPECT_NEAR(sol.obj_val, -9.0, kTol * 10);
-  ExpectDirectModeAccounting(ns, sol);
-}
-
-TEST(KspQpSolveDirectMode, EqualityConstrainedLpMatchesHandSolvedVertex) {
-  SpMat A = DenseToSparse((Eigen::MatrixXd(1, 2) << 1.0, 1.0).finished());
-  Vec c(2);
-  c << 1.0, -1.0;
-  Vec b(1);
-  b << 1.0;
-  auto problem = MakeProblem(2, 1, 0, SpMat(2, 2), A, SpMat(0, 2), c, b, 0.0, Vec::Constant(2, 0.0),
-                              Vec::Constant(2, 1.0), Vec(0), Vec(0));
-  KSP_QP<double> ns(problem);
-  ASSERT_FALSE(ns.setup_failed);
-  ns.direct_solve = true;
-  auto sol = ns.solve();
-
-  EXPECT_EQ(sol.opt, TerminationStatus::Optimal);
-  Vec expected_x(2);
-  expected_x << 0.0, 1.0;
-  EXPECT_TRUE(sol.x.isApprox(expected_x, kTol));
-  EXPECT_NEAR(sol.obj_val, -1.0, kTol * 10);
-  ExpectDirectModeAccounting(ns, sol);
-  EXPECT_GT(sol.fact, 0);
-}
-
-TEST(KspQpSolveDirectMode, InequalityConstrainedQpMatchesKktBySubstitution) {
-  SpMat Q = DenseToSparse((Eigen::MatrixXd(1, 1) << 2.0).finished());
-  SpMat B = DenseToSparse((Eigen::MatrixXd(1, 1) << 1.0).finished());
-  Vec c(1);
-  c << -4.0;
-  Vec lw(1), uw(1);
-  lw << -100.0;
-  uw << 0.5;
-  auto problem = MakeProblem(1, 0, 1, Q, SpMat(0, 1), B, c, Vec(0), 0.0, Vec::Constant(1, -kInf),
-                              Vec::Constant(1, kInf), lw, uw);
-  KSP_QP<double> ns(problem);
-  ASSERT_FALSE(ns.setup_failed);
-  ns.direct_solve = true;
-  auto sol = ns.solve();
-
-  EXPECT_EQ(sol.opt, TerminationStatus::Optimal);
-  EXPECT_NEAR(sol.x(0), 0.5, kTol);
-  EXPECT_NEAR(sol.obj_val, -1.75, kTol * 10);
-  ExpectDirectModeAccounting(ns, sol);
-}
-
-TEST(KspQpSolveDirectMode, GeneralPositiveSemidefiniteQReformulationMatchesClosedForm) {
-  SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 2.0, 1.0, 1.0, 2.0).finished());
-  Vec c(2);
-  c << -3.0, -3.0;
-  auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), c, Vec(0), 0.0,
-                              Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
-  KSP_QP<double> ns(problem);
-  ASSERT_FALSE(ns.setup_failed);
-  ASSERT_EQ(ns.Q_info, 2);
-  ns.direct_solve = true;
-  auto sol = ns.solve();
-
-  EXPECT_EQ(sol.opt, TerminationStatus::Optimal);
-  Vec expected_x(2);
-  expected_x << 1.0, 1.0;
-  EXPECT_TRUE(sol.x.isApprox(expected_x, kTol));
-  ExpectDirectModeAccounting(ns, sol);
-  EXPECT_GT(sol.fact, 0);  // the reformulation's L^T x - v = 0 rows make G non-empty
-}
-
-TEST(KspQpSolveDirectMode, LpWithOneDenseColumnFactorizesOnlyTheKktSystem) {
-  // min x s.t. 10 identical rows x = 0.5, 0 <= x <= 1  =>  x* = 0.5, obj* = 0.5.
-  // G's single column is dense over s = 10 rows: ratio (10/11)*(31/100)^2 ~ 0.087 < 0.1 -> LDLT on K.
-  SpMat A = DenseToSparse(Eigen::MatrixXd::Ones(10, 1));
-  Vec c(1);
-  c << 1.0;
-  auto problem = MakeProblem(1, 10, 0, SpMat(1, 1), A, SpMat(0, 1), c, Vec::Constant(10, 0.5), 0.0,
-                              Vec::Constant(1, 0.0), Vec::Constant(1, 1.0), Vec(0), Vec(0));
-  KSP_QP<double> ns(problem);
-  ASSERT_FALSE(ns.setup_failed);
-  ns.direct_solve = true;
-  auto sol = ns.solve();
-
-  EXPECT_EQ(sol.opt, TerminationStatus::Optimal);
-  EXPECT_NEAR(sol.x(0), 0.5, kTol);
-  EXPECT_NEAR(sol.obj_val, 0.5, kTol * 10);
-  ExpectDirectModeAccounting(ns, sol);
-  EXPECT_GT(ns.kkt_ldlt_fact, 0);
-  EXPECT_EQ(ns.schur_chol_fact, 0);
-}
-
-TEST(KspQpSolveDirectMode, DefaultModeNeverUsesTheDirectSolverWhenPcgSucceeds) {
+TEST(KspQpSolveEndToEnd, PcgSuccessNeverUsesTheDirectFallback) {
   SpMat A = DenseToSparse((Eigen::MatrixXd(1, 2) << 1.0, 1.0).finished());
   Vec c(2);
   c << 1.0, -1.0;
@@ -1933,7 +1816,6 @@ TEST(KspQpSolveDirectMode, DefaultModeNeverUsesTheDirectSolverWhenPcgSucceeds) {
   auto sol = ns.solve();
 
   EXPECT_EQ(sol.opt, TerminationStatus::Optimal);
-  EXPECT_FALSE(ns.direct_solve);
   EXPECT_FALSE(ns.pcg_failed);
   EXPECT_EQ(ns.kkt_ldlt_fact, 0);
   EXPECT_EQ(ns.schur_chol_fact, 0);

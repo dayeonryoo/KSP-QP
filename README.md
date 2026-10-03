@@ -266,8 +266,8 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `pmm_iter` | `int` | PMM outer iterations performed |
 | `ssn_iter` | `int` | Total SSN inner iterations |
 | `krylov_iter` | `int` | Total Krylov iterations |
-| `fact` | `int` | Preconditioner factorizations performed |
-| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates performed |
+| `fact` | `int` | Factorizations performed (of the preconditioner; of K or S by the direct solver after a PCG failure) |
+| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates of the preconditioner used instead of refactorizing it |
 | `pmm_tol_achieved` | `T` | Final PMM (outer) residual |
 | `ssn_tol_achieved` | `T` | Final SSN (inner) residual |
 | `setup_time` | `double` | Wall-clock seconds in the `KSP_QP<T>` constructor |
@@ -299,9 +299,13 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 **`solve_from_sif(filename, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0)`**
 Parse and solve a SIF/MPS file. Returns a dict with keys:
 `status`, `obj_val`, `setup_time`, `solve_time`, `run_time`, `pmm_iter`, `ssn_iter`,
-`krylov_iter`, `fact`, `smw_count`, `pmm_tol_achieved`, `x`, `y1`, `y2`, `z`.
+`krylov_iter`, `fact`, `smw_count`, `pmm_tol_achieved`, `system`, `kkt_ldlt_fact`,
+`schur_chol_fact`, `x`, `y1`, `y2`, `z`.
 `x` and the multipliers are returned in the original, unscaled units, so they can be
-checked directly against the problem data as given.
+checked directly against the problem data as given. `system` is `"S"` when only PCG ran;
+if PCG failed and the direct solver took over, it is `"D"` followed by `"K"` and/or `"S"` for
+the systems it factorized (LDLT on the KKT system, Cholesky on its Schur complement), which
+`kkt_ldlt_fact` / `schur_chol_fact` count.
 
 **`solve_from_data(pd, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, trace_path="", rho_init=-1.0)`**
 Same, but takes already-parsed problem data — the dict returned by `parse_sif()`, or the one

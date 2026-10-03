@@ -911,7 +911,6 @@ Solution<T> KSP_QP<T>::solve() {
     // Neutral by default: report_'s default body just calls print() with this->when/what,
     // same values NS was constructed with.
     NS.report_ = report_;
-    NS.direct_solve = direct_solve;
 
     // Print header.
     print_header(when, what);
