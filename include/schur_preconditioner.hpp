@@ -221,7 +221,8 @@ public:
                                       // row of P/P_hat, so this is a full-rank shift.
         RankExceedsThreshold,         // Active-set delta rank exceeds the SMW update-size threshold.
         ReusedSnapshot,               // Rank 0: the active sets match the snapshot, whose factorization is reused as is.
-        SingularCapacitance,          // Capacitance matrix was (near-)singular; fell back to full rebuild.
+        SingularCapacitance,          // Equilibrated capacitance matrix was (near-)singular or non-finite;
+                                      // fell back to full rebuild.
     };
 
     Eigen::ComputationInfo info() const { return info_; }
@@ -284,6 +285,7 @@ public:
         V_plus_.resize(0, 0);
         Y_all_.resize(0, 0);
         S_lambda_lu_ = Eigen::FullPivLU<Mat>();
+        S_lambda_eq_scale_.resize(0);
 
         smw_e_new_b_.resize(0);
         std::vector<int>().swap(smw_touched_);
@@ -367,9 +369,10 @@ private:
         if (q_ > 0)
             Lambda_all_.tail(q_).noalias() -= V_plus_.transpose() * u_base_;
 
-        // Capacitance solve
-        lambda_work_ = S_lambda_lu_.solve(Lambda_all_);
-        Lambda_all_  = lambda_work_;
+        // Capacitance solve through the equilibrated factorization D S_Lambda D.
+        lambda_work_ = S_lambda_eq_scale_.cwiseProduct(Lambda_all_);
+        Lambda_all_  = S_lambda_lu_.solve(lambda_work_);
+        Lambda_all_  = S_lambda_eq_scale_.cwiseProduct(Lambda_all_);
 
         // z_base = u_base - Y_all * Lambda_all
         z_base_  = u_base_;
@@ -811,30 +814,50 @@ private:
 
     // Phase 5: factor the capacitance matrix S_Lambda = M_sub - V_all^T Y_all_;
     // on near-singularity, caller falls back to a full rebuild.
+    // Its blocks live on very different scales (flipped columns ~ H ~ 1/rho, added rows ~ |b|^2 / H,
+    // up to rho |b|^2), so a rank test relative to the largest pivot would discard well-conditioned
+    // updates. Equilibrate symmetrically first:
+    // tau_i = max(|M_sub_ii|, |(V_all^T Y_all)_ii|) is the scale of the two terms combined in
+    // S_Lambda_ii, so genuine cancellation still shows up as a small pivot, and a lone small pivot
+    // is caught by measuring against max(1, largest pivot).
     bool factorize_capacitance(const Mat& M_sub) {
         const int rank = h_ + p_ + q_;
-        Mat S_Lambda = M_sub;
+        Mat VtY = Mat::Zero(rank, rank);
 
-        // Rows 0..h_-1: -(E_-)^T Y_all_ = -Y_all_.row(del_k)
+        // Rows 0..h_-1: (E_-)^T Y_all_ = Y_all_.row(del_k)
         for (int k = 0; k < h_; ++k)
-            S_Lambda.row(k) -= Y_all_.row(deleted_old_rows_[k]);
+            VtY.row(k) = Y_all_.row(deleted_old_rows_[k]);
 
-        // Rows h_..h_+p_-1: -(G_old_col_j)^T Y_all_
+        // Rows h_..h_+p_-1: (G_old_col_j)^T Y_all_
         for (int j = 0; j < p_; ++j)
             for (typename SpMat::InnerIterator it(G_old_, delta_K_idx_[j]); it; ++it)
-                S_Lambda.row(h_ + j) -= it.value() * Y_all_.row(it.row());
+                VtY.row(h_ + j) += it.value() * Y_all_.row(it.row());
 
-        // Rows h_+p_..rank-1: -V_plus_^T Y_all_
+        // Rows h_+p_..rank-1: V_plus_^T Y_all_
         if (q_ > 0)
-            S_Lambda.bottomRows(q_).noalias() -= V_plus_.transpose() * Y_all_;
+            VtY.bottomRows(q_).noalias() = V_plus_.transpose() * Y_all_;
 
-        S_lambda_lu_.setThreshold(std::sqrt(std::numeric_limits<T>::epsilon()));
-        S_lambda_lu_.compute(S_Lambda);
-        if (S_lambda_lu_.rank() < rank) {
-            // Near-singular capacitance matrix; fall back to full rebuild.
+        // Near-singular (or non-finite) capacitance matrix; fall back to full rebuild.
+        auto reject = [this] {
             smw_last_reject_reason_ = SmwRejectReason::SingularCapacitance;
             return false;
+        };
+
+        Mat S_Lambda = M_sub - VtY;
+        if (!S_Lambda.allFinite()) return reject();
+
+        S_lambda_eq_scale_.resize(rank);
+        for (int i = 0; i < rank; ++i) {
+            const T tau = std::max(std::abs(M_sub(i, i)), std::abs(VtY(i, i)));
+            if (!(tau > T(0))) return reject();
+            S_lambda_eq_scale_(i) = T(1) / std::sqrt(tau);
         }
+        S_Lambda = S_lambda_eq_scale_.asDiagonal() * S_Lambda * S_lambda_eq_scale_.asDiagonal();
+
+        S_lambda_lu_.compute(S_Lambda);
+        const Vec pivots = S_lambda_lu_.matrixLU().diagonal().cwiseAbs();
+        const T pivot_tol = std::sqrt(std::numeric_limits<T>::epsilon()) * std::max(T(1), pivots.maxCoeff());
+        if (!(pivots.minCoeff() > pivot_tol)) return reject();
         return true;
     }
 
@@ -976,7 +999,8 @@ private:
     std::vector<int> delta_K_idx_;
     Mat V_plus_;
     Mat Y_all_;
-    Eigen::FullPivLU<Mat> S_lambda_lu_;
+    Eigen::FullPivLU<Mat> S_lambda_lu_; // of the equilibrated capacitance matrix D S_Lambda D
+    Vec S_lambda_eq_scale_;             // D's diagonal
 
     // Scratch buffers reused across try_build_smw()
     Vec smw_e_new_b_;              // sized N = G_old_.cols(); build_capacitance_setup() scratch
