@@ -302,16 +302,74 @@ void SSN<T>::decide_direct_system(const SpMat& G) {
     if (direct_use_ldlt) release_chol(); // no-op unless switching away from the Schur complement
 }
 
-template <typename T> // Direct solver: dispatches to LDLT on K or Cholesky on S
+template <typename T>
+typename SchurSmwUpdate<T>::BaseSolve SSN<T>::direct_base_solve(bool use_ldlt) {
+    // S^{-1} v through the stored factorization: Cholesky on S directly, or the trailing block of
+    // K^{-1} [0; v] for LDLT on K, since (K^{-1})_{22} = S^{-1}.
+    if (use_ldlt) {
+        return [this](const Vec& v, Vec& out) {
+            direct_smw_pad_.setZero(ldlt_.rows());
+            direct_smw_pad_.tail(v.size()) = v;
+            out = ldlt_.solve(direct_smw_pad_).tail(v.size());
+        };
+    }
+    return [this](const Vec& v, Vec& out) { out = chol_->solve(v); };
+}
+
+template <typename T> // Direct solver: dispatches to an SMW update of the last factorization, LDLT on K or Cholesky on S
 typename SSN<T>::Vec SSN<T>::solve_direct(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv,
                                           const Vec& r1, const Vec& r2) {
     // No rows in G: K = -H, so dx = -H^{-1} r1 exactly and there is nothing to factorize.
-    if (G.rows() == 0) return -H_diag_inv.cwiseProduct(r1);
+    if (G.rows() == 0) {
+        direct_smw_.deactivate();
+        return -H_diag_inv.cwiseProduct(r1);
+    }
 
     // First direct solve without a decision yet (right after PCG failed): decide now.
     if (direct_ldlt_decisions_made_ == 0) decide_direct_system(G);
+    const bool use_ldlt = direct_use_ldlt || schur_chol_failed_;
 
-    if (direct_use_ldlt || schur_chol_failed_)
+    // The Newton matrix changed since the last setup. In direct mode, if the factorization in use would be
+    // redone, first try an SMW update of it against its snapshot. Refinement solves skip this block and
+    // reuse whatever the main solve set up.
+    if (direct_stale_) {
+        direct_stale_ = false;
+        direct_smw_.deactivate();
+        const bool refactor_pending = use_ldlt ? (ldlt_pattern_dirty_ || ldlt_numeric_dirty_)
+                                               : (!chol_ || chol_pattern_dirty_ || chol_numeric_dirty_);
+        if (direct_smw_enabled() && !direct_force_full_ && refactor_pending) {
+            SSN_TIMER_BLOCK(timer_direct_smw_setup);
+            const auto outcome = direct_smw_.setup(G, H_diag, active_W, B_rm, mu, rho, use_ldlt,
+                                                   direct_base_solve(use_ldlt));
+            if (outcome == SchurSmwUpdate<T>::Outcome::Updated) {
+                ++direct_smw_count;
+            } else if (outcome == SchurSmwUpdate<T>::Outcome::ReusedSnapshot) {
+                // The active sets are back to the snapshot's: the stored factorization is exact again.
+                if (use_ldlt) ldlt_pattern_dirty_ = ldlt_numeric_dirty_ = false;
+                else          chol_pattern_dirty_ = chol_numeric_dirty_ = false;
+            }
+        }
+        direct_force_full_ = false;
+    }
+
+    if (direct_smw_enabled() && direct_smw_.active() && direct_smw_.rows() == G.rows() &&
+        direct_smw_.snapshot_base_is_ldlt() == use_ldlt) {
+        SSN_TIMER_BLOCK(timer_direct_smw_solve);
+        // Solve S dy = G H^{-1} r1 + r2 through the update, then recover dx = H^{-1} (G^T dy - r1).
+        const int s = G.rows();
+        const int n = G.cols();
+        direct_smw_Hinv_r1_.noalias() = H_diag_inv.cwiseProduct(r1);
+        direct_smw_rhs_.noalias() = G * direct_smw_Hinv_r1_ + r2;
+        direct_smw_.solve(direct_smw_rhs_, direct_base_solve(use_ldlt), direct_smw_dy_);
+
+        Vec result(n + s);
+        result.head(n) = H_diag_inv.cwiseProduct(G_tr * direct_smw_dy_ - r1);
+        result.tail(s) = direct_smw_dy_;
+        return result;
+    }
+    direct_smw_.deactivate();
+
+    if (use_ldlt)
         return solve_using_ldlt(G, H_diag, r1, r2);
     return solve_using_chol(G, G_tr, H_diag, H_diag_inv, r1, r2);
 }
@@ -336,6 +394,9 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
     }
 
     if (ldlt_pattern_dirty_ || ldlt_numeric_dirty_) {
+        // K_ldlt_ and ldlt_ are about to change, so an SMW snapshot of the old factorization no longer holds.
+        direct_smw_.invalidate();
+
         if (ldlt_pattern_dirty_ || !K_ldlt_built_) {
             // Full rebuild: G's sparsity changed (active_W changed) or first call.
             // Assemble K = [-H, G^T; G, (1/mu) I] from triplets and cache it.
@@ -392,6 +453,9 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
         ldlt_numeric_dirty_ = false;
         fact++;
         kkt_ldlt_fact++;
+
+        // Record the factorized K for later SMW updates (direct mode only).
+        if (direct_smw_enabled()) direct_smw_.snapshot(G, H_diag, active_W, mu, rho, /*base_is_ldlt=*/true);
     }
 
     Vec result;
@@ -428,6 +492,9 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
     bool ok = true;
     const char* reason = "";
     if (!chol_ || chol_pattern_dirty_ || chol_numeric_dirty_) {
+        // S_chol_ and chol_ are about to change, so an SMW snapshot of the old factorization no longer holds.
+        direct_smw_.invalidate();
+
         try {
             {
                 SSN_TIMER_BLOCK(timer_chol_assembly);
@@ -472,6 +539,8 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
                 reason = "not numerically positive definite";
             } else {
                 chol_numeric_dirty_ = false;
+                // Record the factorized S for later SMW updates (direct mode only).
+                if (direct_smw_enabled()) direct_smw_.snapshot(G, H_diag, active_W, mu, rho, /*base_is_ldlt=*/false);
             }
         } catch (const std::bad_alloc&) {
             ok = false;
@@ -514,6 +583,10 @@ void SSN<T>::release_chol() {
     chol_pattern_dirty_ = true;
     chol_numeric_dirty_ = true;
     chol_nnz_at_analyze_ = -1;
+
+    // An SMW snapshot of the Cholesky factorization goes with it; one of the LDLT factorization stays valid
+    // (decide_direct_system() calls this on every decision for K, not only on a switch).
+    if (direct_smw_.has_snapshot() && !direct_smw_.snapshot_base_is_ldlt()) direct_smw_.invalidate();
 }
 
 template <typename T>
@@ -724,9 +797,13 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     bool recompute_H = delta.k_changed || (mu != H_diag_mu_) || (rho != H_diag_rho_);
 
     // These are for the direct solver (LDLT on K, Cholesky on S): their sparsity follows G (active_W),
-    // and their values change exactly when H_diag is recomputed or G is rebuilt.
+    // and their values change exactly when H_diag is recomputed or G is rebuilt. direct_stale_ makes the
+    // next solve_direct() set up for the new matrix (an SMW update or a refactorization).
     if (delta.w_changed) ldlt_pattern_dirty_ = chol_pattern_dirty_ = true;
-    if (recompute_H || delta.w_changed) ldlt_numeric_dirty_ = chol_numeric_dirty_ = true;
+    if (recompute_H || delta.w_changed) {
+        ldlt_numeric_dirty_ = chol_numeric_dirty_ = true;
+        direct_stale_ = true;
+    }
 
     if (recompute_H) {
         SSN_TIMER_BLOCK(timer_prep);
@@ -797,13 +874,16 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
 }
 
 template <typename T>
-void SSN<T>::iterative_refine_dxdy() {
+typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_residual) {
     // Iterative refinement: correct the residual of K [dx;dy] = [r1_;r2_], K = [-H, G^T; G, (1/mu)I].
+    // The residual after the last of refine_max_iter corrections is measured only if need_final_residual.
     const int s = static_cast<int>(r2_.size());
     const T ref_norm = std::max(inf_norm(r1_), inf_norm(r2_));
+    T res_norm = std::numeric_limits<T>::quiet_NaN();
     Vec rho1(N), rho2(s);
 
-    for (int k = 0; k < refine_max_iter; ++k) {
+    const int last_k = need_final_residual ? refine_max_iter : refine_max_iter - 1;
+    for (int k = 0; k <= last_k; ++k) {
         const auto dx_k = dxdy_.head(N);
         const auto dy_k = dxdy_.tail(s);
         Gtr_dy_.noalias() = G_tr * dy_k;
@@ -811,8 +891,8 @@ void SSN<T>::iterative_refine_dxdy() {
         rho1 = r1_ + H_diag.cwiseProduct(dx_k) - Gtr_dy_;
         rho2 = r2_ - G_dx_ - dy_k / mu;
 
-        const T res_norm = std::max(inf_norm(rho1), inf_norm(rho2));
-        if (res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol)) break;
+        res_norm = std::max(inf_norm(rho1), inf_norm(rho2));
+        if (res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol) || k == refine_max_iter) break;
 
         prev_dy_.resize(0); // cold-start for iterative refinement
         Vec correction = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, rho1, rho2,
@@ -820,6 +900,7 @@ void SSN<T>::iterative_refine_dxdy() {
         dxdy_ += correction;
         prev_dy_ = dxdy_.tail(s); // warm-start for the next SSN iteration's main solve
     }
+    return {res_norm, ref_norm};
 }
 
 template <typename T>
@@ -828,7 +909,22 @@ void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed)
     // Solve for dx and dy2_active_W.
     dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
 
-    iterative_refine_dxdy();
+    // An SMW-updated direct solve is kept only if refinement brings its KKT residual within
+    // direct_smw_accept_tol; otherwise refactorize and solve again (cf. the preconditioner's retry after a
+    // PCG failure). A NaN residual fails the check.
+    const bool used_smw = direct_smw_enabled() && direct_smw_.active();
+    const RefineResult refined = iterative_refine_dxdy(/*need_final_residual=*/used_smw);
+    if (used_smw) {
+        if (refined.res_norm <= std::max(direct_smw_accept_tol * refined.ref_norm, refine_abs_tol)) {
+            direct_smw_.reset_fail_streak();
+        } else {
+            ++direct_smw_reject;
+            direct_smw_.record_failure();
+            direct_force_full_ = direct_stale_ = true;
+            dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
+            iterative_refine_dxdy();
+        }
+    }
 
     // Split dxdy_ into dx_ and dy2_active_W.
     dx_ = dxdy_.head(N);
@@ -965,6 +1061,7 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
         timer_prec_assembly = timer_prec_analyze = timer_prec_factorize = 0.0;
         timer_ldlt_analyze = timer_ldlt_factorize = timer_ldlt_solve = 0.0;
         timer_chol_assembly = timer_chol_analyze = timer_chol_factorize = timer_chol_solve = 0.0;
+        timer_direct_smw_setup = timer_direct_smw_solve = 0.0;
         timer_linesearch = timer_state_update = 0.0;
 #endif
         auto [update_prec, prec_pattern_changed] = prepare_newton_system();
@@ -1008,6 +1105,12 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
                 fprintf(stderr,
                     "[Timer]   schur_chol total=%.4fs | assembly=%.4f analyzePattern=%.4f factorize=%.4f solve=%.4f\n",
                     chol_total, timer_chol_assembly, timer_chol_analyze, timer_chol_factorize, timer_chol_solve);
+            }
+            const double smw_total = timer_direct_smw_setup + timer_direct_smw_solve;
+            if (smw_total > 0.0) {
+                fprintf(stderr,
+                    "[Timer]   direct_smw total=%.4fs | setup=%.4f solve=%.4f\n",
+                    smw_total, timer_direct_smw_setup, timer_direct_smw_solve);
             }
         }
 #endif

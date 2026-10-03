@@ -116,12 +116,15 @@ Returns dict:
   ssn_iter          – total SSN inner iterations
   krylov_iter       – total Krylov iterations
   fact              – total number of factorizations
-  smw_count         – total number of SMW preconditioner applications
+  smw_count         – total number of SMW low-rank updates used instead of refactorizing
+                      (of the preconditioner, or of the direct solver's factorization in direct mode)
   pmm_tol_achieved  – tolerance achieved by PMM at termination
   system            – "S" (PCG only), or "D" + "K"/"S" for the systems the direct
                       solver factorized (direct mode, or after PCG failed)
   kkt_ldlt_fact     – direct-solver LDLT factorizations of the KKT system
   schur_chol_fact   – direct-solver Cholesky factorizations of the Schur complement
+  direct_smw_count  – direct-mode Newton systems solved through an SMW update (included in smw_count)
+  direct_smw_reject – of those, updates rejected by the residual check and refactorized
   x                 – primal solution vector (original, unscaled units)
   y1, y2, z         – multipliers for Ax = b, Bx = w and the box constraints on x,
                       in the same original, unscaled units as x
@@ -130,8 +133,10 @@ py::dict solve_from_sif(const std::string& filename,
                         double tol         = 1e-6,
                         long long max_iter = 1'000'000'000LL,
                         double time_limit  = 600.0,
-                        bool direct        = false) {
+                        bool direct        = false,
+                        bool direct_smw    = true) {
     int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
+    int direct_smw_count, direct_smw_reject;
     double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved;
     std::string system;
     Vec x_sol, y1_sol, y2_sol, z_sol;
@@ -145,11 +150,14 @@ py::dict solve_from_sif(const std::string& filename,
                          PrintWhen::NEVER, PrintWhat::NONE);
         KSP_QP<T>  solver(prob);
         solver.direct_solve = direct;
+        solver.direct_smw   = direct_smw;
         Solution<T> sol = solver.solve();
         system           = system_label(solver.direct_solve || solver.pcg_failed,
                                         solver.kkt_ldlt_fact, solver.schur_chol_fact);
         kkt_ldlt_fact    = solver.kkt_ldlt_fact;
         schur_chol_fact  = solver.schur_chol_fact;
+        direct_smw_count  = solver.direct_smw_count;
+        direct_smw_reject = solver.direct_smw_reject;
         opt              = static_cast<int>(sol.opt);
         obj_val          = (double)sol.obj_val;
         setup_time       = sol.setup_time;
@@ -182,6 +190,8 @@ py::dict solve_from_sif(const std::string& filename,
     out["system"]           = system;
     out["kkt_ldlt_fact"]    = kkt_ldlt_fact;
     out["schur_chol_fact"]  = schur_chol_fact;
+    out["direct_smw_count"]  = direct_smw_count;
+    out["direct_smw_reject"] = direct_smw_reject;
     out["x"]                = eigen_vec_to_array(x_sol);
     out["y1"]               = eigen_vec_to_array(y1_sol);
     out["y2"]               = eigen_vec_to_array(y2_sol);
@@ -251,10 +261,12 @@ py::dict solve_from_data(const py::dict& pd_dict,
                          double time_limit  = 600.0,
                          std::string trace_path = "",
                          double rho_init = -1.0,
-                         bool direct = false) {
+                         bool direct = false,
+                         bool direct_smw = true) {
     KSPQPdata<T> pd = dict_to_kspqp(pd_dict); // reads Python objects
 
     int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
+    int direct_smw_count, direct_smw_reject;
     double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved;
     std::string system;
     Vec x_sol, y1_sol, y2_sol, z_sol;
@@ -277,6 +289,7 @@ py::dict solve_from_data(const py::dict& pd_dict,
         // start, matching prior behavior exactly.
         if (rho_init > 0.0) solver.rho = (T)rho_init;
         solver.direct_solve = direct;
+        solver.direct_smw   = direct_smw;
         std::ofstream trace_file;
         if (trace) {
             trace_file.open(trace_path);
@@ -293,6 +306,8 @@ py::dict solve_from_data(const py::dict& pd_dict,
                                         solver.kkt_ldlt_fact, solver.schur_chol_fact);
         kkt_ldlt_fact    = solver.kkt_ldlt_fact;
         schur_chol_fact  = solver.schur_chol_fact;
+        direct_smw_count  = solver.direct_smw_count;
+        direct_smw_reject = solver.direct_smw_reject;
         opt              = static_cast<int>(sol.opt);
         obj_val          = (double)sol.obj_val;
         setup_time       = sol.setup_time;
@@ -325,6 +340,8 @@ py::dict solve_from_data(const py::dict& pd_dict,
     out["system"]           = system;
     out["kkt_ldlt_fact"]    = kkt_ldlt_fact;
     out["schur_chol_fact"]  = schur_chol_fact;
+    out["direct_smw_count"]  = direct_smw_count;
+    out["direct_smw_reject"] = direct_smw_reject;
     out["x"]                = eigen_vec_to_array(x_sol);
     out["y1"]               = eigen_vec_to_array(y1_sol);
     out["y2"]               = eigen_vec_to_array(y2_sol);
@@ -351,20 +368,27 @@ The sparse matrices are in CSC format (data / indices / indptr / shape).)");
           py::arg("max_iter")   = 1'000'000'000LL,
           py::arg("time_limit") = 600.0,
           py::arg("direct")     = false,
+          py::arg("direct_smw") = true,
           R"(Parse a SIF/MPS file and solve it with the KSP-QP solver.
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
-krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact, x, y1,
-y2, z (x and the multipliers y1/y2/z are returned in the original, unscaled units, so they can be
-checked against the problem data as given).
+krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact,
+direct_smw_count, direct_smw_reject, x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
+original, unscaled units, so they can be checked against the problem data as given).
 status == 0  → optimal solution found
 status <  0  → infeasibility detected
 status >  0  → iteration / time limit reached
 
-direct: experimental, default False. When True, skips PCG and factorizes the KKT system (LDLT)
-or its Schur complement (Cholesky) exactly at every SSN iteration. system is "S" when only PCG
-ran, otherwise "D" followed by "K" and/or "S" for the systems the direct solver factorized
-(direct mode, or after PCG failed); kkt_ldlt_fact/schur_chol_fact count those factorizations.)");
+direct: experimental, default False. When True, skips PCG and solves the KKT system (LDLT) or
+its Schur complement (Cholesky) exactly. system is "S" when only PCG ran, otherwise "D" followed
+by "K" and/or "S" for the systems the direct solver factorized (direct mode, or after PCG failed);
+kkt_ldlt_fact/schur_chol_fact count those factorizations.
+
+direct_smw: default True; only used with direct=True. When True, an SSN iteration whose active
+sets differ little from the last factorization's is solved through a Sherman-Morrison-Woodbury
+update of that factorization instead of refactorizing; direct_smw_count counts those, and
+direct_smw_reject the ones whose residual check failed and were refactorized. When False, every
+change is refactorized.)");
 
     m.def("solve_from_data", &solve_from_data,
           py::arg("pd"),
@@ -374,14 +398,15 @@ ran, otherwise "D" followed by "K" and/or "S" for the systems the direct solver 
           py::arg("trace_path") = "",
           py::arg("rho_init") = -1.0,
           py::arg("direct") = false,
+          py::arg("direct_smw") = true,
           R"(Solve with KSP-QP using already-parsed problem data (dict from parse_sif).
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
-krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact, x, y1,
-y2, z (x and the multipliers y1/y2/z are returned in the original, unscaled units, so they can be
-checked against the problem data as given).
+krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact,
+direct_smw_count, direct_smw_reject, x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
+original, unscaled units, so they can be checked against the problem data as given).
 
-direct: experimental, default False; same meaning as in solve_from_sif.
+direct, direct_smw: experimental; same meaning as in solve_from_sif.
 
 trace_path: diagnostic-only, default "" (no tracing, matches prior behavior exactly). When
 set, writes a per-PMM-iteration and per-SSN-inner-iteration CSV trace to that path with columns

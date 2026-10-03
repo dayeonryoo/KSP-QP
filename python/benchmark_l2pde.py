@@ -47,11 +47,13 @@ Settings: tol = 1e-6, time limit = 600 s (10 min), max iterations = infinity by 
         --cooldown:   to change the cooldown time in seconds between solver runs (default: 0).
         --lumped-mass: 0 to use the consistent mass matrix (default), 1 to use the lumped mass matrix.
         --discretization: 'fem' (default) or 'fd' spatial discretization for the PDE operator.
+        --direct:     to run KSP-QP with its experimental direct solver instead of PCG (default: PCG).
 """
 
 import sys
 import math
 import argparse
+import functools
 import multiprocessing as mp
 from pathlib import Path
 
@@ -144,13 +146,13 @@ def _generate(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_
 
 
 def _worker_ssn(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass, discretization,
-                 tol, time_limit, max_iter, conn):
+                 tol, time_limit, max_iter, conn, direct=False):
     result = {}
     try:
         pd_data = _generate(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass,
                              discretization)
         result["n_vars"] = pd_data["n"]
-        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, direct=True)
+        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, direct=direct)
     except Exception as e:
         result["error"] = str(e)
     conn.send(result)
@@ -193,7 +195,7 @@ def run_one(result: dict, choice: str, nc: int, beta: float,
             y_lower: float, y_upper: float, u_lower: float, u_upper: float,
             eps: float, lumped_mass: bool, discretization: str,
             tol: float, time_limit: float, max_iter: int, solvers: set,
-            cooldown: float = 0.0, flush_cb=None) -> dict:
+            cooldown: float = 0.0, flush_cb=None, direct: bool = False) -> dict:
     """Solve one problem with all three solvers in isolated subprocesses."""
     n_disp = _n_display(nc)
     print(f"  {choice} nc={nc} (n={n_disp:.2e})  alpha2={beta:.0e}  "
@@ -204,7 +206,8 @@ def run_one(result: dict, choice: str, nc: int, beta: float,
 
     worker_args = (choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass,
                    discretization)
-    return run_solvers(result, worker_args, _worker_ssn, _worker_qpalm, _worker_osqp,
+    return run_solvers(result, worker_args, functools.partial(_worker_ssn, direct=direct),
+                       _worker_qpalm, _worker_osqp,
                        tol, time_limit, max_iter, solvers, cooldown, flush_cb)
 
 
@@ -227,7 +230,7 @@ CSV_FIELDS = [
 # ---------------------------------------------------------------------------
 
 def _run_poisson_control(nc_list, betas, lumped_mass, discretization, tol, time_limit, max_iter,
-                         result_dir, solvers, cooldown, name_prefix):
+                         result_dir, solvers, cooldown, name_prefix, direct):
     label = "poisson_control"
     csv_path = result_dir / f"{name_prefix}l2_{label}.csv"
     rows: list[dict] = _load_existing_rows(csv_path)
@@ -248,13 +251,14 @@ def _run_poisson_control(nc_list, betas, lumped_mass, discretization, tol, time_
                    "lumped_mass": int(lumped_mass), "discretization": discretization}
             rows.append(row)
             run_one(row, "poisson", nc, beta, -INF, INF, 0.0, u_upper, DEFAULT_EPS, lumped_mass,
-                    discretization, tol, time_limit, max_iter, solvers, cooldown, flush_cb=_flush)
+                    discretization, tol, time_limit, max_iter, solvers, cooldown, flush_cb=_flush,
+                    direct=direct)
     print(f"  Saved: {csv_path}")
     return rows
 
 
 def _run_poisson_state(nc_list, betas, lumped_mass, discretization, tol, time_limit, max_iter,
-                       result_dir, solvers, cooldown, name_prefix):
+                       result_dir, solvers, cooldown, name_prefix, direct):
     label = "poisson_state"
     csv_path = result_dir / f"{name_prefix}l2_{label}.csv"
     rows: list[dict] = _load_existing_rows(csv_path)
@@ -276,13 +280,13 @@ def _run_poisson_state(nc_list, betas, lumped_mass, discretization, tol, time_li
             rows.append(row)
             run_one(row, "poisson_state", nc, beta, -0.1, y_upper, -INF, INF, DEFAULT_EPS,
                     lumped_mass, discretization, tol, time_limit, max_iter, solvers, cooldown,
-                    flush_cb=_flush)
+                    flush_cb=_flush, direct=direct)
     print(f"  Saved: {csv_path}")
     return rows
 
 
 def _run_convdiff_both(nc_list, betas, lumped_mass, discretization, tol, time_limit, max_iter,
-                       result_dir, solvers, cooldown, name_prefix):
+                       result_dir, solvers, cooldown, name_prefix, direct):
     label = "convdiff_both"
     csv_path = result_dir / f"{name_prefix}l2_{label}.csv"
     rows: list[dict] = _load_existing_rows(csv_path)
@@ -306,7 +310,7 @@ def _run_convdiff_both(nc_list, betas, lumped_mass, discretization, tol, time_li
             rows.append(row)
             run_one(row, "convdiff", nc, beta, 0.0, y_upper, -u_bound, u_bound, DEFAULT_EPS,
                     lumped_mass, discretization, tol, time_limit, max_iter, solvers, cooldown,
-                    flush_cb=_flush)
+                    flush_cb=_flush, direct=direct)
     print(f"  Saved: {csv_path}")
     return rows
 
@@ -341,6 +345,9 @@ def main() -> None:
                         help="Spatial discretization for the PDE operator: 'fem' (default, "
                              "Q1 finite elements) or 'fd' (5-point finite-difference stencil "
                              "with first-order upwind convection).")
+    parser.add_argument("--direct",    action="store_true",
+                        help="Run KSP-QP with its experimental direct solver (LDLT on K or "
+                             "Cholesky on its Schur complement) instead of PCG (default: PCG)")
     parser.add_argument("--out",       default="",
                         help="Prefix for output filenames (e.g. '0727' -> '0727_l2_poisson_control.csv')")
     args = parser.parse_args()
@@ -362,17 +369,17 @@ def main() -> None:
     if "poisson_control" in tables:
         nc_list = args.nc or TABLE1_NC
         _run_poisson_control(nc_list, TABLE1_BETAS, lumped_mass, discretization, tol, time_limit,
-                             max_iter, result_dir, solvers, cooldown, name_prefix)
+                             max_iter, result_dir, solvers, cooldown, name_prefix, args.direct)
 
     if "poisson_state" in tables:
         nc_list = args.nc or TABLE2_NC
         _run_poisson_state(nc_list, TABLE2_BETAS, lumped_mass, discretization, tol, time_limit,
-                           max_iter, result_dir, solvers, cooldown, name_prefix)
+                           max_iter, result_dir, solvers, cooldown, name_prefix, args.direct)
 
     if "convdiff_both" in tables:
         nc_list = args.nc or TABLE3_NC
         _run_convdiff_both(nc_list, TABLE3_BETAS, lumped_mass, discretization, tol, time_limit,
-                           max_iter, result_dir, solvers, cooldown, name_prefix)
+                           max_iter, result_dir, solvers, cooldown, name_prefix, args.direct)
 
 
 if __name__ == "__main__":

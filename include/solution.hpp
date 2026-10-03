@@ -56,7 +56,7 @@ public:
     int ssn_iter;    // Number of SSN iterations performed
     int krylov_iter; // Number of Krylov iterations performed
     int fact;        // Number of factorizations performed
-    int smw_count;   // Number of SMW preconditioner applications
+    int smw_count;   // Number of SMW low-rank updates used instead of refactorizing (preconditioner or direct solver)
 
     T pmm_tol_achieved; // Tolerance achieved by PMM
     T ssn_tol_achieved; // Tolerance achieved by SSN

@@ -1043,6 +1043,7 @@ TEST(PrepareNewtonSystem, DirectModeDecisionFollowsGThenLocksAfterThreeDecisions
   SsnFixture f(A, B);
   SSN<double> ns = f.Make();
   ns.direct_solve = true;
+  ns.direct_smw = false;  // every system is factorized (see the SMW twin below)
   Vec x0 = Vec::Zero(1), y10 = Vec::Zero(9), y20 = Vec::Zero(1), z0 = Vec::Zero(1);
   Vec dy10 = Vec::Zero(9), dz0 = Vec::Zero(1);
   ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, 1.0, 1.0, 0.95, 0);
@@ -1065,6 +1066,46 @@ TEST(PrepareNewtonSystem, DirectModeDecisionFollowsGThenLocksAfterThreeDecisions
   EXPECT_EQ(ns.direct_ldlt_decisions_made_, 3);
   EXPECT_EQ(ns.schur_chol_fact, 3);
   EXPECT_EQ(ns.kkt_ldlt_fact, 1);
+  EXPECT_EQ(ns.direct_smw_count, 0);
+  EXPECT_FALSE(ns.direct_smw_.has_snapshot());
+}
+
+TEST(PrepareNewtonSystem, DirectModeSmwFollowsTheDecisionsAndUpdatesOnlyWithinOneSystem) {
+  // Same sequence as above with SMW updates on. Call 1 switches to K, which frees S's factorization and
+  // its snapshot; call 2 switches back to S, so the LDLT snapshot is for the wrong system; call 3 stays
+  // on S and adds one W row to call 2's factorization: a rank-1 update instead of a third Cholesky.
+  const SpMat A = DenseToSparse(Eigen::MatrixXd::Ones(9, 1));
+  const SpMat B = DenseToSparse(Eigen::MatrixXd::Ones(1, 1));
+  SsnFixture f(A, B);
+  SSN<double> ns = f.Make();
+  ns.direct_solve = true;
+  Vec x0 = Vec::Zero(1), y10 = Vec::Zero(9), y20 = Vec::Zero(1), z0 = Vec::Zero(1);
+  Vec dy10 = Vec::Zero(9), dz0 = Vec::Zero(1);
+  ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, 1.0, 1.0, 0.95, 0);
+  ns.x_cur_ = Vec::Zero(1);
+  ns.y2_cur_ = Vec::Zero(1);
+  ns.Ax_ssn_ = Vec::Zero(9);
+
+  using Reason = SchurSmwUpdate<double>::RejectReason;
+  const double Bx[4] = {0.0, 100.0, 0.0, 100.0};
+  const bool expected_ldlt[4] = {false, true, false, false};
+  const Reason expected_reason[4] = {Reason::NoSnapshot, Reason::NoSnapshot, Reason::BaseChanged, Reason::None};
+  for (int i = 0; i < 4; ++i) {
+    SCOPED_TRACE("call " + std::to_string(i));
+    ns.Bx_ssn_ = Vec::Constant(1, Bx[i]);
+    auto prep = ns.prepare_newton_system();
+    EXPECT_EQ(ns.direct_use_ldlt, expected_ldlt[i]);
+    ns.solve_newton_direction(prep.update_prec, prep.prec_pattern_changed);
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.direct_smw_.last_reject_reason(), expected_reason[i]);
+    EXPECT_TRUE(ns.direct_smw_.has_snapshot());
+    EXPECT_EQ(ns.direct_smw_.snapshot_base_is_ldlt(), expected_ldlt[i]);
+  }
+  EXPECT_EQ(ns.schur_chol_fact, 2);
+  EXPECT_EQ(ns.kkt_ldlt_fact, 1);
+  EXPECT_EQ(ns.direct_smw_count, 1);
+  EXPECT_EQ(ns.direct_smw_reject, 0);
+  EXPECT_TRUE(ns.direct_smw_.active());
 }
 
 // ===================== solve_newton_direction =====================
@@ -1215,6 +1256,7 @@ TEST(SolveNewtonDirection, DirectModeReusesAnUnchangedFactorizationAcrossSsnAndP
     EXPECT_EQ(use_ldlt ? ns.kkt_ldlt_fact : ns.schur_chol_fact, 2);
     EXPECT_EQ(use_ldlt ? ns.schur_chol_fact : ns.kkt_ldlt_fact, 0);
     if (!use_ldlt) EXPECT_EQ(ns.chol_.get(), chol_before);  // same solver: the analysis was reused
+    EXPECT_EQ(ns.direct_smw_count, 0);  // a mu change is full rank: never an SMW update
   }
 }
 
@@ -1233,6 +1275,201 @@ TEST(SolveNewtonDirection, DirectModeIterativeRefinementReusesTheFactorization) 
 
   ExpectNewtonSystemSolved(ns);
   EXPECT_EQ(ns.fact, 1);  // the corrections were solved with the existing factorization
+}
+
+// ===================== direct solver: SMW updates =====================
+
+namespace {
+
+// Moves the DefaultA/DefaultB direct-mode state to the given active sets (x_i = 5 lies outside x's box,
+// Bx_i = 5 outside w's) and solves one Newton system: prepare, solve, refine.
+void DirectStep(SSN<double>& ns, const std::vector<bool>& active_k, const std::vector<bool>& active_w) {
+  for (int i = 0; i < 3; ++i) ns.x_cur_(i) = active_k[i] ? 0.0 : 5.0;
+  for (int i = 0; i < 2; ++i) ns.Bx_ssn_(i) = active_w[i] ? 5.0 : 0.0;
+  auto prep = ns.prepare_newton_system();
+  ns.solve_newton_direction(prep.update_prec, prep.prec_pattern_changed);
+}
+
+// Pins the direct solver to one system (LDLT on K or Cholesky on S) for the whole run.
+void PinDirectSystem(SSN<double>& ns, bool use_ldlt) {
+  ns.direct_use_ldlt = use_ldlt;
+  ns.direct_ldlt_decisions_made_ = 3;
+}
+
+}  // namespace
+
+TEST(DirectSmw, ColumnFlipIsSolvedThroughTheUpdateWithoutRefactorizing) {
+  for (const bool use_ldlt : {false, true}) {
+    SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
+    SsnFixture f(DefaultA(), DefaultB());
+    SSN<double> ns = f.Make();
+    SetUpDirectModeDefaultState(ns);
+    PinDirectSystem(ns, use_ldlt);
+
+    DirectStep(ns, {false, true, true}, {false, false});
+    ExpectNewtonSystemSolved(ns);
+    ASSERT_EQ(ns.fact, 1);
+    EXPECT_TRUE(ns.direct_smw_.has_snapshot());
+
+    DirectStep(ns, {false, false, true}, {false, false});  // column 1 leaves active_K
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.direct_smw_count, 1);
+    EXPECT_EQ(ns.direct_smw_reject, 0);
+    EXPECT_TRUE(ns.direct_smw_.active());
+    EXPECT_EQ(ns.direct_smw_.last_rank(), 1);
+
+    // No active-set change: the next system is solved through the same update, without a new setup.
+    DirectStep(ns, {false, false, true}, {false, false});
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.direct_smw_count, 1);
+    EXPECT_TRUE(ns.direct_smw_.active());
+  }
+}
+
+TEST(DirectSmw, WRowSwapUsesTheUpdateAndTheNextFactorizationReanalyzes) {
+  for (const bool use_ldlt : {false, true}) {
+    SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
+    SsnFixture f(DefaultA(), DefaultB());
+    SSN<double> ns = f.Make();
+    SetUpDirectModeDefaultState(ns);
+    PinDirectSystem(ns, use_ldlt);
+    Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
+    Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
+
+    DirectStep(ns, {false, true, true}, {true, false});
+    ASSERT_EQ(ns.fact, 1);
+
+    DirectStep(ns, {false, true, true}, {false, true});  // W row 0 deleted, row 1 added: rank 2
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.direct_smw_count, 1);
+    EXPECT_EQ(ns.direct_smw_.last_rank(), 2);
+    // The stored factorization is still the snapshot's, whose pattern differs from the current G.
+    EXPECT_TRUE(use_ldlt ? ns.ldlt_pattern_dirty_ : ns.chol_pattern_dirty_);
+
+    // A new mu is a full-rank change: refactorize, re-analyzing for the current pattern.
+    ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, /*mu=*/4.0, /*rho=*/1.0, 0.95, 1);
+    DirectStep(ns, {false, true, true}, {false, true});
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.direct_smw_.last_reject_reason(), SchurSmwUpdate<double>::RejectReason::MuChangedSinceSnapshot);
+    EXPECT_EQ(ns.fact, 2);
+    EXPECT_FALSE(use_ldlt ? ns.ldlt_pattern_dirty_ : ns.chol_pattern_dirty_);
+    EXPECT_FALSE(ns.direct_smw_.active());
+    EXPECT_TRUE(ns.direct_smw_.has_snapshot());  // the new factorization is the next snapshot
+  }
+}
+
+TEST(DirectSmw, ReturningToTheSnapshotsActiveSetsReusesItsFactorization) {
+  for (const bool use_ldlt : {false, true}) {
+    SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
+    SsnFixture f(DefaultA(), DefaultB());
+    SSN<double> ns = f.Make();
+    SetUpDirectModeDefaultState(ns);
+    PinDirectSystem(ns, use_ldlt);
+
+    DirectStep(ns, {false, true, true}, {true, false});
+    ASSERT_EQ(ns.fact, 1);
+    DirectStep(ns, {false, false, true}, {false, true});
+    ASSERT_EQ(ns.direct_smw_count, 1);
+
+    DirectStep(ns, {false, true, true}, {true, false});  // back to the snapshot's active sets: rank 0
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.direct_smw_count, 1);
+    EXPECT_EQ(ns.direct_smw_.reuse_count(), 1);
+    EXPECT_FALSE(ns.direct_smw_.active());
+    EXPECT_FALSE(use_ldlt ? ns.ldlt_numeric_dirty_ : ns.chol_numeric_dirty_);
+    EXPECT_FALSE(use_ldlt ? ns.ldlt_pattern_dirty_ : ns.chol_pattern_dirty_);
+  }
+}
+
+TEST(DirectSmw, UpdateFailingTheResidualCheckIsRefactorizedAndStillSolved) {
+  for (const bool use_ldlt : {false, true}) {
+    SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
+    SsnFixture f(DefaultA(), DefaultB());
+    SSN<double> ns = f.Make();
+    SetUpDirectModeDefaultState(ns);
+    PinDirectSystem(ns, use_ldlt);
+    ns.direct_smw_accept_tol = -1.0;  // no residual passes the check
+    ns.refine_abs_tol = -1.0;
+    Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
+    Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
+
+    DirectStep(ns, {false, true, true}, {false, false});
+    ASSERT_EQ(ns.fact, 1);
+
+    DirectStep(ns, {false, false, true}, {false, false});
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.direct_smw_count, 1);
+    EXPECT_EQ(ns.direct_smw_reject, 1);
+    EXPECT_EQ(ns.fact, 2);  // the rejected update was replaced by a factorization of the current system
+    EXPECT_FALSE(ns.direct_smw_.active());
+    EXPECT_EQ(ns.direct_smw_.fail_streak(), 1);
+
+    // A new PMM iteration clears the fail streak.
+    ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, /*mu=*/1.0, /*rho=*/1.0, 0.95, 1);
+    EXPECT_EQ(ns.direct_smw_.fail_streak(), 0);
+  }
+}
+
+TEST(DirectSmw, EmptyGShortCircuitDeactivatesTheUpdate) {
+  // No equality rows: once no W row is active, G has no rows and K = -H.
+  SsnFixture f(SpMat(0, 3), DefaultB());
+  SSN<double> ns = f.Make();
+  ns.direct_solve = true;
+  PinDirectSystem(ns, /*use_ldlt=*/false);
+  Vec x0 = Vec::Zero(3), y10 = Vec::Zero(0), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
+  Vec dy10 = Vec::Zero(0), dz0 = Vec::Zero(3);
+  ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, 1.0, 1.0, 0.95, 0);
+  ns.x_cur_ = Vec::Zero(3);
+  ns.y2_cur_ = Vec::Zero(2);
+  ns.Ax_ssn_ = Vec::Zero(0);
+  ns.Bx_ssn_ = Vec::Zero(2);
+
+  DirectStep(ns, {false, true, true}, {true, false});
+  ASSERT_EQ(ns.fact, 1);
+  DirectStep(ns, {false, true, true}, {true, true});  // add W row 1
+  ASSERT_TRUE(ns.direct_smw_.active());
+
+  DirectStep(ns, {false, true, true}, {false, false});  // G has no rows
+  ExpectNewtonSystemSolved(ns);
+  EXPECT_FALSE(ns.direct_smw_.active());
+  EXPECT_EQ(ns.fact, 1);
+  EXPECT_EQ(ns.direct_smw_count, 1);
+}
+
+TEST(DirectSmw, PcgFailureFallbackNeverSnapshotsOrUpdates) {
+  // Default (PCG) mode after PCG failed: the direct solver refactorizes on every change, as before.
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  SetUpDirectModeDefaultState(ns);
+  ns.direct_solve = false;
+  ns.pcg_failed = true;
+
+  DirectStep(ns, {false, true, true}, {false, false});
+  DirectStep(ns, {false, false, true}, {false, false});
+  ExpectNewtonSystemSolved(ns);
+  EXPECT_EQ(ns.fact, 2);
+  EXPECT_EQ(ns.direct_smw_count, 0);
+  EXPECT_FALSE(ns.direct_smw_.has_snapshot());
+  EXPECT_EQ(ns.krylov_iter, 0);
+}
+
+TEST(DirectSmw, SwitchedOffRefactorizesOnEveryChange) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  SetUpDirectModeDefaultState(ns);
+  ns.direct_smw = false;
+
+  DirectStep(ns, {false, true, true}, {false, false});
+  DirectStep(ns, {false, false, true}, {false, false});
+  DirectStep(ns, {false, false, true}, {true, false});
+  ExpectNewtonSystemSolved(ns);
+  EXPECT_EQ(ns.fact, 3);
+  EXPECT_EQ(ns.direct_smw_count, 0);
+  EXPECT_FALSE(ns.direct_smw_.has_snapshot());
 }
 
 TEST(SolveNewtonDirection, HandlesZeroActiveWDegenerateCase) {
@@ -1554,6 +1791,8 @@ TEST(SolveUsingChol, CholeskyFailureFallsBackToLdltOnKForTheRestOfTheRun) {
   EXPECT_EQ(ns.schur_chol_fact, 1);  // the failed attempt still counts as a factorization
   EXPECT_EQ(ns.kkt_ldlt_fact, 1);
   ExpectKktResidualSmall(sol1, G, H_diag, r1, r2, ns.mu);
+  EXPECT_TRUE(ns.direct_smw_.has_snapshot());  // SMW updates continue from the LDLT factorization
+  EXPECT_TRUE(ns.direct_smw_.snapshot_base_is_ldlt());
 
   // Later direct solves go straight to LDLT on K, even though the decision would pick S (ratio 2).
   Vec sol2 = ns.solve_using_cg(G, G_tr, H_diag, H_diag.cwiseInverse(), BoolArr::Constant(1, true), r1, r2,
@@ -1711,10 +1950,10 @@ TEST(SolveUsingCg, PcgFailureFallsBackToTheKktSystemWhenTheThresholdPrefersIt) {
 // ===================== cross-path agreement =====================
 // For a fixed (G, H_diag, active_K, r1, r2, mu, rho), PCG+Cholesky, PCG+LDLT, PCG+SMW (updated from
 // either a Cholesky or an LDLT snapshot), the direct solver on either of its systems (LDLT on K,
-// Cholesky on S), and solve_using_ldlt() all solve the same augmented KKT system K[dx;dy]=[r1;r2] --
-// the preconditioner only affects PCG's convergence path, and SMW is just a cheaper way to reach the
-// same preconditioning matrix as a fresh factorization. This checks all seven routes agree with each
-// other and each independently satisfies the KKT residual.
+// Cholesky on S), fresh or SMW-updated from a factorization at a neighboring H, and solve_using_ldlt()
+// all solve the same augmented KKT system K[dx;dy]=[r1;r2] -- the preconditioner only affects PCG's
+// convergence path, and SMW is just a cheaper way to reach the same matrix as a fresh factorization.
+// This checks all nine routes agree with each other and each independently satisfies the KKT residual.
 
 namespace {
 
@@ -1800,6 +2039,37 @@ void ExpectAllSolvePathsAgree(const SpMat& A, const SpMat& B, const BoolArr& act
   ASSERT_EQ(ns_direct_schur.schur_chol_fact, 1) << "direct Cholesky-on-S path was not actually taken";
   ASSERT_EQ(ns_direct_schur.krylov_iter, 0);
 
+  // The direct solver's SMW update: factorize at a neighboring H (changed where active_K differs from
+  // active_K_snapshot, as a K flip changes it), then solve at H_diag through a low-rank update of that
+  // factorization instead of refactorizing.
+  Vec H_snapshot = H_diag;
+  for (int i = 0; i < H_diag.size(); ++i)
+    if (active_K(i) != active_K_snapshot(i)) H_snapshot(i) += 2.0;
+  const Vec H_snapshot_inv = H_snapshot.cwiseInverse();
+  auto solve_direct_mode_smw = [&](SSN<double>& ns, bool use_ldlt) {
+    setup_ns(ns);
+    ns.direct_solve = true;
+    ns.direct_use_ldlt = use_ldlt;
+    ns.direct_ldlt_decisions_made_ = 1;
+    ns.solve_using_cg(G, G_tr, H_snapshot, H_snapshot_inv, active_K_snapshot, r1, r2, mu, ns.krylov_tol,
+                      ns.krylov_max_in_iter, /*update_prec=*/true, /*prec_pattern_changed=*/true,
+                      /*schur_use_ldlt=*/false);
+    // What prepare_newton_system() records when H changes.
+    ns.ldlt_numeric_dirty_ = ns.chol_numeric_dirty_ = true;
+    ns.direct_stale_ = true;
+    return ns.solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1, r2, mu, ns.krylov_tol,
+                             ns.krylov_max_in_iter, /*update_prec=*/true,
+                             /*prec_pattern_changed=*/false, /*schur_use_ldlt=*/false);
+  };
+  SSN<double> ns_direct_smw_kkt = f.Make();
+  const Vec sol_direct_smw_kkt = solve_direct_mode_smw(ns_direct_smw_kkt, /*use_ldlt=*/true);
+  ASSERT_EQ(ns_direct_smw_kkt.direct_smw_count, 1) << "direct SMW-from-LDLT path did not engage SMW";
+  ASSERT_EQ(ns_direct_smw_kkt.kkt_ldlt_fact, 1);
+  SSN<double> ns_direct_smw_schur = f.Make();
+  const Vec sol_direct_smw_schur = solve_direct_mode_smw(ns_direct_smw_schur, /*use_ldlt=*/false);
+  ASSERT_EQ(ns_direct_smw_schur.direct_smw_count, 1) << "direct SMW-from-Cholesky path did not engage SMW";
+  ASSERT_EQ(ns_direct_smw_schur.schur_chol_fact, 1);
+
   // Direct factorization of the full augmented KKT system -- no PCG/preconditioner at all.
   const Vec sol_direct = ns_chol.solve_using_ldlt(G, H_diag, r1, r2);
 
@@ -1815,6 +2085,10 @@ void ExpectAllSolvePathsAgree(const SpMat& A, const SpMat& B, const BoolArr& act
       << "direct LDLT on K diverged from solve_using_ldlt";
   EXPECT_TRUE(sol_direct_schur.isApprox(sol_direct, tol))
       << "direct Cholesky on S diverged from solve_using_ldlt";
+  EXPECT_TRUE(sol_direct_smw_kkt.isApprox(sol_direct, tol))
+      << "direct SMW (from LDLT on K) diverged from solve_using_ldlt";
+  EXPECT_TRUE(sol_direct_smw_schur.isApprox(sol_direct, tol))
+      << "direct SMW (from Cholesky on S) diverged from solve_using_ldlt";
 
   // Ground-truth each result independently too, so a bug shared by all paths (which would still
   // leave them agreeing with each other) doesn't slip through.
@@ -1824,6 +2098,8 @@ void ExpectAllSolvePathsAgree(const SpMat& A, const SpMat& B, const BoolArr& act
   ExpectKktResidualSmall(sol_smw_ldlt, G, H_diag, r1, r2, mu);
   ExpectKktResidualSmall(sol_direct_kkt, G, H_diag, r1, r2, mu);
   ExpectKktResidualSmall(sol_direct_schur, G, H_diag, r1, r2, mu);
+  ExpectKktResidualSmall(sol_direct_smw_kkt, G, H_diag, r1, r2, mu);
+  ExpectKktResidualSmall(sol_direct_smw_schur, G, H_diag, r1, r2, mu);
   ExpectKktResidualSmall(sol_direct, G, H_diag, r1, r2, mu);
 }
 

@@ -28,7 +28,7 @@ using Triplet = Eigen::Triplet<T>;
 int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
-            "Usage: ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--direct] [--out FILE] [--cooldown S]\n"
+            "Usage: ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--out FILE] [--cooldown S]\n"
             "  Solves one Maros-Meszaros QP from ROOT/IN/PROBLEM.SIF, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in and --out are resolved relative to this (default: ./)\n"
             "  --in DIR         directory containing the .SIF files, relative to --root (default: data/maros_meszaros/)\n"
@@ -37,10 +37,13 @@ int main(int argc, char** argv) {
             "  --tol T          primal-dual tolerance (default: 1e-6)\n"
             "  --max-iter N     max PMM iterations (default: 3000)\n"
             "  --time-limit S   time limit in seconds (default: 60)\n"
-            "  --direct         experimental: skip PCG and factorize the KKT system (LDLT) or its Schur\n"
-            "                   complement (Cholesky) exactly at every SSN iteration\n"
+            "  --direct         experimental: skip PCG and solve the KKT system (LDLT) or its Schur\n"
+            "                   complement (Cholesky) exactly, reusing the last factorization through SMW\n"
+            "                   low-rank updates while the active sets change little\n"
+            "  --no-direct-smw  with --direct: refactorize on every active-set change instead\n"
             "  --out FILE       (--name all only) output CSV path, relative to --root\n"
-            "                   (default: results/pcg_mm.csv, or results/direct_mm.csv with --direct)\n"
+            "                   (default: results/pcg_mm.csv, or results/direct_mm.csv with --direct,\n"
+            "                   results/direct_nosmw_mm.csv with --direct --no-direct-smw)\n"
             "  --cooldown S     (--name all only) seconds to sleep between problems (default: 3)\n";
         return 0;
     }
@@ -56,6 +59,9 @@ int main(int argc, char** argv) {
     double time_limit = cli::get_double(argc, argv, "--time-limit", 60.0); // in seconds
     int max_iter = cli::get_int(argc, argv, "--max-iter", 3000);
     bool direct = cli::has_flag(argc, argv, "--direct");
+    bool direct_smw = !cli::has_flag(argc, argv, "--no-direct-smw");
+    if (!direct_smw && !direct)
+        std::cerr << "WARNING: --no-direct-smw has no effect without --direct\n";
 
     if (name == "all") {
         // Filenames and objective values of Maros/Meszaros QPs
@@ -204,7 +210,9 @@ int main(int argc, char** argv) {
         PrintWhat what = PrintWhat::TUNING;
         int cooldown_sec = cli::get_int(argc, argv, "--cooldown", 3);
 
-        std::string default_out = direct ? "results/direct_mm.csv" : "results/pcg_mm.csv";
+        std::string default_out = !direct    ? "results/pcg_mm.csv"
+                                : direct_smw ? "results/direct_mm.csv"
+                                             : "results/direct_nosmw_mm.csv";
         std::string csv_path = root + cli::get_str(argc, argv, "--out", default_out);
         write_csv_header(csv_path);
 
@@ -231,6 +239,7 @@ int main(int argc, char** argv) {
                 Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
                 KSP_QP<T> solver(prob);
                 solver.direct_solve = direct;
+                solver.direct_smw = direct_smw;
 
                 // Solve the QP
                 Solution<T> sol = solver.solve();
@@ -290,6 +299,7 @@ int main(int argc, char** argv) {
     Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
     KSP_QP<T> solver(prob);
     solver.direct_solve = direct;
+    solver.direct_smw = direct_smw;
 
     // Solve:
     Solution<T> sol = solver.solve();
@@ -297,6 +307,10 @@ int main(int argc, char** argv) {
     if (solver.direct_solve || solver.pcg_failed) {
         std::cout << "Direct-solver factorizations: KKT system (LDLT) = " << solver.kkt_ldlt_fact
                   << ", Schur complement (Cholesky) = " << solver.schur_chol_fact << "\n";
+    }
+    if (solver.direct_solve && solver.direct_smw) {
+        std::cout << "Direct-solver SMW updates: " << solver.direct_smw_count << " used instead of refactorizing, "
+                  << solver.direct_smw_reject << " of them rejected and refactorized\n";
     }
 
     return 0;

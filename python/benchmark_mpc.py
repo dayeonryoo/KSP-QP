@@ -58,6 +58,7 @@ Outputs
   python3 benchmark_mpc.py --out 0926              # -> results/0926_mpc_sweep.csv
   python3 benchmark_mpc.py --M 20 50 --N 200 400 --T 4 --reps 3
   python3 benchmark_mpc.py --solver ksp-qp --time-limit 60
+  python3 benchmark_mpc.py --solver ksp-qp --direct   # direct solver instead of PCG
   python3 benchmark_mpc.py --loop-mode own --max-nz 20000
 """
 
@@ -176,8 +177,9 @@ def _solve_osqp_x(qpalm_data: tuple, tol: float, time_limit: float):
     return np.asarray(res.x, dtype=np.float64)
 
 
-def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int):
-    r = ksp_qp_bind.solve_from_data(pdd, tol, max_iter, time_limit)
+def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int,
+                   direct: bool = False):
+    r = ksp_qp_bind.solve_from_data(pdd, tol, max_iter, time_limit, direct=direct)
     result = {
         "status": int(r["status"]),
         "solved": int(r["status"] == 0),
@@ -195,9 +197,9 @@ def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int):
     return result, np.asarray(r["x"], dtype=np.float64)
 
 
-def _solve_one(solver_name, pdd, tol, time_limit, max_iter):
+def _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct=False):
     if solver_name == "ksp-qp":
-        return _solve_kspqp_x(pdd, tol, time_limit, max_iter)
+        return _solve_kspqp_x(pdd, tol, time_limit, max_iter, direct)
     if solver_name == "qpalm":
         return _solve_qpalm_x(kspqp_to_qpalm(pdd), tol, time_limit, pdd.get("obj_const", 0.0))
     raise ValueError(f"Unknown solver_name: {solver_name}")
@@ -244,7 +246,7 @@ def _set_high_qos():
 
 
 def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_iter,
-                    solvers, conn):
+                    solvers, direct, conn):
     rows = []
     try:
         _set_high_qos()
@@ -266,7 +268,7 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
                     xbar = xbar_source[t] if loop_mode == "shared" else state[solver_name]
                     pdd = mg.generate_mpc_qp(sysm, N, xbar)
                     t0 = time.perf_counter()
-                    result, x = _solve_one(solver_name, pdd, tol, time_limit, max_iter)
+                    result, x = _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct)
                     wall = time.perf_counter() - t0
 
                     rows.append({
@@ -331,7 +333,7 @@ def _provenance() -> dict:
 
 
 def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, rows, csv_path,
-               prov, cooldown=0.0, loop_mode="shared") -> None:
+               prov, cooldown=0.0, loop_mode="shared", direct=False) -> None:
     sysm = mg.platoon_system(M)
     pdd0 = mg.generate_mpc_qp(sysm, N, sysm.xbar0)
     n_z = int(pdd0["n"])
@@ -350,7 +352,7 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, rows, csv_path
 
     out = _run_isolated(_worker_rollout,
                         (M, N, loop_mode, xbar_source, T, reps, tol, time_limit,
-                         max_iter, solvers))
+                         max_iter, solvers, direct))
     if "error" in out:
         print(f"    ERROR - {out['error']}", flush=True)
         rows.append({**meta, "solver": "ERROR", "status": -99, "solved": 0})
@@ -402,6 +404,9 @@ def main() -> None:
     parser.add_argument("--cooldown", type=float, default=0.0,
                         help="Seconds to sleep between configurations, to limit "
                              "thermal drift across a long sweep")
+    parser.add_argument("--direct", action="store_true",
+                        help="Run KSP-QP with its experimental direct solver (LDLT on K or "
+                             "Cholesky on its Schur complement) instead of PCG")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -428,11 +433,12 @@ def main() -> None:
     rows: list[dict] = []
 
     print(f"run_id={prov['run_id']}  git={prov['git_sha']}  {len(configs)} configurations  "
-          f"tol={args.tol:g}  solvers={','.join(solvers)}")
+          f"tol={args.tol:g}  solvers={','.join(solvers)}  "
+          f"ksp-qp={'direct' if args.direct else 'pcg'}")
     for i, (M, N) in enumerate(configs, 1):
         print(f"\n[{i}/{len(configs)}]")
         run_config(M, N, args.T, args.reps, args.tol, args.time_limit, max_iter,
-                   solvers, rows, csv_path, prov, args.cooldown, args.loop_mode)
+                   solvers, rows, csv_path, prov, args.cooldown, args.loop_mode, args.direct)
 
     print(f"\nResults written to: {csv_path}")
 

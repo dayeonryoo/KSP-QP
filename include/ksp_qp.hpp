@@ -50,7 +50,8 @@
 //    .ssn_iter    -> number of SSN iterations performed to terminate
 //    .krylov_iter -> number of Krylov iterations performed to terminate
 //    .fact        -> number of factorizations performed to terminate
-//    .smw_count   -> number of SMW preconditioner applications performed to terminate
+//    .smw_count   -> number of SMW low-rank updates used instead of refactorizing (of the preconditioner
+//                    in PCG mode, of the direct solver's factorization in direct mode)
 //    .pmm_tol_achieved -> final tolerance achieved by PMM
 //    .ssn_tol_achieved -> final tolerance achieved by SSN
 //    .setup_time       -> wall-clock time in seconds spent in the KSP_QP constructor
@@ -126,7 +127,8 @@ public:
     T rho_limit = 1e7;
     T alpha = 0.95;
     double time_limit = 600.0; // in seconds
-    bool direct_solve = false; // experimental: skip PCG and factorize K (LDLT) or its Schur complement (Cholesky) every SSN iteration
+    bool direct_solve = false; // experimental: skip PCG and solve by LDLT on K or Cholesky on its Schur complement
+    bool direct_smw = true;    // with direct_solve: reuse the last factorization through SMW low-rank updates when the active sets change little
     int linesearch_fail = 0;
 
     // Primal/dual infeasibility certificate tolerances.
@@ -151,6 +153,8 @@ public:
     bool   pcg_failed      = false; // mirrors SSN::pcg_failed: PCG failed and the direct solver took over
     int    kkt_ldlt_fact   = 0;     // mirrors SSN::kkt_ldlt_fact: direct-solver LDLT factorizations of K
     int    schur_chol_fact = 0;     // mirrors SSN::schur_chol_fact: direct-solver Cholesky factorizations of S
+    int    direct_smw_count  = 0;   // mirrors SSN::direct_smw_count: SMW updates used instead of refactorizing
+    int    direct_smw_reject = 0;   // mirrors SSN::direct_smw_reject: SMW-updated solves rejected and refactorized
     double setup_time      = 0.0;   // wall-clock time spent in this constructor, in seconds
     bool   setup_failed    = false; // true if an error occurred during setup
 

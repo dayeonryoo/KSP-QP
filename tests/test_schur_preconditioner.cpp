@@ -2924,6 +2924,56 @@ TEST(NearSingularCapacitance, AboveThresholdRowPerturbationSucceedsViaSmw) {
   EXPECT_TRUE(got.isApprox(P2.colPivHouseholderQr().solve(b), kTol));
 }
 
+TEST(NearSingularCapacitance, EquilibrationKeepsAWellConditionedMixedUpdateAtLargeRho) {
+  // rho = 1e7 (where PMM starts it) with Q = 0, so H_diag = 1/rho on active_K. Flipping column 0 off
+  // while adding W row [0, 1, 0] puts ~1/rho in the capacitance's flip block and ~rho |b|^2 in its
+  // added-row block. Unscaled, a rank test relative to the largest pivot calls this rank 1, although
+  // P_new = [[2e7, 1e7], [1e7, 1e7]] + 0.01 I has condition number ~7.
+  for (bool use_ldlt : {false, true}) {
+    Eigen::MatrixXd A_row(1, 3);
+    A_row << 1.0, 1.0, 1.0;
+    Eigen::MatrixXd B_rows(1, 3);
+    B_rows << 0.0, 1.0, 0.0;
+    const RowMajorSpMat B_rm = DenseToSparseRowMajor(B_rows);
+    const double mu = 1e2;
+    const double rho = 1e7;
+    const Eigen::VectorXd H_diag = Eigen::VectorXd::Constant(3, 1.0 / rho);
+    const BoolArr active_K1 = ToBoolArr({true, true, true});
+    const std::vector<bool> active_k2 = {false, true, true};
+    const BoolArr active_K2 = ToBoolArr(active_k2);
+    const BoolArr active_W1 = ToBoolArr({false});
+    const BoolArr active_W2 = ToBoolArr({true});
+
+    const SpMat G1 = DenseToSparse(A_row);
+    const SpMat G1_tr = DenseToSparse(A_row.transpose());
+
+    Prec prec;
+    prec.arm(G1, G1_tr, H_diag, active_K1, active_W1, B_rm, mu, rho, true, true, use_ldlt);
+    prec.compute(0);
+    ASSERT_EQ(prec.fact_count(), 1);
+
+    Eigen::MatrixXd G2_dense(2, 3);
+    G2_dense << A_row, B_rows;
+    const SpMat G2 = DenseToSparse(G2_dense);
+    const SpMat G2_tr = DenseToSparse(G2_dense.transpose());
+
+    prec.arm(G2, G2_tr, H_diag, active_K2, active_W2, B_rm, mu, rho, /*rebuild=*/true,
+             /*prec_pattern_changed=*/false, use_ldlt);
+    prec.compute(0);
+
+    EXPECT_TRUE(prec.used_smw()) << "use_ldlt=" << use_ldlt << ", reject reason "
+                                 << static_cast<int>(prec.smw_last_reject_reason());
+    EXPECT_EQ(prec.fact_count(), 1);
+    EXPECT_EQ(prec.smw_last_rank(), 2);
+
+    Eigen::VectorXd b(2);
+    b << 1.0, -2.0;
+    const Eigen::VectorXd got = prec.solve(b);
+    const Eigen::MatrixXd P2 = DenseSchurComplement(G2_dense, H_diag, active_k2, mu);
+    EXPECT_TRUE(got.isApprox(P2.colPivHouseholderQr().solve(b), 1e-8)) << "use_ldlt=" << use_ldlt;
+  }
+}
+
 // ===================== randomized Cholesky/LDLT cross-check =====================
 // DirectFactorization.LdltAndCholeskyPathsAgreeOnIdenticalData only exercises the tiny
 // 3-column Fixture (s up to 2). A larger, seeded-random system stresses factorize_by_chol's

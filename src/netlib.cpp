@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
             "Usage: ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all]\n"
-            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct] [--out FILE] [--cooldown S] [--ref FILE]\n"
+            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--out FILE] [--cooldown S] [--ref FILE]\n"
             "  Solves one Netlib LP from ROOT/IN/PROBLEM.mps, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in, --ref and --out are resolved relative to this (default: ./)\n"
             "  --set SET        which problem set to use: feasible or infeasible (default: feasible)\n"
@@ -116,11 +116,13 @@ int main(int argc, char** argv) {
             "  --tol T          primal-dual tolerance (default: 1e-6)\n"
             "  --max-iter N     max PMM iterations (default: 3000)\n"
             "  --time-limit S   time limit in seconds (default: 60)\n"
-            "  --direct         experimental: skip PCG and factorize the KKT system (LDLT) or its Schur\n"
-            "                   complement (Cholesky) exactly at every SSN iteration\n"
+            "  --direct         experimental: skip PCG and solve the KKT system (LDLT) or its Schur\n"
+            "                   complement (Cholesky) exactly, reusing the last factorization through SMW\n"
+            "                   low-rank updates while the active sets change little\n"
+            "  --no-direct-smw  with --direct: refactorize on every active-set change instead\n"
             "  --out FILE       (--name all only) output CSV path, relative to --root\n"
             "                   (default: results/pcg_netlib.csv or results/pcg_infeas.csv, per --set;\n"
-            "                   direct_ instead of pcg_ with --direct)\n"
+            "                   direct_ instead of pcg_ with --direct, direct_nosmw_ with --no-direct-smw)\n"
             "  --cooldown S     (--name all only) seconds to sleep between problems (default: 0)\n"
             "  --ref FILE       (feasible set only) reference objectives CSV, relative to --root\n"
             "                   (default: data/netlib-main/feasible_gurobi_1e-8.csv)\n";
@@ -150,6 +152,9 @@ int main(int argc, char** argv) {
     double time_limit = cli::get_double(argc, argv, "--time-limit", 60.0); // in seconds
     int max_iter = cli::get_int(argc, argv, "--max-iter", 3000);
     bool direct = cli::has_flag(argc, argv, "--direct");
+    bool direct_smw = !cli::has_flag(argc, argv, "--no-direct-smw");
+    if (!direct_smw && !direct)
+        std::cerr << "WARNING: --no-direct-smw has no effect without --direct\n";
 
     if (to_lower(name) == "all") {
         std::vector<std::string> stems = list_problems(data_dir);
@@ -170,7 +175,7 @@ int main(int argc, char** argv) {
         PrintWhat what = PrintWhat::TUNING;
         int cooldown_sec = cli::get_int(argc, argv, "--cooldown", 0);
 
-        std::string default_out = std::string("results/") + (direct ? "direct" : "pcg")
+        std::string default_out = std::string("results/") + (!direct ? "pcg" : direct_smw ? "direct" : "direct_nosmw")
                                 + (infeasible_set ? "_infeas.csv" : "_netlib.csv");
         std::string csv_path = root + cli::get_str(argc, argv, "--out", default_out);
         write_csv_header(csv_path);
@@ -194,6 +199,7 @@ int main(int argc, char** argv) {
                 Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
                 KSP_QP<T> solver(prob);
                 solver.direct_solve = direct;
+                solver.direct_smw = direct_smw;
 
                 // Solve the LP
                 Solution<T> sol = solver.solve();
@@ -270,6 +276,7 @@ int main(int argc, char** argv) {
     Problem<T> prob(pd, tol, max_iter, time_limit, when, what);
     KSP_QP<T> solver(prob);
     solver.direct_solve = direct;
+    solver.direct_smw = direct_smw;
 
     // Solve:
     Solution<T> sol = solver.solve();
@@ -277,6 +284,10 @@ int main(int argc, char** argv) {
     if (solver.direct_solve || solver.pcg_failed) {
         std::cout << "Direct-solver factorizations: KKT system (LDLT) = " << solver.kkt_ldlt_fact
                   << ", Schur complement (Cholesky) = " << solver.schur_chol_fact << "\n";
+    }
+    if (solver.direct_solve && solver.direct_smw) {
+        std::cout << "Direct-solver SMW updates: " << solver.direct_smw_count << " used instead of refactorizing, "
+                  << solver.direct_smw_reject << " of them rejected and refactorized\n";
     }
 
     // On the infeasible set there is no solution to report, but the iterate's

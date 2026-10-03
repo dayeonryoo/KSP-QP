@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <random>
 #include <vector>
 
 namespace {
@@ -1807,12 +1808,15 @@ TEST(SolvePrimalInfeasCertificateOrdering, FreshDeltaY1AfterMultiplierUpdateDete
 namespace {
 
 // Direct-mode bookkeeping: no Krylov work, every factorization is K's or S's, and at most one
-// factorization per Newton solve (iterative refinement and unchanged matrices reuse it).
+// factorization per Newton solve (iterative refinement, unchanged matrices and SMW updates reuse it;
+// a rejected SMW update is replaced by exactly one). Every SMW update is the direct solver's.
 void ExpectDirectModeAccounting(const KSP_QP<double>& ns, const Solution<double>& sol) {
   EXPECT_EQ(sol.krylov_iter, 0);
   EXPECT_FALSE(ns.pcg_failed);
   EXPECT_EQ(ns.kkt_ldlt_fact + ns.schur_chol_fact, sol.fact);
   EXPECT_LE(sol.fact, sol.ssn_iter + sol.pmm_iter + 1);
+  EXPECT_EQ(sol.smw_count, ns.direct_smw_count);
+  EXPECT_LE(ns.direct_smw_reject, ns.direct_smw_count);
 }
 
 }  // namespace
@@ -1937,5 +1941,64 @@ TEST(KspQpSolveDirectMode, DefaultModeNeverUsesTheDirectSolverWhenPcgSucceeds) {
   EXPECT_FALSE(ns.pcg_failed);
   EXPECT_EQ(ns.kkt_ldlt_fact, 0);
   EXPECT_EQ(ns.schur_chol_fact, 0);
+  EXPECT_EQ(ns.direct_smw_count, 0);
   EXPECT_GT(sol.fact, 0);  // all of them preconditioner factorizations
+}
+
+TEST(KspQpSolveDirectMode, SmwUpdatesReachTheSameOptimumAsRefactorizingAndPcg) {
+  // A random feasible QP (half of Q's diagonal zero) with box and two-sided inequality constraints,
+  // large enough that the active sets keep changing within SSN runs.
+  std::mt19937 rng(2024);
+  std::uniform_real_distribution<double> unit(-1.0, 1.0);
+  std::uniform_real_distribution<double> prob(0.0, 1.0);
+  const int n = 40, m = 8, l = 20;
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(m, n), B = Eigen::MatrixXd::Zero(l, n);
+  for (int i = 0; i < m; ++i)
+    for (int j = 0; j < n; ++j)
+      if (prob(rng) < 0.3) A(i, j) = unit(rng);
+  for (int i = 0; i < l; ++i)
+    for (int j = 0; j < n; ++j)
+      if (prob(rng) < 0.3) B(i, j) = unit(rng);
+  Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(n, n);
+  Vec c(n), x_feas(n);
+  for (int j = 0; j < n; ++j) {
+    if (prob(rng) < 0.5) Q(j, j) = 2.0 * prob(rng);
+    c(j) = unit(rng);
+    x_feas(j) = 0.5 * unit(rng);
+  }
+  const Vec b = A * x_feas;
+  const Vec Bx = B * x_feas;
+  Vec lw(l), uw(l);
+  for (int i = 0; i < l; ++i) {
+    lw(i) = Bx(i) - 0.2 * prob(rng);
+    uw(i) = Bx(i) + 0.2 * prob(rng);
+  }
+  auto problem = MakeProblem(n, m, l, DenseToSparse(Q), DenseToSparse(A), DenseToSparse(B), c, b, 0.0,
+                              Vec::Constant(n, -1.0), Vec::Constant(n, 1.0), lw, uw);
+
+  KSP_QP<double> pcg(problem);
+  ASSERT_FALSE(pcg.setup_failed);
+  const auto sol_pcg = pcg.solve();
+
+  KSP_QP<double> refactorizing(problem);
+  refactorizing.direct_solve = true;
+  refactorizing.direct_smw = false;
+  const auto sol_refactorizing = refactorizing.solve();
+
+  KSP_QP<double> smw(problem);
+  smw.direct_solve = true;
+  const auto sol_smw = smw.solve();
+
+  ASSERT_EQ(sol_pcg.opt, TerminationStatus::Optimal);
+  ASSERT_EQ(sol_refactorizing.opt, TerminationStatus::Optimal);
+  ASSERT_EQ(sol_smw.opt, TerminationStatus::Optimal);
+  const double scale = 1.0 + std::abs(sol_pcg.obj_val);
+  EXPECT_NEAR(sol_smw.obj_val, sol_pcg.obj_val, 1e-6 * scale);
+  EXPECT_NEAR(sol_refactorizing.obj_val, sol_pcg.obj_val, 1e-6 * scale);
+
+  ExpectDirectModeAccounting(refactorizing, sol_refactorizing);
+  ExpectDirectModeAccounting(smw, sol_smw);
+  EXPECT_EQ(refactorizing.direct_smw_count, 0);
+  EXPECT_GT(smw.direct_smw_count, 0) << "the SMW run never updated; this comparison would be vacuous";
+  EXPECT_LT(sol_smw.fact, sol_refactorizing.fact);  // the updates replaced refactorizations
 }

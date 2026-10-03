@@ -10,6 +10,7 @@
 #include "printing.hpp"
 #include "schur_operator.hpp"
 #include "schur_preconditioner.hpp"
+#include "schur_smw_update.hpp"
 
 // TIMER: master switch for per-step SSN-loop timer.
 // Set to 1 (here, or via -DSSN_ENABLE_TIMERS=1) to print a step-by-step timer of solve_ssn();
@@ -108,7 +109,7 @@ public:
     Vec x, y1, y2, z;
     Vec delta_x, delta_y1, delta_y2, delta_z;
     int ssn_max_in_iter;
-    T mu, rho, alpha, ssn_tol;
+    T mu = T(1), rho = T(1), alpha = T(0.95), ssn_tol; // mu, rho, alpha are set by update_ssn_system()
     T eps_pinf, eps_dinf;
 
     // Useful vectors and matrices
@@ -172,6 +173,8 @@ public:
     double timer_chol_analyze   = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->analyzePattern()
     double timer_chol_factorize = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->factorize()
     double timer_chol_solve     = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->solve()
+    double timer_direct_smw_setup = 0.0; // subset of timer_linear_solve: solve_direct()'s SMW update setup
+    double timer_direct_smw_solve = 0.0; // subset of timer_linear_solve: solve_direct()'s solves through the SMW update
     double timer_linesearch     = 0.0; // exact_linesearch
     double timer_state_update   = 0.0; // x, y2 update + termination check
 #endif
@@ -266,6 +269,22 @@ public:
     Eigen::Index chol_nnz_at_analyze_ = -1; // S's nonzero count at the last analyzePattern; a mismatch forces re-analysis.
     Vec chol_Hinv_r1_, chol_rhs_;           // size n, s
 
+    // SMW low-rank updates of the direct solver (direct mode only; see schur_smw_update.hpp). Every full
+    // factorization of K or S is recorded as a snapshot; a later Newton system whose active sets differ from
+    // the snapshot's by a low-rank delta (and with the same mu, rho) is solved through that factorization
+    // instead of refactorizing. The result is kept only if iterative refinement brings its KKT residual within
+    // direct_smw_accept_tol; otherwise the system is refactorized (see solve_newton_direction()).
+    bool direct_smw = true;           // True means use SMW updates when direct_solve is set; false refactorizes on every change.
+    T direct_smw_accept_tol = 1e-10;  // Relative KKT residual (after refinement) up to which an SMW-updated solve is kept (refine_rel_tol's default).
+    int direct_smw_count = 0;         // Newton systems set up as SMW updates (not included in fact).
+    int direct_smw_reject = 0;        // SMW-updated solves rejected by the residual check and refactorized.
+    SchurSmwUpdate<T> direct_smw_;    // Snapshot of the last full factorization and the current update.
+    bool direct_stale_ = true;        // True means the Newton matrix changed since the direct solver was last set up for it.
+    bool direct_force_full_ = false;  // True means the next direct setup must refactorize (an SMW result was rejected).
+    Vec direct_smw_Hinv_r1_, direct_smw_rhs_, direct_smw_dy_; // size n, s, s
+    Vec direct_smw_pad_;              // size of K for the LDLT base solve
+    bool direct_smw_enabled() const { return direct_solve && direct_smw; }
+
     SSN(const int Q_info, const Vec& Q_diag, const SpMat& L,
         const SpMat& A, const SpMat& B, const SpMat& A_tr, const SpMat& B_tr,
         const Vec& c, const Vec& b,
@@ -289,6 +308,7 @@ public:
 
         // M is fixed for this SSN's lifetime.
         cg.preconditioner().set_num_equality_rows(M);
+        direct_smw_.set_num_equality_rows(M);
 
         y2_active_W_.resize(l);
         y2_inactive_W_.resize(l);
@@ -325,6 +345,7 @@ public:
         A_tr_y1_ = A_tr * y1;        // y1 is fixed for the entire SSN run; cache A^T y1 once.
         linesearch_fail = 0;         // Reset line search failure count for this SSN iteration.
         cg.preconditioner().reset_smw_fail_streak(); // Reset SMW suppression.
+        direct_smw_.reset_fail_streak();
     }
 
     template <typename Derived>
@@ -368,7 +389,12 @@ public:
     Vec solve_using_ldlt(const SpMat& G, const Vec& H_diag, const Vec& r1, const Vec& r2);
     Vec solve_using_chol(const SpMat& G, const SpMat& G_tr, const Vec& H_diag, const Vec& H_diag_inv, const Vec& r1, const Vec& r2);
     void release_chol();
-    void iterative_refine_dxdy();
+    typename SchurSmwUpdate<T>::BaseSolve direct_base_solve(bool use_ldlt);
+
+    // iterative_refine_dxdy()'s last measured residual max(||rho1||_inf, ||rho2||_inf) and its reference
+    // max(||r1||_inf, ||r2||_inf).
+    struct RefineResult { T res_norm; T ref_norm; };
+    RefineResult iterative_refine_dxdy(bool need_final_residual = false);
     SsnLineSearchParams<T> make_line_search_params();
     void solve_ssn(const T ssn_tol);
 

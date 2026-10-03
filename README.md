@@ -266,8 +266,8 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `pmm_iter` | `int` | PMM outer iterations performed |
 | `ssn_iter` | `int` | Total SSN inner iterations |
 | `krylov_iter` | `int` | Total Krylov iterations |
-| `fact` | `int` | Preconditioner factorizations performed |
-| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates performed |
+| `fact` | `int` | Factorizations performed (of the preconditioner; of K or S by the direct solver) |
+| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates used instead of refactorizing (of the preconditioner; of the direct solver's factorization in direct mode) |
 | `pmm_tol_achieved` | `T` | Final PMM (outer) residual |
 | `ssn_tol_achieved` | `T` | Final SSN (inner) residual |
 | `setup_time` | `double` | Wall-clock seconds in the `KSP_QP<T>` constructor |
@@ -275,6 +275,24 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `run_time` | `double` | `setup_time + solve_time` |
 | `linesearch_fail` | `int` | Line-search failures |
 | `krylov_fail` | `int` | Krylov failures (fell back to a direct factorization) |
+
+### Linear solver for the SSN Newton systems
+
+By default each Newton system is solved by PCG on its Schur complement
+`S = G H⁻¹ Gᵀ + (1/μ) I`, preconditioned by a factorization that is reused across iterations
+through Sherman-Morrison-Woodbury (SMW) low-rank updates (`include/schur_preconditioner.hpp`).
+If PCG fails, the direct solver below takes over for the rest of the run. Two public
+`KSP_QP<T>` members select the experimental direct mode instead:
+
+| Member | Default | Description |
+|---|---|---|
+| `direct_solve` | `false` | Skip PCG and solve every Newton system exactly, by LDLT on the KKT matrix `K = [-H, Gᵀ; G, (1/μ) I]` or Cholesky on `S`, whichever is estimated cheaper |
+| `direct_smw` | `true` | With `direct_solve`: when the active sets differ by a few rows/columns from the last factorization's (and μ, ρ are unchanged), solve through an SMW update of that factorization instead of refactorizing (`include/schur_smw_update.hpp`). An update is kept only if iterative refinement brings its relative KKT residual to `1e-10`, the refinement target of a full factorization (`SSN::direct_smw_accept_tol`); otherwise that system is refactorized |
+
+After `solve()`, `kkt_ldlt_fact` / `schur_chol_fact` count the direct solver's factorizations
+(both included in `Solution::fact`), `direct_smw_count` the Newton systems solved through an SMW
+update instead (included in `Solution::smw_count`), and `direct_smw_reject` the updates that the
+residual check rejected. The SMW updates are not used in the fallback after a PCG failure.
 
 ### Termination status codes
 
@@ -296,14 +314,18 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 
 ### Python `ksp_qp_bind`
 
-**`solve_from_sif(filename, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0)`**
+**`solve_from_sif(filename, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, direct=False, direct_smw=True)`**
 Parse and solve a SIF/MPS file. Returns a dict with keys:
 `status`, `obj_val`, `setup_time`, `solve_time`, `run_time`, `pmm_iter`, `ssn_iter`,
-`krylov_iter`, `fact`, `smw_count`, `pmm_tol_achieved`, `x`, `y1`, `y2`, `z`.
+`krylov_iter`, `fact`, `smw_count`, `pmm_tol_achieved`, `system`, `kkt_ldlt_fact`,
+`schur_chol_fact`, `direct_smw_count`, `direct_smw_reject`, `x`, `y1`, `y2`, `z`.
 `x` and the multipliers are returned in the original, unscaled units, so they can be
-checked directly against the problem data as given.
+checked directly against the problem data as given. `direct` and `direct_smw` set the
+`KSP_QP<T>` members of the same names (see ["Linear solver"](#linear-solver-for-the-ssn-newton-systems));
+`system` is `"S"` when only PCG ran, otherwise `"D"` followed by `"K"` and/or `"S"` for the
+systems the direct solver factorized.
 
-**`solve_from_data(pd, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, trace_path="", rho_init=-1.0)`**
+**`solve_from_data(pd, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, trace_path="", rho_init=-1.0, direct=False, direct_smw=True)`**
 Same, but takes already-parsed problem data — the dict returned by `parse_sif()`, or the one
 built by `pde_generator.py` / `mpc_generator.py`. Returns the same keys as `solve_from_sif`.
 `trace_path` is diagnostic-only: when set, it writes a per-iteration CSV trace (active-set
@@ -328,7 +350,8 @@ to point at your clone from elsewhere. No editing or rebuilding is needed just t
 
 ```bash
 ./build/ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all] \
-                      [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S] [--ref FILE]
+                      [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] \
+                      [--out FILE] [--cooldown S] [--ref FILE]
 ```
 
 `--set` picks the problem set and, with it, the default input directory, default problem, and
@@ -345,8 +368,11 @@ admit a solution). Names are case-insensitive; the `.mps` files themselves are l
 
 Pass `--name all` to sweep the set, appending a row per problem to
 `<root>/results/pcg_netlib.csv` or `<root>/results/pcg_infeas.csv`
-(override with `--out`). The sweep is the directory listing, so adding or removing an `.mps`
-file is all it takes to change the set — the same convention `python/benchmark_netlib.py` uses.
+(override with `--out`). `--direct` runs the experimental direct mode
+(see ["Linear solver"](#linear-solver-for-the-ssn-newton-systems)) and writes `direct_*.csv`
+instead; `--no-direct-smw` additionally turns its SMW updates off (`direct_nosmw_*.csv`).
+The sweep is the directory listing, so adding or removing an `.mps` file is all it takes to
+change the set — the same convention `python/benchmark_netlib.py` uses.
 
 Both sets write the same CSV schema (`include/record_result.hpp`). Two columns are read
 differently per set: on the infeasible set `agree` means "infeasibility was detected" (rather
@@ -364,14 +390,16 @@ For a QPALM/OSQP comparison with performance profiles, use `python/benchmark_net
 ### `ksp_qp_maros_meszaros` — Maros-Meszaros QPs (`src/maros_meszaros.cpp`)
 
 ```bash
-./build/ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--out FILE] [--cooldown S]
+./build/ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] \
+                              [--direct [--no-direct-smw]] [--out FILE] [--cooldown S]
 ```
 
 Solves `<root>/<PROBLEM>.SIF` (default: `data/maros_meszaros/AUG2DCQP.SIF`), printing the
 solution summary. Pass `--name all` to sweep the full Maros-Meszaros set against its built-in
 reference objectives, appending a row to `<root>/results/pcg_mm.csv` (override with
 `--out`) for each — `--cooldown` (default 3s) sleeps between problems in this mode, which keeps
-a long sweep from being distorted by CPU thermal throttling.
+a long sweep from being distorted by CPU thermal throttling. `--direct` and `--no-direct-smw`
+work as for `ksp_qp_netlib` (default CSVs `results/direct_mm.csv` / `results/direct_nosmw_mm.csv`).
 
 For comparing against QPALM/OSQP rather than just checking against reference objectives, use
 the Python benchmark instead (see below) — that's what produces performance profiles.
@@ -619,9 +647,10 @@ When enabled, every SSN iteration prints a line like this to **stderr** (indepen
 [Timer] ssn_iter=3 total=0.1234s | prep=0.0012 linear_solve=0.1180 (prec_setup=0.0500 [assembly=0.0100 analyze=0.0150 factorize=0.0250] krylov_solve=0.0680) linesearch=0.0030 state_update=0.0012
 ```
 
-If the Krylov solve has fallen back to the direct solver, further lines report its breakdown:
-`kkt_ldlt` (LDLT on the KKT system: analyze/factorize/solve) and `schur_chol` (Cholesky on the
-Schur complement: assembly/analyze/factorize/solve). This is the tool to use when profiling
+If the direct solver ran (direct mode, or after PCG failed), further lines report its breakdown:
+`kkt_ldlt` (LDLT on the KKT system: analyze/factorize/solve), `schur_chol` (Cholesky on the
+Schur complement: assembly/analyze/factorize/solve) and `direct_smw` (SMW updates of either
+factorization: setup/solves). This is the tool to use when profiling
 *where* time goes inside the solver (e.g. preconditioner factorization vs. CG iterations);
 `PrintWhat::TUNING` is the tool for watching *convergence behavior* (residuals, PMM parameters)
 across iterations.
@@ -640,6 +669,7 @@ KSP-QP/
 │   ├── ssn.hpp/.tpp                    # semismooth Newton inner solver
 │   ├── schur_operator.hpp              # Schur complement as a matrix-free linear operator
 │   ├── schur_preconditioner.hpp        # preconditioner (factorization reuse, SMW low-rank updates)
+│   ├── schur_smw_update.hpp            # SMW low-rank updates of the direct solver's factorization
 │   ├── problem.hpp                     # Problem<T>: problem data + solver settings
 │   ├── solution.hpp                    # Solution<T> and the TerminationStatus enum
 │   ├── ksp_qp_types.hpp                # ParsedModel / KSPQPdata data structures
@@ -655,6 +685,7 @@ KSP-QP/
 │   ├── test_ssn.cpp
 │   ├── test_schur_operator.cpp
 │   ├── test_schur_preconditioner.cpp
+│   ├── test_schur_smw_update.cpp
 │   ├── test_mps_format_parser.cpp
 │   ├── test_problem.cpp
 │   ├── test_solution.cpp
