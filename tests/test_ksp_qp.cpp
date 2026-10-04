@@ -1280,9 +1280,11 @@ TEST(KspQpSolveEndToEnd, GeneralPositiveSemidefiniteQReformulationMatchesClosedF
 }
 
 TEST(KspQpSolveEndToEnd, TerminatesWithTimeLimitStatusWhenInjectedClockExceedsTimeLimit) {
-  // The time-limit check runs only after a PMM iteration that didn't already converge (it's
-  // checked after the `pmm_tol_achieved < tol` break), so an extremely tight tolerance is used
-  // here to force at least one non-converging iteration before the injected clock is consulted.
+  // The in-loop time-limit check runs only after a PMM iteration that didn't already converge
+  // (it's checked after the `pmm_tol_achieved < tol` break), so an extremely tight tolerance is
+  // used here to force at least one non-converging iteration before the injected clock is
+  // consulted. The first two clock reads (solving_start and the pre-loop setup check) report no
+  // elapsed time, so the limit fires inside the first PMM iteration, not before it.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(1, 1) << 2.0).finished());
   Vec c(1);
   c << -4.0;  // x=0 (the initial iterate) is not already optimal, unlike a c=0 problem
@@ -1294,17 +1296,15 @@ TEST(KspQpSolveEndToEnd, TerminatesWithTimeLimitStatusWhenInjectedClockExceedsTi
   ns.time_limit = 1.0;  // seconds
 
   auto base_time = std::chrono::steady_clock::now();
-  bool first_call = true;
+  int calls = 0;
   ns.now_ = [&]() {
-    if (first_call) {
-      first_call = false;
-      return base_time;
-    }
+    if (calls++ < 2) return base_time;
     return base_time + std::chrono::seconds(10);  // every subsequent call reports 10s elapsed
   };
 
   auto sol = ns.solve();
   EXPECT_EQ(sol.opt, TerminationStatus::TimeLimit);
+  EXPECT_EQ(sol.pmm_iter, 1);
 
   // Regression check: this break used to clear the Ruiz factors and c_orig before the loop exit,
   // which left the post-loop printable_sol()/objective_value() reading emptied buffers and
@@ -1313,6 +1313,28 @@ TEST(KspQpSolveEndToEnd, TerminatesWithTimeLimitStatusWhenInjectedClockExceedsTi
   EXPECT_EQ(sol.x.size(), 1);
   EXPECT_EQ(sol.z.size(), 1);
   EXPECT_TRUE(std::isfinite(sol.obj_val));
+}
+
+TEST(KspQpSolveEndToEnd, TimeLimitCountsSetupTime) {
+  // The time limit covers setup + solve, so a setup_time already past the limit stops solve()
+  // before the first PMM iteration, still reporting the initial iterate.
+  SpMat Q = DenseToSparse((Eigen::MatrixXd(1, 1) << 2.0).finished());
+  Vec c(1);
+  c << -4.0;
+  auto problem = MakeProblem(1, 0, 0, Q, SpMat(0, 1), SpMat(0, 1), c, Vec(0), 0.0,
+                              Vec::Constant(1, -1.0), Vec::Constant(1, 1.0), Vec(0), Vec(0));
+  KSP_QP<double> ns(problem);
+  ASSERT_FALSE(ns.setup_failed);
+  ns.time_limit = 1.0;   // seconds
+  ns.setup_time = 10.0;  // as if setup alone took 10s
+
+  auto sol = ns.solve();
+  EXPECT_EQ(sol.opt, TerminationStatus::TimeLimit);
+  EXPECT_EQ(sol.pmm_iter, 0);
+  EXPECT_EQ(sol.x.size(), 1);
+  EXPECT_EQ(sol.z.size(), 1);
+  EXPECT_TRUE(std::isfinite(sol.obj_val));
+  EXPECT_GE(sol.run_time, 10.0);
 }
 
 TEST(KspQpSolveEndToEnd, TerminatesWithMaxSsnIterationsWhenSsnIterationBudgetIsExhausted) {

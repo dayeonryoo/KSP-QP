@@ -249,7 +249,7 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `lw`, `uw` | `Vec` | `l`-dim bounds on `Bx` |
 | `tol` | `T` | Primal-dual termination tolerance (default `1e-6`) |
 | `max_iter` | `int` | Maximum PMM outer iterations |
-| `time_limit` | `double` | Wall-clock limit in seconds (default `600`) |
+| `time_limit` | `double` | Wall-clock limit in seconds on setup + solve (default `600`) |
 | `when` | `PrintWhen` | `NEVER` / `EVERY10` / `ALWAYS` |
 | `what` | `PrintWhat` | `NONE` / `MINIMAL` / `SSN` / `TUNING` / `FULL` (see ["Tuning: printing and timers"](#tuning-printing-and-timers)) |
 
