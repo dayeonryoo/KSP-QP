@@ -126,7 +126,7 @@ public:
     T mu_limit = 1e7;
     T rho_limit = 1e7;
     T alpha = 0.95;
-    double time_limit = 600.0; // in seconds
+    double time_limit = 600.0; // in seconds,  on setup_time + solve time
     bool direct_solve = false; // experimental: skip PCG and solve by LDLT on K or Cholesky on its Schur complement
     bool direct_smw = true;    // with direct_solve: reuse the last factorization through SMW low-rank updates when the active sets change little
     int linesearch_fail = 0;

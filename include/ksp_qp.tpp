@@ -866,6 +866,11 @@ template <typename T>
 Solution<T> KSP_QP<T>::solve() {
     auto solving_start = now_();
 
+    // Time limit covers the whole run (setup + solve), as in OSQP and QPALM.
+    auto time_limit_exceeded = [this, solving_start]() {
+        return setup_time + time_diff_s(solving_start, now_()) > time_limit;
+    };
+
     // If setup failed, exit immediately with the status already determined during setup:
     // NumericalError for a genuine setup error or PrimalInfeasible if check_bounds() found an empty box interval.
     if (setup_failed) {
@@ -902,9 +907,7 @@ Solution<T> KSP_QP<T>::solve() {
             eps_pinf, eps_dinf,
             when, what);
     NS.interrupted_ = interrupted_;
-    NS.time_limit_exceeded_ = [this, solving_start]() {
-        return time_diff_s(solving_start, now_()) > time_limit;
-    };
+    NS.time_limit_exceeded_ = time_limit_exceeded;
     // Route SSN's per-inner-iteration reports through KSP_QP's own (overridable) report_
     // hook too, so a caller that overrides report_ (e.g. for active-set flip diagnostics)
     // sees both the per-PMM-iteration and per-SSN-inner-iteration records through one path.
@@ -918,8 +921,11 @@ Solution<T> KSP_QP<T>::solve() {
     print_header(when, what);
 
     try {
+    // Setup alone may have used up the time limit.
+    if (time_limit_exceeded()) result = TerminationStatus::TimeLimit;
+
     // KSP-QP main loop
-    while (pmm_iter < max_iter) {
+    while (!result && pmm_iter < max_iter) {
         // ----------------------------------------------
         // Structure:
         // Until (primal infeasibility, dual infeasibility, complementarity) < tol, do:
@@ -998,9 +1004,7 @@ Solution<T> KSP_QP<T>::solve() {
             result = TerminationStatus::Interrupted;
             break;
         }
-        auto solving_current = now_();
-        double solving_current_time = time_diff_s(solving_start, solving_current); // in seconds
-        if (NS.opt == SSN<T>::TerminationStatus::TimeLimit || solving_current_time > time_limit) {
+        if (NS.opt == SSN<T>::TerminationStatus::TimeLimit || time_limit_exceeded()) {
             result = TerminationStatus::TimeLimit;
             break;
         }
