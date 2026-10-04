@@ -55,34 +55,21 @@ template <typename T>
 void SSN<T>::rebuild_G() {
     using RIt = typename RowMajorSpMat::InnerIterator;
 
-    const int n_act   = n_active_W;
-    const int n_inact = l - n_act;
-
-    // Partitioning B into active and inactive.
-    B_inact_trips_.clear();
-    B_inact_trips_.reserve(B_rm.nonZeros());
+    const int n_act = n_active_W;
 
     // G = [A; active rows of B]
     G_trips_.clear();
     G_trips_.reserve(G_A_trips_.size() + B_rm.nonZeros());
     G_trips_.insert(G_trips_.end(), G_A_trips_.begin(), G_A_trips_.end());
 
-    int i_act = 0, i_inact = 0;
+    int i_act = 0;
     for (int i = 0; i < l; ++i) {
         if (active_W(i)) {
             for (RIt it(B_rm, i); it; ++it)
                 G_trips_.emplace_back(M + i_act, it.col(), it.value());
             ++i_act;
-        } else {
-            for (RIt it(B_rm, i); it; ++it)
-                B_inact_trips_.emplace_back(i_inact, it.col(), it.value());
-            ++i_inact;
         }
     }
-
-    B_inactive_W.resize(n_inact, N);
-    B_inactive_W.setFromTriplets(B_inact_trips_.begin(), B_inact_trips_.end());
-    B_inactive_W.makeCompressed();
 
     G.resize(M + n_act, N);
     G.setFromTriplets(G_trips_.begin(), G_trips_.end());
@@ -832,25 +819,26 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
         n_active_W = active_W.count();
         n_inactive_W = l - n_active_W;
 
-        rebuild_G(); // Rebuild G = [A; active rows of B], B_inactive_W, G_tr.
+        rebuild_G(); // Rebuild G = [A; active rows of B] and G_tr.
     }
 
     {
     SSN_TIMER_BLOCK(timer_prep);
-    // Compute dy2 in inactive_W: dy2_inactive_W = - (mu / alpha) * dist_W(v)(inactive_W) - y2(inactive_W).
+    // Compute dy2 in inactive_W: dy2_inactive_W = - (mu / alpha) * dist_W(v)(inactive_W) - y2(inactive_W) = - y2(inactive_W),
+    // since v lies in [lw, uw] on inactive_W, where dist_W(v) = 0 exactly.
     split_by_mask(y2_cur_, active_W, y2_active_W_, y2_inactive_W_);
     split_by_mask(dist_W_v_, active_W, dist_W_v_active_, dist_W_v_inactive_);
-    dy2_inactive_W_.head(n_inactive_W).noalias() =
-        -(mu / alpha) * dist_W_v_inactive_.head(n_inactive_W) - y2_inactive_W_.head(n_inactive_W);
+    dy2_inactive_W_.head(n_inactive_W).noalias() = -y2_inactive_W_.head(n_inactive_W);
 
-    // Compute the RHS vector.
+    // Compute the RHS vector. Its y2 term - B^T y2 - B(inactive_W)^T dy2_inactive_W reduces to - B(active_W)^T y2(active_W),
+    // and B(active_W)^T is the last n_active_W columns of G_tr.
     if (Q_info == 0) {
         r1_ = c + mu * dist_K_u_
-             - B_tr * y2_cur_ - B_inactive_W.transpose() * dy2_inactive_W_.head(n_inactive_W)
+             - G_tr.rightCols(n_active_W) * y2_active_W_.head(n_active_W)
              + (x_cur_ - x) / rho;
     } else {
         r1_ = c + Q_diag.cwiseProduct(x_cur_) + mu * dist_K_u_
-             - B_tr * y2_cur_ - B_inactive_W.transpose() * dy2_inactive_W_.head(n_inactive_W)
+             - G_tr.rightCols(n_active_W) * y2_active_W_.head(n_active_W)
              + (x_cur_ - x) / rho;
     }
     r2_.resize(M + n_active_W);
