@@ -124,13 +124,13 @@ public:
 
     BoolArr active_W, active_K;
     int n_active_W, n_inactive_W;
-    SpMat B_inactive_W, G, G_tr;
+    SpMat G, G_tr;
 
     RowMajorSpMat B_rm;              // Row-major B for rebuilding G.
     std::vector<Triplet> G_A_trips_; // A's contribution to G, computed once since A is const.
 
     // Scratch triplet buffers for rebuild_G() and solve_using_ldlt()
-    std::vector<Triplet> B_inact_trips_, G_trips_;
+    std::vector<Triplet> G_trips_;
     std::vector<Triplet> ldlt_trip_;
 
     // Printing

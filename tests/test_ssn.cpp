@@ -222,7 +222,6 @@ TEST(SSN, RebuildGStacksAWithActiveBRowsInOriginalOrder) {
   EXPECT_TRUE(Dense(ns.G).isApprox(expected_G));
   EXPECT_TRUE(Dense(ns.G).bottomRows(ns.n_active_W)
                   .isApprox((Eigen::MatrixXd(1, 3) << 1, 0, 0).finished()));
-  EXPECT_TRUE(Dense(ns.B_inactive_W).isApprox((Eigen::MatrixXd(1, 3) << 0, 1, 0).finished()));
 }
 
 TEST(SSN, RebuildGHandlesAllRowsInactiveW) {
@@ -236,9 +235,6 @@ TEST(SSN, RebuildGHandlesAllRowsInactiveW) {
 
   EXPECT_TRUE(Dense(ns.G).isApprox((Eigen::MatrixXd(1, 3) << 1, 1, 1).finished()));
   EXPECT_EQ(ns.G.rows(), f.M);  // no active-W rows appended to A
-  Eigen::MatrixXd expected_inactive(2, 3);
-  expected_inactive << 1, 0, 0,  0, 1, 0;
-  EXPECT_TRUE(Dense(ns.B_inactive_W).isApprox(expected_inactive));
 }
 
 TEST(SSN, RebuildGHandlesAllRowsActiveW) {
@@ -256,7 +252,6 @@ TEST(SSN, RebuildGHandlesAllRowsActiveW) {
   Eigen::MatrixXd expected_active(2, 3);
   expected_active << 1, 0, 0,  0, 1, 0;
   EXPECT_TRUE(Dense(ns.G).bottomRows(ns.n_active_W).isApprox(expected_active));
-  EXPECT_EQ(ns.B_inactive_W.rows(), 0);
 }
 
 TEST(SSN, RebuildGHandlesZeroInequalityRowsGEqualsAOnly) {
@@ -272,7 +267,6 @@ TEST(SSN, RebuildGHandlesZeroInequalityRowsGEqualsAOnly) {
 
   EXPECT_TRUE(Dense(ns.G).isApprox(Dense(A)));
   EXPECT_EQ(ns.G.rows(), f.M);  // no active-W rows appended to A
-  EXPECT_EQ(ns.B_inactive_W.rows(), 0);
 }
 
 // ===================== choose_schur_ldlt =====================
@@ -971,12 +965,35 @@ TEST(PrepareNewtonSystem, AllWActiveWhenFarOutsideBoundsRebuildsGWithAllRowsAndE
   EXPECT_TRUE((ns.active_W.array() == true).all());
   EXPECT_EQ(ns.n_active_W, 2);
   EXPECT_EQ(ns.n_inactive_W, 0);
-  EXPECT_EQ(ns.B_inactive_W.rows(), 0);
   ASSERT_EQ(ns.G.rows(), 3);  // M=1 + n_active_W=2 = full [A; B]
   Eigen::MatrixXd expected(3, 3);
   expected.topRows(1) = DenseA1x3();
   expected.bottomRows(2) = DenseB2x3();
   EXPECT_TRUE(Dense(ns.G).isApprox(expected));
+}
+
+TEST(PrepareNewtonSystem, InactiveWRowsGetDy2EqualToMinusY2AndDropOutOfR1) {
+  // dist_W(v) = 0 on inactive_W, so dy2_inactive_W = -y2(inactive_W), and r1's y2 term
+  // -B^T y2 - B(inactive_W)^T dy2_inactive_W reduces to -B(active_W)^T y2(active_W).
+  SsnFixture f(DefaultA(), DefaultB());  // N=3, M=1, l=2
+  SSN<double> ns = f.Make();
+  Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
+  Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
+  ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, /*mu=*/1.0, /*rho=*/1.0, /*alpha=*/0.95, 0);
+  ns.x_cur_ = Vec::Zero(3);
+  ns.y2_cur_ = (Vec(2) << 2.0, -3.0).finished();
+  ns.Ax_ssn_ = Vec::Zero(1);
+  ns.Bx_ssn_ = (Vec(2) << 5.0, 0.0).finished();  // v_ = Bx_ssn_ + 0.05*y2_cur_ = (5.1, -0.15)
+
+  ns.prepare_newton_system();
+
+  ASSERT_TRUE(ns.active_W(0));   // v_(0) = 5.1 outside uw=1
+  ASSERT_FALSE(ns.active_W(1));  // v_(1) = -0.15 inside [lw, uw]
+  ASSERT_EQ(ns.n_inactive_W, 1);
+  EXPECT_DOUBLE_EQ(ns.dy2_inactive_W_(0), 3.0);  // -y2_cur_(1)
+  // c = 0, dist_K = 0 (x_cur_ inside its box) and x_cur_ = x, so r1_ = -B_row0^T y2_cur_(0) = (-2, 0, 0);
+  // B_row1 = [0,1,0] would contribute to r1_(1) if inactive rows did not cancel.
+  EXPECT_TRUE(ns.r1_.isApprox((Vec(3) << -2.0, 0.0, 0.0).finished()));
 }
 
 TEST(PrepareNewtonSystem, SchurLdltDecisionLocksAfterThreeActiveSetChanges) {
