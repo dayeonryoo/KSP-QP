@@ -2,52 +2,37 @@
 Benchmark KSP-QP against QPALM on the platoon (vehicle-chain) linear Model
 Predictive Control (MPC) QP (see python/mpc_generator.py).
 
-MPC is a native smooth QP: pure quadratic tracking cost, linear dynamics equality
-constraints, simple box bounds, no general inequality rows (l = 0). Its constraint
-matrix is banded, with at most 6 nonzeros per row independently of M and N.
+MPC is a smooth QP: quadratic tracking cost, linear dynamics equalities, box bounds,
+and no general inequality rows (l = 0). Its constraint matrix is banded, with at most
+6 nonzeros per row independently of M and N.
 
 Sweep design
 ------------
-The platoon has TWO size axes and they are not interchangeable:
+The platoon has two size axes:
 
-  * M (vehicle count) grows the band WIDTH -- and also the dense 2M x 2M DARE
-    terminal cost block, which is what forces Q to be non-diagonal.
-  * N (horizon) grows the band LENGTH: more banded stage blocks, fixed bandwidth,
-    fixed terminal block.
+  * M (vehicle count) grows the band width and the dense 2M x 2M DARE terminal
+    block, which makes Q non-diagonal.
+  * N (horizon) grows the band length, at fixed bandwidth and terminal block.
 
-Sweeping them one at a time through the corner of the (M, N) plane is misleading.
-Measured at tol 1e-6, two configurations of almost identical size land on opposite
-sides of the result:
+QPALM's iteration count grows with both axes while KSP-QP's stays nearly fixed, so
+problems of almost the same size can favor either solver depending on (M, N). The
+benchmark therefore sweeps the (M, N) grid, capped by problem size (--max-nz).
 
-    M=5,  N=1600  (n_z=24010):  KSP-QP 700 ms  vs  QPALM  477 ms   (0.68x)
-    M=20, N=400   (n_z=24040):  KSP-QP 734 ms  vs  QPALM 2060 ms   (2.81x)
+Scope note: KSP-QP has no warm start, so every solve is a cold start for both solvers
+(QPALM's warm_start() is never called). This measures cold-solve cost on MPC QPs, not
+closed-loop MPC throughput, where a warm-started QPALM would be faster.
 
-KSP-QP's time barely moves between them; QPALM's quadruples, because its iteration
-count grows with both axes (121 -> 288) while KSP-QP's stays essentially fixed
-across the whole family (pmm 13-15, krylov 104-182). So this benchmark sweeps the
-(M, N) GRID rather than two 1-D slices, capped by problem size (--max-nz).
-
-Scope note: KSP-QP has NO warm-start capability at any level yet, so every solve
-here is a cold start for BOTH solvers -- QPALM's warm_start() is deliberately never
-invoked, to keep the comparison like-for-like. This measures per-instance cold-solve
-cost on MPC-structured QPs; it is NOT a claim about closed-loop MPC throughput, where
-a warm-started QPALM would be considerably faster.
-
-Accuracy caveat: `pmm_tol_achieved` and `qpalm_tol_achieved` are each solver's OWN
-reported residual, in its own residual definition, its own scaling and its own
-reformulation of the problem. They are recorded as reported and are NOT directly
-comparable to one another -- in particular KSP-QP's is a lifted, relative residual
-(the MPC terminal block makes Q non-diagonal) while QPALM's is absolute on the
-stacked C = [A; I] form. Any write-up using these numbers must say so.
+Accuracy caveat: `pmm_tol_achieved` and `qpalm_tol_achieved` are each solver's own
+residual (own definition, scaling and reformulation) and are not directly comparable:
+KSP-QP's is a lifted, relative residual (the terminal block makes Q non-diagonal),
+QPALM's is absolute on C = [A; I].
 
 Trajectory design: two loop modes via --loop-mode:
-  - "shared" (default): one canonical state trajectory xbar_0..xbar_{T-1} is
-    precomputed per (M, N) config by a reference OSQP solve, then both solvers are
-    benchmarked on the identical sequence of T QP instances. OSQP appears ONLY as
-    this neutral trajectory generator -- it is not a comparison arm -- so neither
-    compared solver's own control choices bias the instance sequence.
-  - "own": each solver closes its own feedback loop with its own u_0. Operationally
-    realistic, and surfaces whether numerical error compounds differently.
+  - "shared" (default): one state trajectory xbar_0..xbar_{T-1} per (M, N) config is
+    precomputed by a reference OSQP solve, and both solvers are benchmarked on the
+    same T QP instances. OSQP is only the trajectory generator, not a comparison arm.
+  - "own": each solver closes its own feedback loop with its own u_0, which shows
+    whether numerical error compounds differently.
 
 Outputs
 -------
@@ -132,10 +117,8 @@ def sweep_configs(M_list=None, N_list=None, max_nz: int = MAX_NZ):
 # ---------------------------------------------------------------------------
 # Solver wrappers.
 #
-# These return the solution vector x as well as the result dict; the shared
-# benchmark_common.run_qpalm/run_osqp discard it, and the rollout needs u_0 to
-# advance the state. They are local variants rather than modifications to that
-# already-relied-upon module.
+# These also return x, since the rollout needs u_0 to advance the state;
+# benchmark_common.run_qpalm/run_osqp discard it.
 # ---------------------------------------------------------------------------
 
 def _solve_qpalm_x(qpalm_data: tuple, tol: float, time_limit: float, obj_const: float = 0.0):
@@ -223,13 +206,10 @@ def generate_trajectory(M: int, N: int, T: int) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Rollout worker. One subprocess runs the whole rollout for ONE config: MPC QPs
-# solve in milliseconds at the small end, so per-step spawn overhead would dominate.
-# Crash/OOM isolation is kept, just at (M, N) granularity.
-#
-# Both solvers run inside the SAME worker so that solver order can be interleaved
-# per repeat -- running all of solver A then all of solver B lets thermal drift and
-# P-core/E-core migration bias whichever ran first.
+# Rollout worker: one subprocess per (M, N) config, since small MPC QPs solve in
+# milliseconds and per-step spawning would dominate; crashes/OOM are still isolated
+# per config. Both solvers run in the same worker so their order can alternate per
+# repeat, avoiding thermal-drift and P-/E-core bias toward whichever runs first.
 # ---------------------------------------------------------------------------
 
 def _set_high_qos():
@@ -291,10 +271,9 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
 # ---------------------------------------------------------------------------
 # CSV -- long format, one row per (instance, solver, repeat).
 #
-# The previous wide merged-by-step schema put every solver's columns on one row;
-# it cannot absorb repeats without a column explosion, and _write_csv's
-# extrasaction="ignore" silently drops any key missing from CSV_FIELDS, which is
-# how the archived CSVs became schema-incompatible. Hence schema_version.
+# schema_version separates this from older wide CSVs (all solvers on one row), which
+# are incompatible; _write_csv's extrasaction="ignore" silently drops keys missing
+# from CSV_FIELDS.
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [

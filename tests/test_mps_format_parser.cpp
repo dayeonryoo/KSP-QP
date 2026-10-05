@@ -127,9 +127,8 @@ TEST(MpsFormatParserParse, EmptyModelWithNoRowsOrColumnsParsesCleanly) {
 }
 
 // ===================== parse(): fixed vs. free format detection =====================
-// Free-format ROWS line "N GOAL" must not be misread as fixed-format.
-// Sliced at fixed byte offsets it becomes F1=substr(1,2)="G", F2=substr(4,8)="AL",
-// i.e. 2 tokens which happens to satisfy the ROWS section's arity check.
+// Free-format ROWS line "N GOAL" must not be read as fixed-format, where it slices to
+// F1="G", F2="AL" (2 tokens, which passes the ROWS arity check).
 
 TEST(MpsFormatParserParse, FreeFormatRowNamedGoalIsNotMisreadAsGTypeRowNamedAl) {
   std::string content;
@@ -492,12 +491,9 @@ TEST(MpsFormatParserParse, SecondBoundsSetWithDifferentNameStillApplies) {
   EXPECT_NEAR(model.col_upper(0), 9.0, kTight);    // from BND2, still applied
 }
 
-// A value-less bound (FR/MI/PL/BV) on a file whose columns are named with digits
-// -- as in DPKLO1.SIF, whose 133 columns are named "1".."133" and whose bound set
-// is named "0".  The three tokens "FR 0 1" must read as <type> <bound_name> <col>;
-// mistaking the numeric column name for a bound value would leave every real
-// column at its default [0, inf) and invent a spurious free column, which turned
-// the whole QP infeasible.
+// A value-less bound (FR/MI/PL/BV) on numerically named columns, as in DPKLO1.SIF (columns
+// "1".."133", bound set "0"). "FR 0 1" must read as <type> <bound_name> <col>; reading "1" as a
+// value would leave every real column at [0, inf) and add a spurious free column.
 TEST(MpsFormatParserParse, ValuelessBoundOnNumericallyNamedColumnIsNotMisreadAsAValue) {
   std::string content;
   content += "ROWS\n";
@@ -579,12 +575,9 @@ TEST(MpsFormatParserParse, UnknownBoundTypeThrows) {
 
 // ===================== parse(): fixed-field overflow =====================
 
-// A file that looks fixed-format from its first line (" N  OBJ" carries no numeric
-// field, so both readings agree) but whose values are written at full double
-// precision.  "1.1305249478260869e+01" overruns the 12-column value field and would
-// be read as "1.1305249478" -- losing the exponent, and with it a factor of ten.
-// Every value must survive intact, and the truncation must not silently produce a
-// plausible-but-wrong number.
+// Fixed-format by its first line (" N  OBJ" reads the same both ways), but with values at full
+// double precision: "1.1305249478260869e+01" overruns the 12-column value field and would be
+// read as "1.1305249478". Every value must survive intact.
 TEST(MpsFormatParserParse, FullPrecisionValuesOverflowingTheFixedValueFieldAreNotTruncated) {
   std::string content;
   content += "ROWS\n";
@@ -609,9 +602,8 @@ TEST(MpsFormatParserParse, FullPrecisionValuesOverflowingTheFixedValueFieldAreNo
   EXPECT_NEAR(model.col_upper(0), 1.1305249478260869e+01, kTight);  // not 1.1305249478
 }
 
-// The truncated upper bound (1.13) would fall below the untruncated lower bound
-// (5.44), so the pre-fix parser rejected the model outright rather than solving a
-// silently corrupted one.  Pins that this no longer throws.
+// Truncated, the upper bound (1.13) would fall below the lower bound (5.44) and throw an
+// inconsistent-bounds error; it must not.
 TEST(MpsFormatParserParse, OverflowingBoundPairNoLongerTriggersInconsistentBoundsError) {
   std::string content;
   content += "ROWS\n";
@@ -822,9 +814,8 @@ TEST(MpsFormatParserParse, InconsistentColumnBoundsThrows) {
 }
 
 
-// A negative UP with no explicit LO relaxes the lower bound to -inf (the common MPS-reader
-// convention) instead of leaving the default lower bound (0) and throwing on the resulting
-// lower(0) > upper(<0).
+// A negative UP with no explicit LO relaxes the lower bound to -inf (the common MPS convention)
+// instead of throwing on lower(0) > upper(<0).
 TEST(MpsFormatParserParse, UpBoundNegativeWithoutLowerBoundRelaxesLowerBoundToMinusInf) {
   std::string content;
   content += "ROWS\n";
@@ -844,8 +835,7 @@ TEST(MpsFormatParserParse, UpBoundNegativeWithoutLowerBoundRelaxesLowerBoundToMi
   EXPECT_NEAR(model.col_upper(0), -1.0, kTight);
 }
 
-// An explicit LO (even LO 0) disables the auto-relax above: the negative UP that follows it is a
-// genuine conflict, not a defaulted one, so this must still throw.
+// An explicit LO (even LO 0) disables the relaxation, so a following negative UP must throw.
 TEST(MpsFormatParserParse, UpBoundNegativeWithExplicitZeroLowerBoundStillThrows) {
   std::string content;
   content += "ROWS\n";
@@ -861,9 +851,8 @@ TEST(MpsFormatParserParse, UpBoundNegativeWithExplicitZeroLowerBoundStillThrows)
   EXPECT_THROW(parser.parse(WriteTempMps(content)), std::runtime_error);
 }
 
-// The relaxation must key off "was an explicit lower-bound entry ever seen for this column",
-// not "was it seen before this UP entry specifically" -- so a negative UP followed later by a
-// consistent explicit LO must keep that explicit value, not the -inf relaxation.
+// The relaxation checks for an explicit lower bound anywhere in the file, not only before the UP:
+// a negative UP followed by a consistent LO keeps the LO value.
 TEST(MpsFormatParserParse, UpBoundNegativeBeforeExplicitLowerBoundKeepsExplicitLowerBound) {
   std::string content;
   content += "ROWS\n";
@@ -923,9 +912,8 @@ TEST(MpsFormatParserParse, RhsEntryTargetingObjectiveRowSetsObjConst) {
   EXPECT_NEAR(pd.obj_const, -7.0, kTight);  // negated in to_kspqp(), read off the RHS
 }
 
-// A RANGES entry on a non-primary N-type row is accepted but then silently ignored,
-// since finalize_row_bounds()'s N-type branch unconditionally sets (-inf, inf)
-// regardless of any stored range or rhs value.
+// A RANGES entry on a non-objective N row is accepted and ignored: finalize_row_bounds()
+// makes N rows free.
 TEST(MpsFormatParserParse, RangesEntryOnNonPrimaryFreeRowIsAcceptedAndIgnored) {
   std::string content;
   content += "ROWS\n";
@@ -1019,9 +1007,8 @@ TEST(MpsFormatParserToKspqp, SplitsEqualityInequalityAndSkipsFreeRows) {
   EXPECT_NEAR(pd.uw(0), 3.0, kTight);
 }
 
-// Degenerate opposite ends of the eq/ineq split above: all rows equality
-// (l=0, empty B/lw/uw) and all rows inequality (m=0, empty A/b). 
-// Both pd.A/pd.B are constructed unconditionally regardless of size.
+// Degenerate eq/ineq splits: all rows equality (l=0, empty B/lw/uw) and all rows
+// inequality (m=0, empty A/b).
 TEST(MpsFormatParserToKspqp, AllRowsEqualityGivesEmptyInequalityBlock) {
   ParsedModel<double> model;
   model.is_qp = false;

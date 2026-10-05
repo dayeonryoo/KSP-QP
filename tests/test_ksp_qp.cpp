@@ -82,9 +82,7 @@ TEST(GetQInfo, GeneralMatrixReportsQInfoTwo) {
 }
 
 // ===================== determine_dimensions =====================
-// Exercised directly on an already-constructed KSP_QP<double> (built from a trivially valid
-// problem), matching the "construct one valid instance, then call the method under test again
-// with different data" pattern -- avoids duplicating the whole setup pipeline per case.
+// Called directly on an already-constructed KSP_QP<double> built from a trivially valid problem.
 
 namespace {
 
@@ -293,9 +291,8 @@ TEST(KspQpConstruction, ReportsPrimalInfeasibleWhenLxExceedsUx) {
 }
 
 // ===================== ruiz_scaling =====================
-// ruiz_scaling() reads/writes only `this->n/m/l/Q_info` (members) plus the `problem` argument, so
-// these tests override those members directly on an already-constructed instance rather than
-// building a fresh KSP_QP per case.
+// ruiz_scaling() uses only the members n/m/l/Q_info and its `problem` argument, so these tests set
+// those members on an existing instance.
 
 TEST(RuizScaling, ReturnsImmediatelyWhenNIsZero) {
   KSP_QP<double> ns = MakeValidInstance();
@@ -364,18 +361,16 @@ TEST(SetLFromLLT, ProducesFactorSatisfyingLLTApproximatesQForPositiveDefiniteInp
 }
 
 TEST(SetLFromLLT, ThrowsOnGenuinelyIndefiniteQInsteadOfSilentlyClamping) {
-  // Q=[[1,2],[2,1]] has eigenvalues {3,-1} -- genuinely indefinite, not fixable by escalated
-  // diagonal regularization within tolerance. set_L_from_LLT must refuse (throw) rather than
-  // clamp the negative LDLT pivot to 0 and silently hand back an L whose L*L^T != Q.
+  // Q=[[1,2],[2,1]] has eigenvalues {3,-1}: too indefinite for the regularization tolerance, so
+  // set_L_from_LLT must throw rather than clamp the pivot and return an L with L*L^T != Q.
   KSP_QP<double> ns = MakeValidInstance();
   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1.0, 2.0, 2.0, 1.0).finished());
   EXPECT_THROW(ns.set_L_from_LLT(Q), std::runtime_error);
 }
 
 TEST(SetLFromLLT, ConstructorSetsNumericalErrorStatusOnGenuinelyIndefiniteQ) {
-  // Same indefinite Q as above, but exercised end-to-end through the KSP_QP constructor: the
-  // exception thrown by set_L_from_LLT (via set_default, Q_info==2 path) must be caught there
-  // and surfaced as setup_failed + TerminationStatus::NumericalError, not left unreported.
+  // Same Q through the KSP_QP constructor: set_L_from_LLT's exception must surface as
+  // setup_failed + TerminationStatus::NumericalError.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1.0, 2.0, 2.0, 1.0).finished());
   auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), Vec::Zero(2), Vec::Zero(0), 0.0,
                               Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
@@ -386,11 +381,9 @@ TEST(SetLFromLLT, ConstructorSetsNumericalErrorStatusOnGenuinelyIndefiniteQ) {
 }
 
 TEST(SetLFromLLT, RecoversViaEscalatedRegularizationWhenNegativePivotIsSmallRelativeToQ) {
-  // Q=[[1,b],[b,1]] with b=1+1e-7 has eigenvalues {2+1e-7, -1e-7}: a genuine (not floating-point
-  // noise) but tiny negative eigenvalue, well within the accepted regularization/verification
-  // tolerance relative to Q's scale (~2). The initial regularization seed (~sqrt(eps)*scale)
-  // isn't quite enough to fix it, so this exercises the retry-with-10x-delta path -- confirms it
-  // succeeds (doesn't throw) and the resulting L still satisfies L*L^T ~= Q.
+  // Q=[[1,b],[b,1]], b=1+1e-7, has eigenvalues {2+1e-7, -1e-7}: a tiny but real negative
+  // eigenvalue, within tolerance for Q's scale (~2). The initial delta (~sqrt(eps)*scale) isn't
+  // enough, so this exercises the 10x retry, which must succeed with L*L^T ~= Q.
   KSP_QP<double> ns = MakeValidInstance();
   const double b = 1.0000001;
   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1.0, b, b, 1.0).finished());
@@ -403,10 +396,8 @@ TEST(SetLFromLLT, RecoversViaEscalatedRegularizationWhenNegativePivotIsSmallRela
 }
 
 TEST(SetLFromLLT, ThrowsOnGenuinelyIndefiniteQRegardlessOfOverallMatrixScale) {
-  // Same indefinite Q as ThrowsOnGenuinelyIndefiniteQInsteadOfSilentlyClamping, scaled by 1e6:
-  // the eigenvalue ratio (and hence relative indefiniteness) is unchanged, so this must still
-  // throw -- confirms the regularization is scaled relative to Q (via Q's inf-norm), not pinned
-  // to some absolute constant that a rescaled Q could slip past.
+  // The Q of ThrowsOnGenuinelyIndefiniteQInsteadOfSilentlyClamping scaled by 1e6 must still throw:
+  // the regularization scales with Q's inf-norm, not an absolute constant.
   KSP_QP<double> ns = MakeValidInstance();
   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1.0, 2.0, 2.0, 1.0).finished() * 1e6);
   EXPECT_THROW(ns.set_L_from_LLT(Q), std::runtime_error);
@@ -425,9 +416,34 @@ TEST(SetLFromLLT, NullDiagonalRowGetsExactlyZeroRowInL) {
   Eigen::MatrixXd L_dense(ns.L);
   EXPECT_TRUE(L_dense.row(2).isZero(0.0));
 
+  // Row 2 is dropped from L's storage, and no other stored entry is an explicit zero.
+  for (int k = 0; k < ns.L.outerSize(); ++k)
+    for (SpMat::InnerIterator it(ns.L, k); it; ++it) {
+      EXPECT_NE(it.row(), 2);
+      EXPECT_NE(it.value(), 0.0);
+    }
+
   Eigen::MatrixXd LLT = L_dense * L_dense.transpose();
   Eigen::MatrixXd Q_dense(Q);
   EXPECT_TRUE(LLT.isApprox(Q_dense, 1e-6));
+}
+
+TEST(SetLFromLLT, LiftedConstraintMatrixStoresNoExplicitZeros) {
+  // Q_info == 2 lifts A to [A, 0; L^T, -I], so L's dropped entries must not reappear in A.
+  SpMat Q = DenseToSparse((Eigen::MatrixXd(3, 3) <<
+                            4.0, 1.0, 0.0,
+                            1.0, 3.0, 0.0,
+                            0.0, 0.0, 0.0).finished());
+  auto problem = MakeProblem(3, 0, 0, Q, SpMat(0, 3), SpMat(0, 3), Vec::Zero(3), Vec::Zero(0), 0.0,
+                              Vec::Constant(3, -kInf), Vec::Constant(3, kInf), Vec(0), Vec(0));
+  KSP_QP<double> ns(problem);
+  ASSERT_FALSE(ns.setup_failed);
+  ASSERT_EQ(ns.Q_info, 2);
+
+  for (int k = 0; k < ns.A.outerSize(); ++k)
+    for (SpMat::InnerIterator it(ns.A, k); it; ++it)
+      EXPECT_NE(it.value(), 0.0) << "explicit zero at (" << it.row() << ", " << it.col() << ")";
+  EXPECT_EQ(ns.A.col(2).nonZeros(), 0);  // x_2 is Q's null row, so L^T has no entries in its column
 }
 
 // ===================== build_reformulated_vecs (static) =====================
@@ -509,11 +525,9 @@ TEST(BuildReformulatedVecs, ReformulationBranchDefaultsEmptyCAndBToZeroPadding) 
 
 // ===================== compute_residual_unscaled_inf_norms =====================
 //
-// Each case constructs an KSP_QP directly (bypassing solve()) and hand-sets x/y1/y2/z plus the
-// Ax/Bx/Qx arguments, choosing A/B entries of magnitude exactly 1 (or leaving M/l at 0) so Ruiz
-// scaling is a no-op (row/col max already == 1, converges on the first pass with
-// D1A_diag/D1B_diag/D2_diag all exactly 1) -- this keeps "scaled" and "unscaled" identical so the
-// expected residuals are directly hand-derivable.
+// Each case constructs a KSP_QP (bypassing solve()) and sets x/y1/y2/z and Ax/Bx/Qx by hand.
+// A/B entries have magnitude 1 (or M/l = 0), so Ruiz scaling is a no-op (all D factors exactly 1)
+// and the expected residuals can be derived by hand.
 
 TEST(ComputeResidualUnscaledInfNorms, AllShortcutsFireWhenMAndLAreZero) {
   SpMat Q(1, 1);  // Q_info = 0
@@ -606,90 +620,6 @@ TEST(ComputeResidualUnscaledInfNorms, DualResidualIncludesQxTermWhenQInfoNonzero
   EXPECT_DOUBLE_EQ(res(3), 0.0);
 }
 
-// TEST(ComputeResidualUnscaledInfNorms, DualResidualUsesTrueQNotLiftedProxyWhenQInfoIsTwo) {
-//   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 2.0, 1.0, 1.0, 2.0).finished());  // Q_info = 2
-//   Vec c = Vec::Zero(2);
-//   auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), c, Vec(0), 0.0,
-//                               Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
-//   KSP_QP<double> ns(problem);
-//   ASSERT_FALSE(ns.setup_failed);
-//   ASSERT_EQ(ns.Q_info, 2);
-//   ASSERT_TRUE(ns.D2_diag.isApprox(Vec::Ones(2)));  // ruiz scaling is a no-op here
-
-//   // Adversarial iterate: x_true and v deliberately inconsistent (v != L^T x_true), but y1 and z
-//   // are chosen so the OLD (lifted-proxy) formula reads num.head(2) == 0 exactly.
-//   Vec x_true(2); x_true << 1.0, 1.0;
-//   Vec v(2);      v      << 5.0, 5.0;
-//   ns.x = Vec(4); ns.x << x_true, v;
-//   ns.y1 = -v;                        // satisfies the v-block's own residual (v+y1=0)
-//   ns.y2 = Vec::Zero(0);
-//   Vec z_head = ns.L * ns.y1 - c;     // forces the OLD formula's c+z-L*y1 to exactly 0
-//   ns.z = Vec(4); ns.z << z_head, 0.0, 0.0;
-
-//   Vec Ax = ns.A * ns.x;
-//   Vec Qx = ns.Q_diag.cwiseProduct(ns.x);
-//   auto res = ns.compute_residual_unscaled_inf_norms(Ax, Vec::Zero(0), Qx);
-
-//   // True residual: L*(L^T*x_true - v). Hand-verified with LDLT of [[2,1],[1,2]]
-//   // (L ~= [[1.414,0],[0.707,1.225]]): numerator ~[-4.07,-6.66], denom ~10.66, res_d ~0.625.
-//   // Threshold (not exact) since L's precise value depends on Eigen's internal pivoting.
-//   EXPECT_GT(res(1), 0.1);  // fails on old code (reads ~0), passes once fixed (~0.625)
-// }
-
-// TEST(ComputeResidualUnscaledInfNorms, DualResidualIndependentOfAuxiliaryBlockScaleWhenQInfoIsTwo) {
-//   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 2.0, 1.0, 1.0, 2.0).finished());
-//   Vec c(2); c << 5.0, 0.0;
-//   auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), c, Vec(0), 0.0,
-//                               Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
-//   KSP_QP<double> ns(problem);
-//   ASSERT_FALSE(ns.setup_failed);
-//   ASSERT_EQ(ns.Q_info, 2);
-
-//   Vec x_true(2); x_true << 1.0, 1.0;
-//   ns.y2 = Vec::Zero(0);
-//   ns.z = Vec::Zero(4);
-
-//   auto res_d_for_v = [&](double v_scale) {
-//     ns.x = Vec(4); ns.x << x_true, Vec::Constant(2, v_scale);
-//     ns.y1 = Vec::Constant(2, -v_scale);  // v-block's own residual satisfied, any scale
-//     Vec Ax = ns.A * ns.x;
-//     Vec Qx = ns.Q_diag.cwiseProduct(ns.x);
-//     return ns.compute_residual_unscaled_inf_norms(Ax, Vec::Zero(0), Qx)(1);
-//   };
-
-//   // res_d must be identical regardless of the auxiliary block's magnitude: it's pure
-//   // solver-internal bookkeeping and must not influence the original problem's certificate.
-//   EXPECT_NEAR(res_d_for_v(0.0), res_d_for_v(1e6), 1e-9);
-// }
-
-// TEST(ComputeResidualUnscaledInfNorms, PrimalResidualIndependentOfAuxiliaryBlockScaleWhenQInfoIsTwo) {
-//   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 2.0, 1.0, 1.0, 2.0).finished());
-//   SpMat A = DenseToSparse((Eigen::MatrixXd(1, 2) << 1.0, 1.0).finished());
-//   Vec c = Vec::Zero(2);
-//   Vec b(1); b << 3.0;
-//   auto problem = MakeProblem(2, 1, 0, Q, A, SpMat(0, 2), c, b, 0.0,
-//                               Vec::Constant(2, -kInf), Vec::Constant(2, kInf), Vec(0), Vec(0));
-//   KSP_QP<double> ns(problem);
-//   ASSERT_FALSE(ns.setup_failed);
-//   ASSERT_EQ(ns.Q_info, 2);
-
-//   Vec x_head(2); x_head << 1.0, 1.0;
-//   ns.y1 = Vec::Zero(ns.M);
-//   ns.y2 = Vec::Zero(0);
-//   ns.z = Vec::Zero(4);
-
-//   auto res_p_for_v = [&](double v_scale) {
-//     ns.x = Vec(4); ns.x << x_head, Vec::Constant(2, v_scale);
-//     Vec Ax = ns.A * ns.x;
-//     Vec Qx = ns.Q_diag.cwiseProduct(ns.x);
-//     return ns.compute_residual_unscaled_inf_norms(Ax, Vec::Zero(0), Qx)(0);
-//   };
-
-//   // res_p must be identical regardless of the auxiliary block's magnitude: the lifting
-//   // constraint's own violation (L^T*x - v) must not leak into the original problem's primal
-//   // residual.
-//   EXPECT_NEAR(res_p_for_v(0.0), res_p_for_v(1e6), 1e-9);
-// }
 
 TEST(ComputeResidualUnscaledInfNorms, DualResidualUnaffectedByNullDirectionMagnitudeWhenQInfoIsTwo) {
   // Index 2 has zero row/column in Q, i.e. L's row 2 is exactly zero.
@@ -743,11 +673,8 @@ TEST(ObjectiveValue, LinearOnlyWhenQInfoIsZero) {
 }
 
 TEST(ObjectiveValue, ReconstructsFullSymmetricQuadraticFromLowerTriangularStorage) {
-  // Q given as a full, general (off-diagonal-coupled) symmetric matrix -> Q_info=2, and the
-  // constructor keeps only Q's lower triangle. Confirms objective_value's
-  // selfadjointView<Lower>() reconstruction still produces the correct FULL quadratic form
-  // x^T Q x, not just the lower-triangular contribution -- a regression guard for the
-  // Q-triangular-storage bug noted as already fixed in project history.
+  // A general symmetric Q (Q_info=2) is stored lower-triangular; objective_value's
+  // selfadjointView<Lower>() must still give the full x^T Q x.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 4.0, 1.0, 1.0, 2.0).finished());
   Vec c(2); c << 0.0, 0.0;
   auto problem = MakeProblem(2, 0, 0, Q, SpMat(0, 2), SpMat(0, 2), c, Vec(0), 0.0,
@@ -889,10 +816,8 @@ TEST(UpdatePmmParameters, LineSearchFailedLoosensMuRhoAndGrowsSsnTol) {
 }
 
 // ===================== primal_infeas / dual_infeas =====================
-// Certificates are built directly from the solver's own (ruiz-scaled) matrices/vectors after
-// construction, so these tests validate the documented formula (see the docstrings in
-// ksp_qp.tpp) against a certificate guaranteed to satisfy it exactly -- independent of the
-// specific ruiz scaling factors, which are solver-internal and not hand-predicted here.
+// Certificates are built from the solver's own Ruiz-scaled data after construction, so they
+// satisfy the formulas in ksp_qp.tpp exactly, whatever the scaling factors are.
 
 TEST(PrimalInfeas, DetectsCertificateOnHandBuiltInfeasibleLp) {
   // min 0  s.t.  x = 1000,  x <= 0.  Genuinely infeasible.  The finite ux is what makes the
@@ -916,12 +841,10 @@ TEST(PrimalInfeas, DetectsCertificateOnHandBuiltInfeasibleLp) {
 }
 
 TEST(PrimalInfeas, RejectsCertificateLeaningOnAnInfiniteBound) {
-  // Same certificate as DetectsCertificateOnHandBuiltInfeasibleLp, but ux = +inf, which turns the
-  // problem into min 0 s.t. x = 1000, x free -- feasible, with x = 1000.  cert_z > 0 on a
-  // coordinate with no upper bound makes condition 2's support function +inf, so the certificate
-  // proves nothing and condition 3 abandons it.  The pre-fix code instead treated that term as 0,
-  // leaving lhs2 = -b*cert_y1 = -1000 < 0 and reporting this feasible LP as primal infeasible; on
-  // the Netlib set that misreported CRE-A, CRE-C, SCORPION, SCSD6, SCTAP1 and all six SHIP*.
+  // Same certificate as DetectsCertificateOnHandBuiltInfeasibleLp, but ux = +inf, so the LP
+  // (x = 1000, x free) is feasible. cert_z > 0 on a coordinate with no upper bound makes condition
+  // 2's support function +inf, so condition 3 must abandon the certificate; treating that term as 0
+  // would give lhs2 = -b*cert_y1 = -1000 < 0 and a false infeasible verdict.
   SpMat A = DenseToSparse((Eigen::MatrixXd(1, 1) << 1.0).finished());
   Vec b(1);
   b << 1000.0;
@@ -969,11 +892,9 @@ TEST(PrimalInfeas, ReturnsFalseForZeroCertificate) {
 }
 
 TEST(PrimalInfeas, ReturnsFalseWhenCondition2PassesButCondition1Fails) {
-  // Same infeasible LP as DetectsCertificateOnHandBuiltInfeasibleLp, but cert_z=0 instead of
-  // A^T*cert_y1: condition 2 (which only involves b/cert_y1 and the bound terms, all zero here
-  // since cert_z=0) still passes, but condition 1's lhs1 = A^T*cert_y1 - cert_z = A^T*cert_y1 is
-  // now nonzero, so the overall certificate must be rejected -- isolating that condition 1 is
-  // genuinely load-bearing rather than always short-circuited by condition 2.
+  // Same infeasible LP as DetectsCertificateOnHandBuiltInfeasibleLp, but cert_z=0: condition 2
+  // still passes, but condition 1's lhs1 = A^T*cert_y1 is nonzero, so condition 1 alone must
+  // reject the certificate.
   SpMat A = DenseToSparse((Eigen::MatrixXd(1, 1) << 1.0).finished());
   Vec b(1);
   b << 1000.0;
@@ -1281,11 +1202,9 @@ TEST(KspQpSolveEndToEnd, GeneralPositiveSemidefiniteQReformulationMatchesClosedF
 }
 
 TEST(KspQpSolveEndToEnd, TerminatesWithTimeLimitStatusWhenInjectedClockExceedsTimeLimit) {
-  // The in-loop time-limit check runs only after a PMM iteration that didn't already converge
-  // (it's checked after the `pmm_tol_achieved < tol` break), so an extremely tight tolerance is
-  // used here to force at least one non-converging iteration before the injected clock is
-  // consulted. The first two clock reads (solving_start and the pre-loop setup check) report no
-  // elapsed time, so the limit fires inside the first PMM iteration, not before it.
+  // The in-loop time-limit check runs after the `pmm_tol_achieved < tol` break, so a very tight
+  // tol forces a non-converged iteration. The first two clock reads (solving_start and the
+  // pre-loop setup check) report no elapsed time, so the limit fires inside the first PMM iteration.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(1, 1) << 2.0).finished());
   Vec c(1);
   c << -4.0;  // x=0 (the initial iterate) is not already optimal, unlike a c=0 problem
@@ -1307,10 +1226,9 @@ TEST(KspQpSolveEndToEnd, TerminatesWithTimeLimitStatusWhenInjectedClockExceedsTi
   EXPECT_EQ(sol.opt, TerminationStatus::TimeLimit);
   EXPECT_EQ(sol.pmm_iter, 1);
 
-  // Regression check: this break used to clear the Ruiz factors and c_orig before the loop exit,
-  // which left the post-loop printable_sol()/objective_value() reading emptied buffers and
-  // reporting a size-0 solution with obj_val == obj_const. Same check as the Interrupted and
-  // MaxSsnIterations tests: a timed-out solve still reports its last accepted iterate.
+  // A timed-out solve still reports its last accepted iterate (as in the Interrupted and
+  // MaxSsnIterations tests): the Ruiz factors and c_orig must survive this break for the
+  // post-loop printable_sol()/objective_value().
   EXPECT_EQ(sol.x.size(), 1);
   EXPECT_EQ(sol.z.size(), 1);
   EXPECT_TRUE(std::isfinite(sol.obj_val));
@@ -1353,18 +1271,16 @@ TEST(KspQpSolveEndToEnd, TerminatesWithMaxSsnIterationsWhenSsnIterationBudgetIsE
   auto sol = ns.solve();
   EXPECT_EQ(sol.opt, TerminationStatus::MaxSsnIterations);
 
-  // Regression check: this break fires before the in-loop printable_sol()/objective_value() call,
-  // so x/y1/y2/z (and obj_val) must be populated from the last accepted iterate after the loop
-  // instead of being left at their default-constructed (size-0 / indeterminate) state.
+  // This break fires before the in-loop printable_sol()/objective_value(), so x/y1/y2/z and
+  // obj_val must be filled from the last accepted iterate after the loop.
   EXPECT_EQ(sol.x.size(), 1);
   EXPECT_EQ(sol.z.size(), 1);
   EXPECT_TRUE(std::isfinite(sol.obj_val));
 }
 
 TEST(KspQpSolveEndToEnd, PopulatesSolutionWhenMaxIterIsZero) {
-  // max_iter=0 skips the PMM loop body entirely, so the in-loop printable_sol()/objective_value()
-  // call never runs at all; the returned solution should still be well-formed (the zero-initialized
-  // iterate), not size-0 vectors with an indeterminate objective.
+  // max_iter=0 skips the PMM loop, so the returned solution must be the zero-initialized iterate,
+  // not size-0 vectors.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(1, 1) << 2.0).finished());
   Vec c(1);
   c << -4.0;
@@ -1399,9 +1315,8 @@ TEST(KspQpSolveEndToEnd, TerminatesWithMaxPmmIterationsWhenIterationBudgetIsExha
 }
 
 TEST(KspQpSolveEndToEnd, TerminatesWithInterruptedStatusAndReportsSolutionWhenInterruptedFlagIsSet) {
-  // An unconditionally-true interrupted_ fires on the very first NS.solve_ssn() call (checked as
-  // the first statement of the SSN inner loop too), so this reaches TerminationStatus::Interrupted
-  // regardless of the problem.
+  // An always-true interrupted_ fires in the first NS.solve_ssn() call, so this reaches
+  // TerminationStatus::Interrupted regardless of the problem.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(1, 1) << 2.0).finished());
   Vec c(1);
   c << -4.0;
@@ -1414,10 +1329,8 @@ TEST(KspQpSolveEndToEnd, TerminatesWithInterruptedStatusAndReportsSolutionWhenIn
   auto sol = ns.solve();
   EXPECT_EQ(sol.opt, TerminationStatus::Interrupted);
 
-  // Regression check: this break used to clear the Ruiz factors and c_orig before the loop exit,
-  // which left the post-loop printable_sol()/objective_value() reading emptied buffers and
-  // reporting a size-0 solution with obj_val == obj_const. An interrupted solve still reports its
-  // last accepted iterate.
+  // An interrupted solve still reports its last accepted iterate: the Ruiz factors and c_orig must
+  // survive this break for the post-loop printable_sol()/objective_value().
   EXPECT_EQ(sol.x.size(), 1);
   EXPECT_EQ(sol.z.size(), 1);
   EXPECT_TRUE(std::isfinite(sol.obj_val));
@@ -1435,10 +1348,8 @@ TEST(ReportHook, CapturesOnePmmIterationRecordPerIterationWithMatchingFinalObjec
   KSP_QP<double> ns(problem);
   ASSERT_FALSE(ns.setup_failed);
 
-  // solve()'s per-iteration IterationRecord::obj_val is only freshly computed when print() would
-  // actually consume it (when != PrintWhen::NEVER && what != PrintWhat::NONE); MakeProblem() sets
-  // NEVER/NONE, so opt in here since this test's own report_ hook needs a fresh obj_val every
-  // iteration too. The final Solution's obj_val is unaffected by this and always correct.
+  // IterationRecord::obj_val is computed only when printing is on, and MakeProblem() turns it off;
+  // this test's report_ hook needs it, so turn printing on. The final Solution's obj_val is always computed.
   ns.when = PrintWhen::ALWAYS;
   ns.what = PrintWhat::FULL;
 
@@ -1464,9 +1375,8 @@ TEST(ReportHook, CapturesOnePmmIterationRecordPerIterationWithMatchingFinalObjec
 
 namespace {
 
-// accept_ssn_iterate(NS) only reads NS.x/NS.y2 (the rest of NS is irrelevant to it), so a
-// minimal, otherwise-unused SSN<double> "data holder" is enough -- no need to mirror the real
-// pmm's A/B. Backing storage must still outlive the SSN<double> (reference-member constructor).
+// accept_ssn_iterate(NS) only reads NS.x/NS.y2, so a minimal SSN<double> is enough. Its backing
+// storage must outlive it (SSN holds references).
 struct MinimalSsnHolder {
   Vec Q_diag;
   SpMat L{0, 0};
@@ -1756,16 +1666,10 @@ TEST(UpdateMultipliersIfAccurate, DeltaZReflectsClippingWhenBoxMultiplierPlusXIs
 }
 
 // ===================== solve()'s primal_infeas certificate ordering =====================
-// Regression test for a bug where solve() called primal_infeas() using delta_y1/delta_z left
-// over from the *previous* PMM iteration's multiplier update, paired with y2 - y2_old_scratch_
-// from the *current* iteration's freshly-accepted SSN iterate -- an internally inconsistent
-// certificate direction, since the three components did not all come from the same PMM step.
-// The fix reorders solve() to call update_multipliers_if_accurate() before primal_infeas(), so
-// delta_y1/delta_z are refreshed for this step before being checked alongside this step's y2
-// change. This test replays that exact sequence of solve()'s decomposed helpers --
-// accept_ssn_iterate(), update_multipliers_if_accurate(), primal_infeas() -- on a hand-built
-// infeasible certificate, and shows the fixed order detects infeasibility while checking with the
-// pre-fix (stale) delta_y1/delta_z would have missed it.
+// solve() must call update_multipliers_if_accurate() before primal_infeas(), so delta_y1/delta_z
+// come from the same PMM step as y2 - y2_old_scratch_. This replays accept_ssn_iterate(),
+// update_multipliers_if_accurate(), primal_infeas() on a hand-built infeasible certificate: that
+// order detects infeasibility, while stale delta_y1/delta_z would miss it.
 
 TEST(SolvePrimalInfeasCertificateOrdering, FreshDeltaY1AfterMultiplierUpdateDetectsInfeasibility) {
   SpMat A = DenseToSparse((Eigen::MatrixXd(1, 1) << 1.0).finished());
@@ -1814,11 +1718,9 @@ TEST(SolvePrimalInfeasCertificateOrdering, FreshDeltaY1AfterMultiplierUpdateDete
   // Fixed order: primal_infeas() sees this iteration's own (freshly-updated) delta_y1/delta_z.
   EXPECT_TRUE(pmm.primal_infeas(delta_y1, cert_y2_vec, delta_z));
 
-  // Pre-fix order: primal_infeas() would have seen delta_y1/delta_z as they were *before*
-  // update_multipliers_if_accurate() ran this iteration (here: still zero, as initialized at the
-  // top of solve()), paired with the same cert_y2_vec -- the certificate no longer cancels in
-  // condition 1 (and condition 2 also fails, since -b*cert_y1 collapses to 0), so infeasibility
-  // is missed.
+  // Wrong order: delta_y1/delta_z from before update_multipliers_if_accurate() (still zero here)
+  // with the same cert_y2_vec. Condition 1 no longer cancels (and condition 2 fails, since
+  // -b*cert_y1 is 0), so infeasibility is missed.
   Vec stale_delta_y1 = Vec::Zero(1), stale_delta_z = Vec::Zero(1);
   EXPECT_FALSE(pmm.primal_infeas(stale_delta_y1, cert_y2_vec, stale_delta_z));
 }

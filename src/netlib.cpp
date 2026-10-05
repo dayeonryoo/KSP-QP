@@ -26,9 +26,8 @@ using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 using SpMat = Eigen::SparseMatrix<T>;
 using Triplet = Eigen::Triplet<T>;
 
-// Netlib .mps filenames are lowercase; problem names are reported as the
-// uppercased stem (afiro.mps -> AFIRO), matching the result CSVs and the
-// Python benchmark in python/benchmark_netlib.py.
+// Netlib .mps filenames are lowercase; problem names are reported uppercase
+// (afiro.mps -> AFIRO), as in python/benchmark_netlib.py.
 static std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -41,8 +40,7 @@ static std::string to_upper(std::string s) {
     return s;
 }
 
-// Problem set = the .mps files in data_dir, sorted, so adding or removing a file
-// is all it takes to change the sweep (same convention as benchmark_netlib.py).
+// Problem set = the .mps files in data_dir, sorted.
 static std::vector<std::string> list_problems(const std::string& data_dir) {
     std::vector<std::string> stems;
     if (!std::filesystem::is_directory(data_dir)) {
@@ -58,11 +56,9 @@ static std::vector<std::string> list_problems(const std::string& data_dir) {
     return stems;
 }
 
-// Reference optimal objectives ship with the dataset in
-// data/netlib-main/feasible_gurobi_1e-8.csv (Gurobi 10 at 1e-8), as
-// "name,status,solveTime,pobj". They disagree with the long-standing published
-// Netlib optima on a handful of problems (E226 and CRE-A among them), so treat
-// either source with care. Returns an empty map if the file is absent.
+// Reference objectives from a "name,status,solveTime,pobj" CSV (default: Gurobi 10 at 1e-8).
+// They differ from the published Netlib optima on a few problems (e.g. E226, CRE-A).
+// Returns an empty map if the file is absent.
 static std::map<std::string, double> load_reference_objectives(const std::string& csv_path) {
     std::map<std::string, double> refs;
     std::ifstream csv(csv_path);
@@ -95,11 +91,10 @@ static std::map<std::string, double> load_reference_objectives(const std::string
 //
 // Two problem sets, selected with --set:
 //   feasible   -- the 114 feasible instances, checked against reference objectives
-//   infeasible -- the 29 primal-infeasible instances, checked for *detected*
-//                 infeasibility instead (there is no objective to compare)
+//   infeasible -- the 29 primal-infeasible instances, checked for detected infeasibility
 //
-// Both write the same CSV schema (see include/record_result.hpp); on the
-// infeasible set the `agree` column means "infeasibility was detected".
+// Both write the same CSV schema (record_result.hpp); on the infeasible set
+// `agree` means "infeasibility was detected".
 
 int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
@@ -223,9 +218,7 @@ int main(int argc, char** argv) {
                         agree = (abs_err < err_tol) || (rel_err < err_tol);
                     }
                 }
-                // A large residual is the *expected* outcome on the infeasible
-                // set (the iterates run off to the infeasibility certificate),
-                // so `diverged` only carries meaning for the feasible set.
+                // On the infeasible set a large residual is expected, so `diverged` is feasible-set only.
                 bool diverged = !infeasible_set && sol.pmm_tol_achieved > 1e0;
 
                 // Record result
@@ -290,8 +283,7 @@ int main(int argc, char** argv) {
                   << solver.direct_smw_reject << " of them rejected and refactorized\n";
     }
 
-    // On the infeasible set there is no solution to report, but the iterate's
-    // residuals show *how* the problem fails to admit one.
+    // On the infeasible set, the iterate's residuals show how the problem is infeasible.
     if (infeasible_set) {
         print_feasibility(pd, sol.x, tol);
     }

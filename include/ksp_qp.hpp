@@ -86,7 +86,7 @@ public:
     Vec D1A_diag, D1B_diag, D2_diag;
     Vec D1A_ext, D2_ext; // extended to size N, M
     Vec D1A_ext_inv, D2_ext_inv, D1B_diag_inv; // precomputed reciprocals
-    Vec c_orig, b_orig, lx_orig, ux_orig, lw_orig, uw_orig; // unscaled problem data for terminataion/infeasibility check
+    Vec c_orig, b_orig, lx_orig, ux_orig, lw_orig, uw_orig; // unscaled problem data for termination/infeasibility check
     Vec x_sol, y1_sol, y2_sol, z_sol;
 
     // Pre-allocated scratch vectors for the PMM main loop
@@ -112,8 +112,8 @@ public:
     static constexpr int kMaxRuizIter = 10;
     static constexpr T   kRuizTol     = T(1e-3);
 
-    // set_L_from_LLT regularization constants (see ksp_qp.tpp): on a negative LDLT pivot beyond
-    // noise level, the diagonal regularization is escalated by 10x, up to this many attempts.
+    // set_L_from_LLT regularization constants: on a negative LDLT pivot beyond noise level,
+    // the diagonal regularization is escalated by 10x, up to this many attempts.
     static constexpr int kLdltMaxAttempts = 4;
     static constexpr T   kLdltVerifyTol   = T(1e-5);
 

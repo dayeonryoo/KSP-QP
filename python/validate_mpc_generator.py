@@ -9,15 +9,12 @@ Checks, in order:
      x_0 block bounds always +-inf.
   2. Objective cross-check: KSP-QP vs a raw OSQP solve, on the (feasible,
      near-bound) default xbar0 at several M.
-  3. LQR exact ground-truth check: with the terminal weight P set to the exact
-     DARE solution, the finite-horizon solution equals the infinite-horizon LQR
-     solution EXACTLY for any N>=1 whenever no inequality constraint is active
-     (P is then a fixed point of the backward Riccati recursion) -- not just
-     asymptotically as N->inf. Checked two ways:
-       - obj_val == xbar'*P*xbar + obj_const (checkable for ALL solvers,
-         including KSP-QP, since it only needs obj_val)
-       - u_0* == -K @ xbar (checkable directly against KSP-QP's OWN solution
-         vector, since solve_from_data returns x)
+  3. LQR ground-truth check: with P the exact DARE solution (a fixed point of
+     the backward Riccati recursion), the finite-horizon solution equals the
+     infinite-horizon LQR solution for any N>=1 when no inequality is active.
+     Checked two ways:
+       - obj_val == xbar'*P*xbar + obj_const (any solver)
+       - u_0* == -K @ xbar (on KSP-QP's solution x)
   4. Feasibility check across benchmark_mpc.py's default (M, N) sweep GRID,
      imported from that module (sweep_configs) so the two cannot drift apart.
      Runs the whole grid by default; --max-M caps it for a quicker run.
@@ -42,10 +39,9 @@ FAILURES = []
 SMOKE_M = [1, 3, 5, 20, 50]
 CROSS_CHECK_M = [1, 5, 20]
 
-# Every constraint row touches at most this many variables, INDEPENDENTLY of
-# both M and N. This is the "genuinely sparse/banded" property benchmark_mpc.py
-# rests on; the generic 2*n_x+n_u bound (= 5M here) is vacuous at the large-M
-# end of the sweep, so it is not worth asserting.
+# Every constraint row touches at most this many variables, independently of M
+# and N: the sparsity benchmark_mpc.py relies on (the generic 2*n_x+n_u = 5M
+# bound would be vacuous at large M).
 #
 # Derivation: Ac's only nonzero rows are the d rows, and those hit only v
 # columns, while the v rows are identically zero -- so Ac @ Ac == 0 and the ZOH
@@ -127,11 +123,9 @@ def smoke_tests() -> None:
 
         _chain_structure_checks(M, sysm)
 
-    # M=1 degenerates to a lone vehicle tracking a constant-speed leader:
-    # d_1' = v_0 - v_1 = -v_1 (v_0 == 0 identically in deviation coordinates),
-    # v_1' = u_1. Note the sign: this is a double integrator with d' = -v, NOT
-    # the textbook d' = +v -- the state is a spacing ERROR, so closing a gap
-    # means a positive velocity deviation drives d downward.
+    # M=1 is a lone vehicle behind a constant-speed leader: d_1' = v_0 - v_1 = -v_1
+    # (v_0 == 0 in deviation coordinates), v_1' = u_1. Note d' = -v, not +v: d is
+    # a spacing error, so a positive velocity deviation drives it down.
     plat1 = mg.platoon_system(1)
     _check("platoon M=1 reduces to a double integrator in deviation coords (d'=-v, v'=u)",
            plat1.n_x == 2 and plat1.n_u == 1

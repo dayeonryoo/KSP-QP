@@ -3,7 +3,6 @@
 #include <string>
 
 // Minimal `--flag value` command-line parsing shared by the src/*.cpp drivers.
-// Not a general-purpose parser: no short flags, no `--flag=value`, no validation.
 namespace cli {
 
 inline bool has_flag(int argc, char** argv, const std::string& flag) {

@@ -2,10 +2,9 @@
 Build linear Model Predictive Control (MPC) QPs in KSPQPdata dict form (same
 format as ksp_qp_bind.parse_sif()), for benchmark_mpc.py.
 
-MPC is a native smooth QP: pure quadratic tracking cost, linear dynamics
-equality constraints, simple box bounds on states/inputs. The constraint 
-matrix is genuinely sparse -- each dynamics row only couples one timestep's
-variables to the next (block-bidiagonal/banded).
+MPC is a smooth QP: quadratic tracking cost, linear dynamics equalities, box
+bounds on states/inputs. The constraint matrix is block-bidiagonal: each
+dynamics row couples one timestep to the next.
 
 Model
 -----
@@ -22,10 +21,8 @@ the current state xbar, MPC solves:
           u_min <= u_k <= u_max,     k=0..N-1
 
 P is the exact discrete-algebraic-Riccati-equation (DARE) solution for
-(A,B,Q,R) -- this isn't just a common tuning choice, it's what makes the
-LQR ground-truth check in validate_mpc_generator.py exact for any N>=1
-(not just asymptotically), since it makes P a fixed point of the backward
-Riccati recursion.
+(A,B,Q,R), a fixed point of the backward Riccati recursion, so the LQR
+ground-truth check in validate_mpc_generator.py is exact for any N>=1.
 
 Variable stacking:
     z = [x_0; u_0; x_1; u_1; ...; x_{N-1}; u_{N-1}; x_N],
@@ -38,9 +35,8 @@ Mapping to KSP-QP's min c'x + 0.5x'Qx s.t. Ax=b, lw<=Bx<=uw, lx<=x<=ux:
   - A, b: block-bidiagonal equality matrix (x_0=xbar row-block, then N
     dynamics row-blocks each touching only x_k, u_k, x_{k+1}) -- assembled
     via sparse triplets, never densified.
-  - lx, ux: direct box bounds (no B/lw/uw needed at all in the base
-    version -- l=0). The x_0 block is always +-inf (never a finite box
-    bound), since it's already pinned by the equality row.
+  - lx, ux: box bounds (l = 0, no B/lw/uw). The x_0 block is +-inf, since
+    the equality row pins it.
 """
 
 from __future__ import annotations
@@ -164,14 +160,11 @@ def platoon_system(M: int) -> MpcSystem:
     x_min = np.tile([-2., -5.], M)
     u_min = np.full(M, -2.)
     xbar0 = np.zeros(n_x)
-    # Vehicle 1 perturbed (rest at steady state). Note d_1' = -v_1 (v_0=0
-    # identically), so d_1 and v_1 can't both start near their bounds with
-    # the same sign -- a large positive v_1 drives d_1 further negative
-    # faster than the actuator (bounded by u_min/u_max) can correct, which
-    # is infeasible for any horizon/discretization (verified: (-1.8, 4.5)
-    # is infeasible at every N in the sweep; (-1.0, 2.0) is feasible across
-    # benchmark_mpc.py's entire default matrix -- N in {10,20,50} at M=5 and
-    # M in {3,5,10,20,50,100,200,300} at N=20.
+    # Vehicle 1 perturbed (the rest at steady state). Since d_1' = -v_1 (v_0 = 0),
+    # a large positive v_1 drives d_1 negative faster than the bounded actuator
+    # can correct, so d_1 and v_1 can't both start near their bounds: (-1.8, 4.5)
+    # is infeasible at every N, while (-1.0, 2.0) is feasible across
+    # benchmark_mpc.py's default sweep.
     xbar0[0], xbar0[1] = -1.0, 2.0
 
     return MpcSystem(
@@ -224,12 +217,10 @@ def _build_dynamics(Ad: np.ndarray, Bd: np.ndarray, xbar: np.ndarray,
 def _build_cost(Q: np.ndarray, R: np.ndarray, P: np.ndarray, N: int,
                 n_x: int, n_u: int, n_z: int, col_x, col_u,
                 x_ref: np.ndarray, u_ref: np.ndarray):
-    # Convert each stage block to sparse BEFORE block_diag. sp.block_diag keeps the
-    # explicit zeros of a dense input, so stacking dense blocks stores every stage
-    # block structurally dense: O(N*(n_x^2 + n_u^2)) entries instead of the true
-    # O(N*(n_x + n_u)). At M=300, N=20 that is 9.36M stored vs 378k real nonzeros
-    # (25x), and the bloat propagates into KSP-QP's chol(Q) and hence into the
-    # lifted constraint matrix, which is where it actually hurts.
+    # Convert each stage block to sparse before block_diag: sp.block_diag keeps a
+    # dense input's explicit zeros, storing O(N*(n_x^2 + n_u^2)) entries instead of
+    # O(N*(n_x + n_u)), and the bloat carries into KSP-QP's chol(Q) and the lifted
+    # constraint matrix.
     Q_blk, R_blk, P_blk = (_drop_zeros(2 * B) for B in (Q, R, P))
     blocks = []
     for _ in range(N):

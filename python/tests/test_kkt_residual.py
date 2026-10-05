@@ -93,12 +93,9 @@ class TestKktResidualFem(KktResidualTestCase):
 
 
 # ===================== Discretization.FD =====================
-# Mirrors the FEM cases above but with the FD discretization. FD's PDE
-# operator is mass-scaled in assemble_diff_by_discretization /
-# assemble_cd_by_discretization specifically so these solve to the same
-# KKT residual tolerance as the FEM path -- see
-# test_poisson_l2_control_fd_is_not_degenerate below for the regression
-# this guards against.
+# The FEM cases above with the FD discretization. FD's operator is mass-scaled
+# (assemble_*_by_discretization) so these reach the same KKT tolerance; see
+# test_poisson_l2_control_fd_is_not_degenerate below.
 
 class TestKktResidualFd(KktResidualTestCase):
     def test_poisson_l2_control_satisfies_kkt(self):
@@ -115,20 +112,14 @@ class TestKktResidualFd(KktResidualTestCase):
                                      disc=Discretization.FD))
 
     def test_poisson_l2_control_fd_is_not_degenerate(self):
-        # Regression test for the bug the FD mass-scaling addresses: with a raw
-        # (unscaled) FD stiffness matrix in the D_op*y = M*u constraint, FD's
-        # O(1/h^2) operator combined with the O(h^2) mass on the control made the
-        # state's response to control collapse as O(h^4), so the trivial x=0
-        # solution was (numerically) KKT-optimal for a control-constrained,
-        # weakly-regularized tracking problem -- i.e. the solver would "converge"
-        # in a single iteration to a degenerate, physically wrong answer. Assert
-        # the control actually engages (uses a meaningful fraction of its box)
-        # instead of collapsing to its lower bound everywhere.
+        # With a raw FD stiffness in D_op*y = M*u, the O(1/h^2) operator and the
+        # O(h^2) control mass make the state's response to control vanish as O(h^4),
+        # so x=0 is numerically KKT-optimal. Assert the control uses a meaningful
+        # fraction of its box instead of sitting at its lower bound.
         #
-        # beta = 1e-6 makes this instance badly conditioned: with the QP normalized
-        # by the mesh size, KSP-QP bottoms out at a relative residual of ~2e-7 here,
-        # just above SOLVER_TOL, so this test solves at 1e-6. Its point is that the
-        # control engages, not the last digit of accuracy.
+        # beta = 1e-6 is badly conditioned: with the mesh-size normalization, KSP-QP
+        # bottoms out at a relative residual of ~2e-7, just above SOLVER_TOL, so this
+        # test solves at 1e-6.
         u_upper = 300.0
         pb = make_poisson_l2_control(5, 1e-6, u_lower=0.0, u_upper=u_upper,
                                      disc=Discretization.FD)

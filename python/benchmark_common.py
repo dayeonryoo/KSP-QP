@@ -37,16 +37,11 @@ osqp  = _import_or_exit("osqp",  "Cannot find osqp. Install it with: pip install
 QPALM_SOLVED = qpalm.Info.SOLVED   # == 1
 OSQP_SOLVED  = 1                   # osqp.constant("OSQP_SOLVED")
 
-# Infeasibility certificate tolerance as a multiple of the requested primal-dual
-# tolerance. Mirrors KSP-QP's eps_pinf = eps_dinf = 1e-3 * tol (include/ksp_qp.hpp),
-# so all three solvers test their Farkas certificates at the same ratio.
-#
-# QPALM and OSQP instead ship fixed constants (eps_prim_inf = 1e-5 and 1e-4) that are
-# decoupled from eps_abs/eps_rel. At their own defaults that is coherent -- the
-# certificate test is 10x tighter than the optimality test -- but a benchmark that
-# overrides eps_abs/eps_rel to a smaller tol and leaves the certificate alone inverts
-# the relationship, leaving their infeasibility tests looser than the accuracy asked
-# for. Passing eps_inf to run_qpalm/run_osqp restores the intended ratio.
+# Infeasibility certificate tolerance as a multiple of tol, mirroring KSP-QP's
+# eps_pinf = eps_dinf = 1e-3 * tol (include/ksp_qp.hpp), so all three solvers test
+# their Farkas certificates at the same ratio. QPALM/OSQP default to fixed constants
+# (eps_prim_inf = 1e-5 / 1e-4), which are looser than the accuracy asked for once
+# eps_abs/eps_rel are tightened; run_qpalm/run_osqp take eps_inf to keep the ratio.
 INF_TOL_FACTOR = 1e-3
 
 

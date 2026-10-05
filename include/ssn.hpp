@@ -13,9 +13,8 @@
 #include "schur_preconditioner.hpp"
 #include "schur_smw_update.hpp"
 
-// TIMER: master switch for per-step SSN-loop timer.
-// Set to 1 (here, or via -DSSN_ENABLE_TIMERS=1) to print a step-by-step timer of solve_ssn();
-// 0 compiles the timers out entirely (no overhead).
+// TIMER: master switch; 0 (off) by default. Set via -DSSN_ENABLE_TIMERS=1 to print per-step
+// timings of solve_ssn(); 0 compiles the timers out.
 #ifndef SSN_ENABLE_TIMERS
 #define SSN_ENABLE_TIMERS 0
 #endif
@@ -54,10 +53,8 @@ struct SsnLineSearchParams {
     const Vec& c;
     const Vec& A_tr_y1;
     const Vec& Q_diag;
-    const Vec& grad_Atr_resp; // A_tr * (Ax_ssn_ - b), cached once per SSN iteration in
-                               // make_line_search_params() -- invariant across the initial
-                               // exact_line_search() call and its steepest-descent retry, both
-                               // of which run against the same (unmoved) Ax_ssn_.
+    const Vec& grad_Atr_resp; // A_tr * (Ax_ssn_ - b), cached once per SSN iteration; shared by
+                               // exact_line_search() and its steepest-descent retry.
     const Vec& b;
 };
 
@@ -180,8 +177,8 @@ public:
     double timer_state_update   = 0.0; // x, y2 update + termination check
 #endif
 
-    // Kylov (conjugate gradient) parameters
-    T krylov_tol = 1e-12; // Eigen's convention error is ||rhs - S*dy||_2 / ||rhs||_2.
+    // Krylov (conjugate gradient) parameters
+    T krylov_tol = 1e-12; // Eigen's error convention: ||rhs - S*dy||_2 / ||rhs||_2.
     int krylov_max_in_iter = 100;
 
     // Iterative refinement parameters
@@ -190,7 +187,7 @@ public:
     T refine_abs_tol = 1e-12;
 
     // Preconditioner factorization method
-    bool schur_use_ldlt = false;        // choose_schur_ldlt()'s return; default=false means use Cholesky to factorize a preconditioner.
+    bool schur_use_ldlt = false;        // choose_schur_ldlt()'s return; false (default) means Cholesky on P.
     int schur_ldlt_decisions_made_ = 0; // choose_schur_ldlt() call count; locked after the first 3.
     static constexpr double kSchurLdltRatioThreshold = 0.1; // schur_use_ldlt=true if the estimated work ratio is below this cutoff.
 
@@ -251,8 +248,7 @@ public:
     SpMat K_ldlt_;
     bool K_ldlt_built_ = false;
 
-    // Cached flat storage indices (into K_ldlt_.valuePtr()) for the diagonal entries.
-    // Lets the diagonal-only patch path in solve_using_ldlt() write via valuePtr()[idx].
+    // Diagonal entries' indices into K_ldlt_.valuePtr(), for solve_using_ldlt()'s diagonal-only patch path.
     std::vector<int> ldlt_diag_top_idx_; // size n, top-left -H block
     std::vector<int> ldlt_diag_bot_idx_; // size s, bottom-right (1/mu)I block
 

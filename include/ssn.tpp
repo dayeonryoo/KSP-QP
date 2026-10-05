@@ -184,9 +184,8 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
 #endif
     };
 
-    // Run preconditioned CG.
-    // Returns false and increments krylov_fail on preconditioner failure or solver non-convergence with error > 1e-10.
-    // If max_iter is reached but the error is <= 1e-10, the direction is accepted.
+    // Run PCG. Returns false (and counts a krylov_fail) on preconditioner failure or on
+    // non-convergence with error > 1e-10; an error <= 1e-10 at max_iter is accepted.
     auto attempt_solve = [&](Vec& dy_out) -> bool {
         if (cg.preconditioner().info() != Eigen::Success) {
             std::cout << "[PCG] CG failed due to preconditioner failure.\n";
@@ -228,9 +227,8 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         cg_dx_.resize(0);
     };
 
-    // Set up and attempt to solve by PCG.
-    // bad_alloc can come from build() (P_base_ = G E G^T) or from Eigen's CG iteration internals;
-    // in either case, fall back to the direct solver.
+    // Set up and attempt to solve by PCG. On bad_alloc (building the preconditioner or inside
+    // Eigen's CG), fall back to the direct solver.
     Vec dy_;
     bool ok = false;
     try {
@@ -406,8 +404,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
             K_ldlt_.makeCompressed();
             K_ldlt_built_ = true;
 
-            // Cache each diagonal's flat storage index so the patch path below can write 
-            // via valuePtr()[idx] (O(1)) instead of coeffRef(i,i) (O(log nnz), binary search).
+            // Cache each diagonal's valuePtr() index for the in-place patch path below.
             ldlt_diag_top_idx_.resize(n);
             for (int i = 0; i < n; ++i)
                 ldlt_diag_top_idx_[i] = static_cast<int>(&K_ldlt_.coeffRef(i, i) - K_ldlt_.valuePtr());
@@ -421,9 +418,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
                 ldlt_pattern_dirty_ = false;
             }
         } else {
-            // Pattern unchanged (active_W same): only diagonal values changed (H_diag, mu).
-            // Update top-left and bottom-right diagonal entries in-place via the cached flat indices above;
-            // G blocks stay.
+            // Pattern unchanged (active_W same): patch the -H and (1/mu)I diagonals in place.
             for (int i = 0; i < n; ++i)
                 K_ldlt_.valuePtr()[ldlt_diag_top_idx_[i]] = -H_diag(i);
             const T mu_inv = T(1) / mu;
@@ -578,8 +573,7 @@ void SSN<T>::release_chol() {
 
 template <typename T>
 SsnLineSearchParams<T> SSN<T>::make_line_search_params() {
-    // Cached once per SSN iteration as Ax_ssn_ doesn't move across a line-search attempt
-    // and its steepest-descent retry. 
+    // Ax_ssn_ is unchanged across the line search and its steepest-descent retry; compute once.
     grad_res_p_.noalias()    = Ax_ssn_ - b;
     grad_Atr_resp_.noalias() = A_tr * grad_res_p_;
 
@@ -706,11 +700,9 @@ T exact_line_search(const SsnLineSearchParams<T>& p,
         }
     }
 
-    // If there is no breakpoint and the direction (dx, dy2) is nearly zero, return a full step (i.e. trivial case).
-    // Note: eta is the weighted squared norm of the direction.
+    // No breakpoints and a near-zero direction (eta is its weighted squared norm): take a full step.
     if (breakpoints.empty() && eta < eps_zero) return T(1);
-    // Otherwise (no breakpoints but a non-negligible direction, e.g. no finite box bounds at all), 
-    // fall through to the psi'(0) check and solve psi(t) = eta/2 t^2 + zeta t + const exactly.
+    // No breakpoints but a non-negligible direction: the code below solves the quadratic psi exactly.
 
     // Sort breakpoints by t in ascending order.
     std::sort(breakpoints.begin(), breakpoints.end(), [](const Breakpoint& a, const Breakpoint& b){ return a.t < b.t; });
@@ -765,8 +757,7 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     // Clarke subgradient and distance for K and W
     compute_subgrad_and_dist(u_, lx, ux, false, new_active_K_, dist_K_u_);
     compute_subgrad_and_dist(v_, lw, uw, true,  new_active_W_, dist_W_v_);
-    // W is active when v lies OUTSIDE [lw,uw]; the subgrad just written is true when INSIDE
-    // (include_bd=true), so invert it to land new_active_W_ in the same polarity as active_W.
+    // W is active when v lies outside [lw, uw], so invert the inside-[lw, uw] subgradient.
     new_active_W_ = (new_active_W_ == false);
     }
 
@@ -783,9 +774,8 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     // Recompute H if active_K changed or mu/rho drifted since H_diag was last built.
     bool recompute_H = delta.k_changed || (mu != H_diag_mu_) || (rho != H_diag_rho_);
 
-    // These are for the direct solver (LDLT on K, Cholesky on S): their sparsity follows G (active_W),
-    // and their values change exactly when H_diag is recomputed or G is rebuilt. direct_stale_ makes the
-    // next solve_direct() set up for the new matrix (an SMW update or a refactorization).
+    // Direct-solver flags: K's and S's sparsity follows G (active_W); their values change when
+    // H_diag is recomputed or G is rebuilt.
     if (delta.w_changed) ldlt_pattern_dirty_ = chol_pattern_dirty_ = true;
     if (recompute_H || delta.w_changed) {
         ldlt_numeric_dirty_ = chol_numeric_dirty_ = true;
@@ -1027,7 +1017,7 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
         If the SSN iteration stagnates for 10 consecutive iterations, terminate early.
     End
     ---------------------------------------------- */
-    // Intialize iteration counter and set starting points.
+    // Initialize iteration counter and set starting points.
     x_cur_ = x;
     y2_cur_ = y2;
     int _iter = 0;
