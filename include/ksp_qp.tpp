@@ -220,8 +220,7 @@ void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_dia
             }
         }
 
-        // Scale I: I <- D1 I D2;
-        // this is represented through the variable substitution and scaling of lx, ux below.
+        // Scale I: I <- D1 I D2, represented through the variable substitution and scaling of lx, ux below.
 
         // Scale Q if Q is nonzero: Q <- D2 Q D2.
         if (Q_info == 2) {
@@ -313,10 +312,8 @@ void KSP_QP<T>::set_L_from_LLT(const SpMat& Q) {
     T delta = T(0); // Regularization factor; only increased to nonzero if 0 fails the pivot check below.
     Vec Q_diag = Q_sym.diagonal();
 
-    // A genuinely PSD Q with Q_ii == 0 must have row/column i identically zero by Cauchy-Schwarz,
-    // i.e. these directions carry no real curvature. Detect them up front so L can be scrubbed
-    // back to exactly zero there after factorization, regardless of what delta ends up being
-    // needed elsewhere in Q.
+    // A PSD Q with Q_ii == 0 has row/column i identically zero (Cauchy-Schwarz). Detect these null
+    // rows up front so their entries can be dropped from L, whatever delta ends up being.
     std::vector<bool> is_null_row(n, false);
     for (int k = 0; k < n; ++k) {
         T col_abs_max = T(0);
@@ -335,8 +332,8 @@ void KSP_QP<T>::set_L_from_LLT(const SpMat& Q) {
     for (int k = 0; k < n; ++k)
         diag_idx[k] = static_cast<int>(&Q_reg.coeffRef(k, k) - Q_reg.valuePtr());
 
-    // analyzePattern()+factorize() retry loop: on a meaningfully negative pivot, escalate the
-    // diagonal regularization and refactorize. The ordering is AMD, run in 64-bit indices (amd_ordering.hpp).
+    // analyzePattern()+factorize() retry loop (see kLdltMaxAttempts in ksp_qp.hpp).
+    // The ordering is AMD, run in 64-bit indices (amd_ordering.hpp).
     SimplicialLDLT64<SpMat> ldlt;
     ldlt.analyzePattern(Q_reg); // sparsity pattern is fixed across retries below; analyze once
 
@@ -368,13 +365,11 @@ void KSP_QP<T>::set_L_from_LLT(const SpMat& Q) {
     Vec D_sqrt = D.cwiseMax(T(0)).cwiseSqrt();
     L = (ldlt.permutationP().transpose() * SpMat(ldlt.matrixL())) * D_sqrt.asDiagonal();
 
-    // Scrub any regularization that leaked into null-space rows of L.
-    for (int outer = 0; outer < L.outerSize(); ++outer) {
-        for (typename SpMat::InnerIterator it(L, outer); it; ++it)
-            if (is_null_row[it.row()]) it.valueRef() = T(0);
-    } // TODO: this leaves explicit zeros in L which could be removed by compressing L, but that would break the cached diag_idx above.
+    // Drop the null rows' entries (regularization leaks into them) and any exact zeros, so no
+    // explicit zeros reach the lifted A and G.
+    L.prune([&](auto row, auto, const T& value) { return value != T(0) && !is_null_row[row]; });
 
-    // When pivots were clamped, verify L*L^T actually approximates Q before accepting it.
+    // When pivots were clamped, verify L*L^T approximates Q before accepting it.
     if (!clamped) {
         if (delta > kLdltVerifyTol * Q_scale) {
             throw std::runtime_error(
@@ -739,11 +734,8 @@ bool KSP_QP<T>::primal_infeas(const Vec& cert_y1, const Vec& cert_y2, const Vec&
                            inf_norm(cert_z.cwiseQuotient(D2_ext))}); // Unscaled certificate norms
     if (cert_inf < T(100) * std::numeric_limits<T>::epsilon()) return false;
 
-    // Conditions 2 and 3. cert_tol is a noise floor for "is this component zero", not a residual
-    // tolerance -- eps_pinf keeps its full strictness in conditions 1 and 2. A component on an
-    // unbounded coordinate never reaches exactly zero in floating point, so some floor is needed:
-    // above it the certificate is abandoned, below it the term is skipped.
-    const T cert_tol = T(1e5) * eps_pinf * cert_inf; // 1e2 * tol * cert_inf
+    // Conditions 2 and 3. 
+    const T cert_tol = T(1e5) * eps_pinf * cert_inf; // 1e2 * tol * cert_inf; noise floor for "is this component zero"
     T lhs2 = T(0); // scale-invariant
     if (M > 0) lhs2 -= b.dot(cert_y1);
     for (int i = 0; i < l; ++i) {
@@ -792,8 +784,7 @@ bool KSP_QP<T>::dual_infeas(const Vec& delta_x, const Vec& Adx, const Vec& Bdx) 
     For general Q, delta_x = [delta_x_hat; delta_v] is the lifted change, but the certificate is
     checked on the original problem: delta_v and the L^T delta_x_hat - delta_v rows of Adx are
     ignored, ||delta_x||_inf is taken over the original n variables, and condition 1 uses the stored
-    original Q, as D2^{-1} Q_hat delta_x_hat = Q (D2 delta_x_hat). Being the only condition that
-    needs a sparse product, it is checked last.
+    original Q, as D2^{-1} Q_hat delta_x_hat = Q (D2 delta_x_hat).
 
     Infeasibility is determined in unscaled scope.
     */
@@ -827,8 +818,7 @@ bool KSP_QP<T>::dual_infeas(const Vec& delta_x, const Vec& Adx, const Vec& Bdx) 
         else if (has_uw)      { if (Bdx_i_unscaled >  rhs)          return false; }
     }
 
-    // Condition 1 (general Q), checked last so its sparse product only runs once 2-5 pass:
-    // D2^{-1} Q_hat delta_x_hat = Q (D2 delta_x_hat), with Q the stored original (lower triangle).
+    // Condition 1 (general Q), checked last since it alone needs a sparse product.
     if (Q_info == 2) {
         const Vec Qdx = Q.template selfadjointView<Eigen::Lower>() * dx_unscaled;
         if (inf_norm(Qdx) > rhs) return false;
@@ -871,8 +861,8 @@ Solution<T> KSP_QP<T>::solve() {
         return setup_time + time_diff_s(solving_start, now_()) > time_limit;
     };
 
-    // If setup failed, exit immediately with the status already determined during setup:
-    // NumericalError for a genuine setup error or PrimalInfeasible if check_bounds() found an empty box interval.
+    // If setup failed, return the status set during setup: NumericalError for a setup error,
+    // or PrimalInfeasible if check_bounds() found an empty box interval.
     if (setup_failed) {
         auto solving_end = now_();
         double solve_time = time_diff_s(solving_start, solving_end); // in seconds
@@ -909,8 +899,8 @@ Solution<T> KSP_QP<T>::solve() {
     NS.interrupted_ = interrupted_;
     NS.time_limit_exceeded_ = time_limit_exceeded;
     // Route SSN's per-inner-iteration reports through KSP_QP's own (overridable) report_
-    // hook too, so a caller that overrides report_ (e.g. for active-set flip diagnostics)
-    // sees both the per-PMM-iteration and per-SSN-inner-iteration records through one path.
+    // hook too, so a caller that overrides report_ sees both the per-PMM-iteration and
+    // per-SSN-inner-iteration records through one path.
     // Neutral by default: report_'s default body just calls print() with this->when/what,
     // same values NS was constructed with.
     NS.report_ = report_;
@@ -944,7 +934,7 @@ Solution<T> KSP_QP<T>::solve() {
         ssn_tol_achieved = NS.tol_achieved;
         linesearch_fail += NS.linesearch_fail;
 
-        // If SSN reached max total iteratioins, terminate.
+        // If SSN reached max total iterations, terminate.
         if (ssn_iter >= ssn_max_iter) {
             result = TerminationStatus::MaxSsnIterations;
             break;
@@ -958,7 +948,7 @@ Solution<T> KSP_QP<T>::solve() {
         ResVec new_res_norms = compute_residual_unscaled_inf_norms(Ax_scratch_, Bx_scratch_, Qx_scratch_);
         pmm_tol_achieved = new_res_norms.maxCoeff();
 
-        // Intermediate obj_val/x_sol/y1_sol/y2_sol/z_sol computation for printing; skipped when printing is off.
+        // Intermediate obj_val for printing; skipped when printing is off.
         if (when != PrintWhen::NEVER && what != PrintWhat::NONE) {
             printable_sol(x, y1, y2, z); // (Modifies x_sol, y1_sol, y2_sol, z_sol.)
             obj_val = objective_value(x_sol);
@@ -996,8 +986,8 @@ Solution<T> KSP_QP<T>::solve() {
         Ax_old_scratch_.swap(Ax_scratch_);
         Bx_old_scratch_.swap(Bx_scratch_);
 
-        // NS.opt catches interruption/time-limit detected mid-inner-loop (checked every SSN iteration);
-        // the second conditions catches them occured between PMM iterations.
+        // NS.opt catches an interruption/time limit hit inside the SSN loop; the second condition
+        // catches one hit between PMM iterations.
         if (NS.opt == SSN<T>::TerminationStatus::Interrupted || interrupted_()) {
             result = TerminationStatus::Interrupted;
             break;
@@ -1021,7 +1011,7 @@ Solution<T> KSP_QP<T>::solve() {
     printable_sol(x, y1, y2, z);
     obj_val = objective_value(x_sol);
 
-    // Check if infeasiblity or a numerical error is detected.
+    // Check if infeasibility or a numerical error is detected.
     if (opt == TerminationStatus::PrimalInfeasible ||
         opt == TerminationStatus::DualInfeasible   ||
         opt == TerminationStatus::NumericalError)  {
