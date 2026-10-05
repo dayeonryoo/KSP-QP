@@ -85,19 +85,13 @@ from benchmark_common import (
 # ---------------------------------------------------------------------------
 # Problem set.
 #
-# data/netlib-main/feasible/ holds all 114 feasible instances of the Netlib LP
-# collection, with the large "kennington" family (CRE-*, KEN-*, OSA-*, PDS-*)
-# blended in rather than kept in a separate directory. The problem list is taken
-# from the directory listing, so adding or removing an .mps file is all it takes
-# to change the set.
+# The .mps files in data/netlib-main/feasible/: all 114 feasible Netlib LPs,
+# including the kennington family (CRE-*, KEN-*, OSA-*, PDS-*). Filenames are
+# lowercase; problem names are the uppercased stems (vtp.base.mps -> VTP.BASE).
 #
-# Filenames are lowercase; problem names are the uppercased stems, which is the
-# spelling used in the result CSVs (e.g. vtp.base.mps -> VTP.BASE).
-#
-# Reference optimal objectives are NOT kept here: the dataset ships them in
-# data/netlib-main/feasible_gurobi_1e-8.csv (Gurobi 10 at 1e-8). Note that those
-# disagree with the long-standing published Netlib optima on a handful of
-# problems -- E226 and CRE-A among them -- so treat either source with care.
+# Reference objectives come from data/netlib-main/feasible_gurobi_1e-8.csv
+# (Gurobi 10 at 1e-8); they differ from the published Netlib optima on a few
+# problems (e.g. E226, CRE-A).
 # ---------------------------------------------------------------------------
 FEASIBLE_SUBDIR = "netlib-main/feasible"
 

@@ -36,68 +36,41 @@ struct SchurPrecScopedTimer {
 // =================================================================================================
 // Flag-dependency chain (SSN + SchurPreconditioner)
 // -------------------------------------------------------------------------------------------------
-// "PCG with SMW update and direct-solver fallback" needs independent flag tracking at three layers, all
-// driven by the active sets, K and W, changes, computed once per SSN iteration in
-// SSN::prepare_newton_system() as SSN::ActiveSetDelta{k_changed, w_changed}:
+// Flags at three layers, all driven by the active-set changes SSN::ActiveSetDelta{k_changed,
+// w_changed}, computed once per SSN iteration in SSN::prepare_newton_system():
 //
 // Layer 1 -- SSN::prepare_newton_system()
-//   SSN::PrepResult{update_prec, prec_pattern_changed}: both are (k_changed || w_changed).
-//   Threaded down through SSN::solve_newton_direction() -> SSN::solve_using_cg() -> here (arm()).
+//   SSN::PrepResult{update_prec, prec_pattern_changed}: both are (k_changed || w_changed), passed
+//   through SSN::solve_newton_direction() -> SSN::solve_using_cg() -> arm().
 //
-// Layer 2 -- SSN's own direct solver (see ssn.hpp/.tpp), used permanently once PCG has failed
-//            (SSN::pcg_failed): LDLT on the full KKT matrix (K_ldlt_) or Cholesky on its exact
-//            Schur complement (S_chol_), as chosen by SSN::decide_direct_system():
-//   ldlt_pattern_dirty_ / chol_pattern_dirty_ : set on w_changed only -- active_W changes G's, hence
-//                         K_ldlt_'s and S_chol_'s, sparsity.
-//   ldlt_numeric_dirty_ / chol_numeric_dirty_ : set on w_changed or whenever prepare_newton_system()
-//                         recomputes H_diag (k_changed, or a mu/rho drift from SSN::H_diag_mu_/
-//                         H_diag_rho_) -- exactly when K's and S's values change, so an unchanged
-//                         matrix keeps its factorization across SSN and PMM iterations. Guard
-//                         K_ldlt_'s / S_chol_'s factorize().
-//   K_ldlt_built_       : whether the triplet-assembled K_ldlt_ exists yet, so a numeric-only
-//                         update can skip full triplet reassembly.
+// Layer 2 -- SSN's direct solver, used permanently once PCG has failed (SSN::pcg_failed): LDLT on
+//            the KKT matrix (K_ldlt_) or Cholesky on its Schur complement (S_chol_), chosen by
+//            SSN::decide_direct_system():
+//   ldlt_pattern_dirty_ / chol_pattern_dirty_ : set on w_changed (active_W changes G's sparsity).
+//   ldlt_numeric_dirty_ / chol_numeric_dirty_ : set on w_changed or whenever H_diag is recomputed
+//                         (k_changed, or mu/rho drift from SSN::H_diag_mu_/H_diag_rho_). Guard
+//                         factorize(), so an unchanged matrix keeps its factorization.
+//   K_ldlt_built_       : K_ldlt_ exists, so a numeric-only update skips triplet reassembly.
 //
-// Layer 3 -- SchurPreconditioner (this class), factorizing P = G E G^T + (1/mu)I via Cholesky or
-//            P_hat = [-H_act, G_act^T; G_act, (1/mu)I] via LDLT for the PCG preconditioner:
-//   rebuild_        : should compute() call build() at all -- caller's `rebuild` (== Layer 1's
-//                     update_prec) OR an internal row-count change.
-//   pattern_dirty_  : needs analyzePattern() -- caller's `prec_pattern_changed` (== Layer 1's
-//                     prec_pattern_changed) OR a size change OR the first-ever call.
-//   numeric_dirty_  : needs G E G^T (or the LDLT structural blocks) fully recomputed rather than
-//                     just diagonal-shifted -- same trigger as pattern_dirty_. This is a
-//                     *pattern-only* signal; it is deliberately NOT set on a mu/rho-only change.
-//   mu_/rho_, mu_at_last_fact_/rho_at_last_fact_ : on active_K entries H_diag(i) = Q_diag(i) +
-//                     1/rho -- mu's contribution vanishes there exactly, so mu and rho affect
-//                     disjoint parts of P/P_hat and get independent, asymmetric numeric-only
-//                     paths, both bypassing pattern_dirty_/numeric_dirty_ entirely:
-//                       mu-only change  : both chol and ldlt shift/overwrite the (1/mu) I block
-//                                         in place (compute()'s mu_changed forces build() even
-//                                         when rebuild_ is false; factorize_by_chol/ldlt's `else`
-//                                         branch does the O(s) patch).
-//                       rho-only change : chol has no cheap path (E = 1/H_diag is a nonlinear
-//                                         function of rho baked into the G*E*G^T product) and
-//                                         must fully rebuild G E G^T -- factorize_by_chol() ORs
-//                                         numeric_dirty_ with a local rho_changed check. ldlt's
-//                                         -H_act sits directly on P_hat's diagonal (no product),
-//                                         so factorize_by_ldlt()'s `else` branch instead patches
-//                                         it in place (O(n_act), using the cached ldlt_act_idx_
-//                                         from the last full rebuild) -- cheaper than chol despite
-//                                         solving a structurally equivalent problem.
-//   use_ldlt_ / use_ldlt_at_last_fact_ : Cholesky-vs-LDLT variant for the Schur matrix, set from
-//                     SSN::schur_use_ldlt via arm(); a mismatch between the two also forces
-//                     prec_pattern_changed=true (factorizing a structurally different matrix).
-//   skip_smw_ / use_smw_ / has_snapshot_ / smw_fail_streak_ : SMW low-rank-update control, mostly
-//                     orthogonal to the pattern/numeric split above -- see try_build_smw(). Its
-//                     capacitance-update math only recomputes H_diag-derived (rho-dependent) and
-//                     mu-dependent values for the classified delta (flipped active_K indices, or
-//                     added W rows); everywhere else -- every retained row/column -- it implicitly
-//                     reuses P_old, snapshotted at the last full rebuild. A rho drift silently
-//                     invalidates P_old's retained active_K entries (H_diag(i) = Q_diag(i) + 1/rho);
-//                     a mu drift silently invalidates P_old's retained (1/mu)I diagonal (a uniform,
-//                     hence full-rank, shift the low-rank correction can't represent at all). So
-//                     smw_gate_open() rejects unconditionally on rho_ != rho_old_ or mu_ != mu_old_
-//                     (SmwRejectReason::RhoChangedSinceSnapshot / MuChangedSinceSnapshot),
-//                     independent of the delta being classified, before any capacitance math runs.
+// Layer 3 -- SchurPreconditioner (this class): Cholesky on P = G E G^T + (1/mu)I or LDLT on
+//            P_hat = [-H_act, G_act^T; G_act, (1/mu)I]:
+//   rebuild_        : compute() calls build() -- caller's `rebuild` (Layer 1's update_prec) or a
+//                     row-count change.
+//   pattern_dirty_  : analyzePattern() needed -- caller's `prec_pattern_changed`, a size change,
+//                     or the first call.
+//   numeric_dirty_  : G E G^T (or P_hat's structural blocks) must be fully rebuilt; same trigger
+//                     as pattern_dirty_, not set on a mu/rho-only change.
+//   mu_/rho_ vs mu_at_last_fact_/rho_at_last_fact_ : on active_K entries H_diag(i) = Q_diag(i) +
+//                     1/rho, so mu and rho touch disjoint parts of P/P_hat. compute() calls build()
+//                     on either change, which patches without the dirty flags:
+//                       mu-only  : both variants overwrite the (1/mu)I block in place, O(s).
+//                       rho-only : chol must rebuild G E G^T (E = 1/H_diag is inside the product);
+//                                  ldlt patches -H_act on P_hat's diagonal in place, O(n_act).
+//   use_ldlt_ / use_ldlt_at_last_fact_ : Cholesky vs LDLT, from SSN::schur_use_ldlt via arm(); a
+//                     switch forces prec_pattern_changed.
+//   skip_smw_ / use_smw_ / has_snapshot_ / smw_fail_streak_ : SMW control (see try_build_smw()).
+//                     The update reuses P_old from the last full rebuild for every retained row and
+//                     column, so smw_gate_open() rejects any rho or mu change since the snapshot.
 // =================================================================================================
 
 template <typename T>
@@ -149,8 +122,7 @@ public:
         // Detect if P needs to be rebuild.
         rebuild_ = rebuild || size_changed;
 
-        // M_rows_ = number of equality-constraint (A) rows = G.rows() - n_active_W; constant.
-        // Fallback only: a no-op once set_num_equality_rows() has already pinned M_rows_ >= 0.
+        // Fallback if set_num_equality_rows() wasn't called: M_rows_ = G.rows() - n_active_W.
         if (M_rows_ < 0 && static_cast<int>(G.rows()) > 0)
             M_rows_ = static_cast<int>(G.rows()) - static_cast<int>(active_W.count());
     }
@@ -159,8 +131,8 @@ public:
     void arm(const SpMat& G, const SpMat& G_tr, const Vec& H_diag,
              const BoolArr& active_K, const BoolArr& active_W, const RowMajorSpMat& B_rm,
              T mu, T rho, bool rebuild, bool prec_pattern_changed, bool use_ldlt, bool force_rebuild = false) {
-        if (use_ldlt != use_ldlt_)       // Cholesky and LDLT factorize structurally different matrices (P vs P_hat),
-            prec_pattern_changed = true; // so a cached analyzePattern() from one is invalid for the other.
+        if (use_ldlt != use_ldlt_)       // P and P_hat differ structurally, so the cached
+            prec_pattern_changed = true; // analyzePattern() is invalid.
         set_data(G, G_tr, H_diag, active_K, active_W, B_rm, mu, rho, rebuild || force_rebuild, prec_pattern_changed);
         set_use_ldlt(use_ldlt);
         if (force_rebuild || smw_suppressed())
@@ -175,8 +147,8 @@ public:
         return delta;
     }
 
-    // On PCG failure: if the preconditioner used SMW, records the failure and reports to retry with arm(..., force_rebuild=true).
-    // Returns false (no retry) if the failure wasn't attributable to an SMW-updated preconditioner.
+    // On PCG failure: if the preconditioner used SMW, records the failure and returns true (retry with
+    // arm(..., force_rebuild=true)); otherwise returns false.
     bool should_retry_after_failure() {
         if (!use_smw_) return false;
         record_smw_rebuild();
@@ -215,11 +187,8 @@ public:
         MissingData,                  // active_W/B_rm not supplied, or no equality rows tracked yet.
         FactorizationMethodChanged,   // use_ldlt_ differs from the method used at the last full factorization.
         NoSnapshot,                   // No prior full-rebuild snapshot to update from.
-        RhoChangedSinceSnapshot,      // rho drifted since the snapshot; the low-rank update's implicit
-                                      // "H_diag unchanged outside the classified delta" assumption would
-                                      // be violated, so the capacitance math can't be trusted.
-        MuChangedSinceSnapshot,       // mu drifted since the snapshot. The (1/mu)I block spans every
-                                      // row of P/P_hat, so this is a full-rank shift.
+        RhoChangedSinceSnapshot,      // rho changed since the snapshot, so H_diag changed outside the delta.
+        MuChangedSinceSnapshot,       // mu changed since the snapshot: a full-rank shift of the (1/mu)I block.
         RankExceedsThreshold,         // Active-set delta rank exceeds the SMW update-size threshold.
         ReusedSnapshot,               // Rank 0: the active sets match the snapshot, whose factorization is reused as is.
         SingularCapacitance,          // Equilibrated capacitance matrix was (near-)singular or non-finite;
@@ -495,9 +464,7 @@ private:
                 sol.P_hat.setFromTriplets(ldlt_build_trips_.begin(), ldlt_build_trips_.end());
                 sol.P_hat.makeCompressed();
 
-                // Cache each diagonal's flat storage index (coeffRef returns a reference
-                // straight into the value array) so the patch path below can write via
-                // valuePtr()[idx] (O(1)) instead of coeffRef(i,i) (O(log nnz), binary search).
+                // Cache each diagonal's valuePtr() index for the in-place patch path below.
                 ldlt_diag_top_idx_.resize(n_act);
                 for (int k = 0; k < n_act; ++k)
                     ldlt_diag_top_idx_[k] = static_cast<int>(&sol.P_hat.coeffRef(k, k) - sol.P_hat.valuePtr());
@@ -544,8 +511,7 @@ private:
         auto& sol = std::get<CholSolver>(active_solver_);
 
         const bool rho_changed = (rho_ != rho_at_last_fact_);
-        // Captured before the branch below runs: numeric_dirty_ is reset to false partway through it.
-        const bool structural_change = numeric_dirty_;
+        const bool structural_change = numeric_dirty_; // captured before the branch below resets it.
         {
             SCHUR_PREC_TIMER_BLOCK(assembly_time_);
             if (numeric_dirty_ || rho_changed) {
@@ -575,9 +541,7 @@ private:
                 sol.P += mu_diag;
                 sol.P.makeCompressed();
 
-                // Cache each diagonal's flat storage index (valid since sol.P was just
-                // (re)assigned above) so the mu-only shift path below can write via
-                // valuePtr()[idx] (O(1)) instead of coeffRef(i,i) (O(log nnz), binary search).
+                // Cache each diagonal's valuePtr() index for the mu-only shift path below.
                 diag_idx_chol_.resize(s);
                 for (Eigen::Index i = 0; i < s; ++i)
                     diag_idx_chol_[i] = static_cast<int>(&sol.P.coeffRef(i, i) - sol.P.valuePtr());
@@ -641,23 +605,19 @@ private:
             smw_last_reject_reason_ = SmwRejectReason::FactorizationMethodChanged;
             return false;
         }
-        // No usable snapshot to update from -- either none has ever been taken (has_snapshot_
-        // false), or record_smw_rebuild() wiped G_old_ after a fail-streak.
+        // No usable snapshot: none taken yet, or record_smw_rebuild() wiped G_old_ after a fail streak.
         if (!has_snapshot_ || (G_old_.rows() == 0 && snapshot_wiped_by_fail_streak_)) {
             smw_last_reject_reason_ = SmwRejectReason::NoSnapshot;
             return false;
         }
-        // The low-rank reuses P_old, which was factorized against the snapshot's rho.
-        // On active_K entries H_diag(i) = Q_diag(i) + 1/rho, so a rho drift invalidates that reuse,
-        // so reject the low-rank updates.
+        // P_old was factorized with the snapshot's rho, and H_diag(i) = Q_diag(i) + 1/rho on
+        // active_K entries, so a rho change invalidates it.
         if (rho_ != rho_old_) {
             smw_last_reject_reason_ = SmwRejectReason::RhoChangedSinceSnapshot;
             return false;
         }
-        // The (1/mu)I block spans every row of P/P_hat, not just active_K entries.
-        // The capacitance math only recomputes it fresh for added W rows; every retained rows's
-        // (1/mu) entry is inherited unchanged from P_old via the Y_all_ = P_old^-1 [...] solves.
-        // A mu drift is therefore a full-rank shift, so reject the low-rank updates.
+        // The update recomputes (1/mu) only for added W rows; retained rows inherit it from P_old.
+        // A mu change is thus a full-rank shift.
         if (mu_ != mu_old_) {
             smw_last_reject_reason_ = SmwRejectReason::MuChangedSinceSnapshot;
             return false;
@@ -727,8 +687,8 @@ private:
         // Block 3: W_+ = B_+ E_new B_+^T + (1/mu) I  (q_×q_).
         V_plus_.setZero(s_old_, q_);
         zero_resize(smw_e_new_b_, N);
-        // zero_resize() no-ops on a same-size reuse -- this only holds if the last call actually
-        // restored every touched entry back to zero before returning (see the loop below).
+        // zero_resize() keeps old contents on a same-size reuse, so this relies on the loop below
+        // re-zeroing every touched entry.
         assert((smw_e_new_b_.size() == 0 || smw_e_new_b_.cwiseAbs().maxCoeff() == T(0)) &&
                "smw_e_new_b_ zero-invariant violated: dirty state leaked from a previous call.");
         for (int j = 0; j < q_; ++j) {
@@ -765,13 +725,12 @@ private:
         const int rank = h_ + p_ + q_;
         Y_all_.resize(s_old_, rank);
         zero_resize(smw_tmp_, s_old_);
-        // Same invariant as smw_e_new_b_ above: zero_resize() no-ops on a same-size reuse, so
-        // this only holds if the last call restored its touched entries back to zero.
+        // Same zero invariant as smw_e_new_b_ in build_capacitance_setup().
         assert((smw_tmp_.size() == 0 || smw_tmp_.cwiseAbs().maxCoeff() == T(0)) &&
                "smw_tmp_ zero-invariant violated: dirty state leaked from a previous call.");
 
-        // LDLT padding is loop-invariant except for its tail. Unconditional setZero (not
-        // zero_resize) so a same-size reuse across calls can't retain stale head data.
+        // Only the tail is written per solve; setZero (not zero_resize) so a same-size reuse with a
+        // different n_act_ can't leave stale data in the head.
         if (use_ldlt_) smw_ldlt_padded_.setZero(n_act_ + s_old_);
 
         // Helper: P_old^-1 v via LLT, or (P_hat_old^-1 [0;v]).tail via LDLT.
@@ -813,14 +772,13 @@ private:
         }
     }
 
-    // Phase 5: factor the capacitance matrix S_Lambda = M_sub - V_all^T Y_all_;
-    // on near-singularity, caller falls back to a full rebuild.
-    // Its blocks live on very different scales (flipped columns ~ H ~ 1/rho, added rows ~ |b|^2 / H,
-    // up to rho |b|^2), so a rank test relative to the largest pivot would discard well-conditioned
-    // updates. Equilibrate symmetrically first:
-    // tau_i = max(|M_sub_ii|, |(V_all^T Y_all)_ii|) is the scale of the two terms combined in
-    // S_Lambda_ii, so genuine cancellation still shows up as a small pivot, and a lone small pivot
-    // is caught by measuring against max(1, largest pivot).
+    // Phase 5: factor the capacitance matrix S_Lambda = M_sub - V_all^T Y_all_; if near-singular,
+    // the caller falls back to a full rebuild.
+    // Its blocks have very different scales (flipped columns ~ H ~ 1/rho, added rows ~ |b|^2 / H,
+    // up to rho |b|^2), so a pivot test against the largest pivot alone would reject well-conditioned
+    // updates. S_Lambda is first equilibrated symmetrically with tau_i = max(|M_sub_ii|,
+    // |(V_all^T Y_all)_ii|), so cancellation in S_Lambda_ii still shows as a small pivot, measured
+    // against max(1, largest pivot).
     bool factorize_capacitance(const Mat& M_sub) {
         const int rank = h_ + p_ + q_;
         Mat VtY = Mat::Zero(rank, rank);
@@ -937,10 +895,8 @@ private:
     bool use_ldlt_ = false;
     bool use_ldlt_at_last_fact_ = false;
 
-    // Held by pointer, not by value: a pattern rebuild needs a solver with no stale symbolic
-    // state, and Eigen's solvers are not copy-assignable, so the handle is simply reseated.
-    // Both order by AMD in 64-bit indices (amd_ordering.hpp): SpMat is int-indexed, and Eigen's
-    // default AMDOrdering<int> overflows on large patterns.
+    // Held by pointer so a pattern rebuild starts from a fresh solver (Eigen's solvers are not
+    // copy-assignable). Both use AMD in 64-bit indices (amd_ordering.hpp).
     using LltType  = SimplicialLLT64<SpMat>;
     using LdltType = SimplicialLDLT64<SpMat>;
     struct CholSolver {
@@ -962,9 +918,8 @@ private:
     std::vector<Triplet> ldlt_build_trips_;
     Vec E_diag_; // factorize_by_chol()'s E diagonal (1/H_diag on active_K, 0 elsewhere)
 
-    // Cached flat storage indices (into sol.P/sol.P_hat's valuePtr()) for the diagonal entries
-    // touched by the mu/rho-only patch paths in factorize_by_chol()/factorize_by_ldlt(); avoids
-    // an O(log nnz) coeffRef() binary search on every mu/rho-only iteration.
+    // Diagonal entries' indices into sol.P/sol.P_hat's valuePtr(), for the mu/rho-only patch paths:
+    // O(1) writes instead of coeffRef()'s O(log nnz) search.
     std::vector<int> diag_idx_chol_;
     std::vector<int> ldlt_diag_top_idx_;
     std::vector<int> ldlt_diag_bot_idx_;

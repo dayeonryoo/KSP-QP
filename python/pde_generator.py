@@ -16,12 +16,10 @@ Copyright (c) 2005 D.J. Silvester, H.C. Elman, A. Ramage
   nonzerobc_input.m  - IFISS function: DJS, JWP; 27 June 2012
 Copyright (c) 2012 D.J. Silvester, H.C. Elman, A. Ramage, J.W. Pearson
 
-See also fem_q1.py for the element-level kernels (shape/deriv/gauss_*)
-and its own IFISS citations.
+The element-level kernels and their IFISS citations are in fem_q1.py.
 
-The generated problems are returned as KSPQPdata instances; call .to_dict()
-to get the numpy/CSC dict that ksp_qp_bind.solve_from_data() and
-benchmark_common.kspqp_to_qpalm() consume.
+The generators return KSPQPdata; .to_dict() gives the numpy/CSC dict that
+ksp_qp_bind.solve_from_data() and benchmark_common.kspqp_to_qpalm() consume.
 """
 
 from dataclasses import dataclass, replace
@@ -36,12 +34,10 @@ INF = np.inf
 
 
 class Discretization(str, Enum):
-    """Spatial discretization used to build the PDE operator D_op and mass
-    matrix M in the QP generators below. FEM is the default; FD uses a
-    standard 5-point Laplacian stiffness with first-order upwind convection
-    on the same uniform GridQ1 node layout, so both share Dirichlet BC
-    handling (apply_dirichlet_bc / apply_dirichlet_bc_mass) and only ever
-    produce a lumped mass matrix.
+    """Spatial discretization for the PDE operator D_op and mass matrix M.
+    FEM (default) uses Q1 elements; FD uses a 5-point Laplacian with
+    first-order upwind convection on the same GridQ1 nodes, so Dirichlet BC
+    handling is shared, and always a lumped mass matrix.
     """
 
     FEM = "fem"
@@ -72,12 +68,9 @@ def fd_trapezoid_factor(idx, n1d):
 
 
 # -----------------------------------------------------------------------
-# Q1 finite-element mesh on a uniform rectangular tensor-product grid over
-# the unit square. Element connectivity is generated directly from (ei,ej)
-# since we assume the mesh is always structured.
-#
-# n_nodes is the C++ GridQ1::np field, renamed to avoid colliding with the
-# conventional numpy alias.
+# Q1 mesh on a uniform tensor-product grid over the unit square; element
+# connectivity comes directly from (ei, ej). The node count is n_nodes, not
+# np, to avoid clashing with numpy.
 # -----------------------------------------------------------------------
 
 class GridQ1:
@@ -255,12 +248,10 @@ def assemble_femq1_cd(g, wind=fem.velocity_field_w_constant):
 
 
 # -----------------------------------------------------------------------
-# FD diffusion assembly: standard 5-point Laplacian stiffness A_stiff and
-# diagonal lumped mass M_lump (composite-trapezoidal area weight per node,
-# so it sums exactly to the domain area, same invariant as the FEM lumped
-# mass) on the same uniform GridQ1 node layout used by the FEM path.
-# Boundary rows of A_stiff are left empty here since apply_dirichlet_bc
-# fills them in (diagonal = 1) during the shared post-assembly BC step below.
+# FD diffusion assembly on the GridQ1 nodes: 5-point Laplacian A_stiff and
+# lumped mass M_lump (trapezoidal weights, summing to the domain area like
+# the FEM lumped mass). Boundary rows of A_stiff are left empty;
+# apply_dirichlet_bc sets them.
 # -----------------------------------------------------------------------
 
 @dataclass
@@ -353,22 +344,15 @@ def assemble_fd_cd(g, wind=fem.velocity_field_w_constant):
 
 
 # -----------------------------------------------------------------------
-# Dispatches diffusion / convection-diffusion assembly to FEM or FD based
-# on `disc`, so the QP generators below only branch once per operator. FD
-# always uses its lumped mass (there is no FD analogue of the consistent
-# Q1 mass matrix), so `lump_mass` only affects the FEM path.
+# Dispatches diffusion / convection-diffusion assembly to FEM or FD. FD has
+# no consistent mass matrix, so `lump_mass` only affects FEM.
 #
-# D_op feeds into the shared PDE constraint D_op*y - M*u = rhs (see
-# make_problem_l2_from_mats), which encodes the FEM weak form K*y = M*u.
-# FD's strong-form Laplacian/convection assembly instead represents the
-# pointwise equation D_op*y = u (no mass weighting on u), and FD's stiffness
-# is O(1/h^2) rather than FEM's O(1) -- so passing FD's raw D_op through the
-# same M*u convention would silently divide the control's influence on the
-# state by an extra O(h^2) per stage. To reuse the shared constraint assembly
-# unchanged, the FD operator is mass-scaled here (M_lump * D_op_raw), which is
-# algebraically equivalent to the strong-form equation (mass is
-# diagonal/invertible) and also renormalizes FD's stiffness down to FEM's
-# O(1) magnitude.
+# The shared PDE constraint D_op*y - M*u = rhs (make_problem_l2_from_mats) is
+# FEM's weak form K*y = M*u. FD assembles the strong form D_op*y = u, with
+# stiffness O(1/h^2) instead of O(1), so its raw D_op would shrink the
+# control's effect by O(h^2). The FD operator is therefore mass-scaled here
+# (M_lump * D_op_raw): equivalent to the strong form (M_lump is diagonal and
+# invertible) and of FEM's O(1) magnitude.
 # -----------------------------------------------------------------------
 
 def assemble_diff_by_discretization(g, disc, lump_mass):
@@ -399,9 +383,7 @@ def assemble_cd_by_discretization(g, disc, lump_mass, eps, wind=fem.velocity_fie
 #   D_op(p, :) = D_op(:, p) = 0,  D_op(p, p) = 1              for p in bc_nodes
 #   rhs_p  <-  g_p                                            for p in bc_nodes
 #
-# i.e. known boundary columns are folded into the RHS of the interior
-# equations, then boundary rows/cols are replaced by identity rows so that
-# solving D_op y = rhs directly yields y_p = g_p at the boundary.
+# so solving D_op y = rhs gives y_p = g_p on the boundary.
 # -----------------------------------------------------------------------
 
 def apply_dirichlet_bc(D_op, rhs, bc_nodes, bc_values):
@@ -560,21 +542,15 @@ def make_problem_l2_from_mats(D_op, M, rhs, yhat, beta,
 #   Q, c, obj_const  <-  (Q, c, obj_const) / h^2
 #   A(r,:), b_r      <-  (A(r,:), b_r) / h^2       for r not in bc_nodes
 #
-# On the uniform grid (h = 2^-nc) every entry of M is O(h^2) -- exactly h^2
-# on the lumped interior diagonal, h^2 times a fixed stencil for the
-# consistent mass -- and hence so are Q and c. An interior row
-# D_op*y - M*u - rhs of the state equation is O(h^2) as well at smooth
-# (y, u), since D_op*y ~ h^2 * (D y)(x_p) there. Left as is, every KKT
-# residual block shrinks as O(h^2) under refinement, so a fixed solver tol
-# becomes less demanding as the mesh is refined; dividing by h^2 brings them
-# all to the mesh-independent O(1) scale of the continuous optimality system.
-# The Dirichlet rows y_p = g_p set by apply_dirichlet_bc are already O(1)
-# and are left alone.
+# On the uniform grid (h = 2^-nc) M is O(h^2), hence so are Q and c, and so
+# is an interior state-equation row D_op*y - M*u - rhs at smooth (y, u),
+# since D_op*y ~ h^2 * (D y)(x_p) there. Unscaled, every KKT residual block
+# shrinks as O(h^2) under refinement, so a fixed tol gets looser; dividing by
+# h^2 restores the O(1) scale of the continuous system. The Dirichlet rows
+# y_p = g_p are already O(1) and are left alone.
 #
-# The primal solution x = [y; u] is unchanged. The multipliers change as
-# z -> z / h^2 and, on the Dirichlet rows only, y1 -> y1 / h^2; the interior
-# entries of y1 (the discrete adjoint) are unchanged. h is a power of two, so
-# the scaling is exact in floating point.
+# x = [y; u] is unchanged; z -> z / h^2 and, on the Dirichlet rows only,
+# y1 -> y1 / h^2. h is a power of two, so the scaling is exact.
 # -----------------------------------------------------------------------
 
 def scale_by_mesh_size(pb, bc_nodes, h):

@@ -1,12 +1,10 @@
 """
 Benchmark KSP-QP vs QPALM vs OSQP on the Netlib *infeasible* LP set.
 
-Every problem in data/netlib-main/infeasible/ is known to be primal infeasible, so
-metric here is detection, not solve time: a solver "succeeds" when it terminates
-with an infeasibility status. The per-solver `*_detected` column records that;
-the raw `*_status` column is kept alongside so primal-vs-dual infeasibility and
-the failure modes (time limit, iteration cap, or a false claim of optimality)
-stay recoverable.
+Every problem in data/netlib-main/infeasible/ is primal infeasible, so the metric is
+detection: `*_detected` records whether a solver terminated with an infeasibility
+status, and the raw `*_status` column keeps primal vs dual and the failure modes
+(time limit, iteration cap, false optimality).
 
 Outputs
 -------
@@ -62,8 +60,8 @@ from benchmark_common import (
 
 # ---------------------------------------------------------------------------
 # Netlib infeasible LPs (all primal infeasible).
-# Same list, same order as the `all` sweep in src/netlib.cpp, so the C++ driver
-# and this benchmark stay comparable row for row.
+# Same set and order as `ksp_qp_netlib --set infeasible --name all` (the sorted
+# directory), so the two compare row for row.
 # ---------------------------------------------------------------------------
 # Filenames are lowercase (.mps); the names below are the uppercase spelling used
 # in the result CSVs, so paths are built as f"{name.lower()}.mps".
@@ -79,9 +77,9 @@ INFEAS_LPS = [
 
 # ---------------------------------------------------------------------------
 # Per-solver infeasibility statuses.
-# Primal and dual infeasibility are both counted as a detection, matching
-# `infeas_detected = (opt == -2 || opt == -3)` in src/netlib.cpp. OSQP's
-# "_INACCURATE" variants count too; the raw status column preserves which.
+# Primal and dual infeasibility both count as a detection, as in src/netlib.cpp's
+# infeasible set. OSQP's "_INACCURATE" variants count too; the raw status column
+# preserves which.
 # ---------------------------------------------------------------------------
 KSPQP_INFEAS = {-2, -3}          # TerminationStatus::{PrimalInfeasible, DualInfeasible}
 QPALM_INFEAS = {-3, -4}          # qpalm.Info.{PRIMAL_INFEASIBLE, DUAL_INFEASIBLE}

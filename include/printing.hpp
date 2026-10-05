@@ -15,7 +15,7 @@ enum class PrintWhat {
     NONE,
     MINIMAL, // iter, tol
     SSN,     // iter, tol, params, linesearch and Krylov failures; printed at every SSN iteration
-    TUNING,  // iter, tol, params, lineserach and Krylov failures
+    TUNING,  // iter, tol, params, linesearch and Krylov failures
     FULL,    // iter, obj_val, tol, params, linesearch and Krylov failures
 };
 
@@ -35,10 +35,8 @@ struct IterationRecord {
     T ssn_res, mu, rho, eps;
     int linesearch_fail, krylov_fail;
     bool show_pmm_iter = true;
-    // Active-set sizes. -1 means "not applicable" -- n_active_W/n_active_K are only
-    // meaningful on records produced from inside the SSN inner loop (this file's
-    // per-inner-iteration report_ call), and ssn_opt (a cast SSN<T>::TerminationStatus)
-    // only on the per-PMM-iteration record built once a full solve_ssn() call returns.
+    // Active-set sizes and SSN status; -1 means "not applicable". n_active_K is set only on SSN
+    // inner-loop records (ssn.tpp), ssn_opt (a cast SSN<T>::TerminationStatus) only on per-PMM records.
     int n_active_W = -1, n_active_K = -1;
     int ssn_opt = -1;
 };

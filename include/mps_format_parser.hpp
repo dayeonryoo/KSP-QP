@@ -33,7 +33,7 @@ private:
         int idx   = -1;  // index of constraint rows (objective row has idx = -1)
     };
 
-    // Fixed-vs-free-format: decided once from the first content line.
+    // Fixed-vs-free-format: decided once from the first value-bearing line.
     enum class Format { UNKNOWN, FIXED, FREE };
 
     Section section_ = Section::NONE;

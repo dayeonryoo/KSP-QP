@@ -546,10 +546,8 @@ TEST(ExactLineSearch, MergesCoincidentKAndWBreakpoints) {
 }
 
 TEST(ExactLineSearch, ReturnsZeroWhenInitialDerivativeIsExactlyZeroAtTheBoundary) {
-  // Same shape as FindsExactBreakpointForSingleActiveBoundCrossing but c=0,  
-  // so zeta=0 and (interior, dist_K_s=0) p_val=0 exactly hits the `p_val >= 0`
-  // check's equality branch specifically, distinct from
-  // ReturnsZeroWhenInitialDerivativeIsNonNegative which only covers p_val > 0.
+  // As FindsExactBreakpointForSingleActiveBoundCrossing but c=0, so p_val = 0 exactly: the equality
+  // case of `p_val >= 0` (ReturnsZeroWhenInitialDerivativeIsNonNegative covers p_val > 0).
   LineSearchCase lc(1);
   const auto p = lc.Params();
 
@@ -566,10 +564,9 @@ TEST(ExactLineSearch, ReturnsZeroWhenInitialDerivativeIsExactlyZeroAtTheBoundary
 }
 
 TEST(ExactLineSearch, ReturnsFullStepForDegenerateZeroDirection) {
-  // dx=0, dy2=0 with finite box bounds on both K and W: every |dx_i| and |dv_i| is below
-  // eps_direction, so no breakpoints are generated at all and eta (the weighted squared norm
-  // of the direction) is exactly 0. This isolates the `breakpoints.empty() && eta < eps_zero`
-  // guard from the unbounded-box fallthrough exercised by ReturnsFullStepWhenNoBoundIsCrossed.
+  // dx=0, dy2=0 with finite bounds: no breakpoints and eta = 0, so this hits the
+  // `breakpoints.empty() && eta < eps_zero` guard (ReturnsFullStepWhenNoBoundIsCrossed covers
+  // the unbounded-box case).
   LineSearchCase lc(3, /*l=*/2);
   const auto p = lc.Params();
 
@@ -586,13 +583,10 @@ TEST(ExactLineSearch, ReturnsFullStepForDegenerateZeroDirection) {
 }
 
 TEST(ExactLineSearch, SlopeSafeguardHandlesNearZeroAccumulatedSlopeFromRounding) {
-  // All three coordinates start violating lx=0 (x_curr=-1) and move toward it (dx=1),
-  // each crossing at the identical t=1 and each independently contributing mu*dx_i^2=0.1 to
-  // m's initial value (three sequential += at ssn.tpp:464-465) and -0.1 to the merged
-  // breakpoint's slope_change (ssn.tpp:513-524). Mathematically these cancel exactly, but
-  // IEEE-754 rounding of repeated 0.1 additions (cf. the classic 0.1+0.1+0.1 != 0.3) can leave
-  // the post-crossing m at exactly 0.0 or a few ULPs off zero rather than a clean value.
-  // rho is huge so eta itself is negligible, isolating m to these violation/breakpoint terms.
+  // All three coordinates start below lx=0 (x_curr=-1) and move toward it (dx=1), crossing at the
+  // same t=1. Each adds mu*dx_i^2=0.1 to the initial m and -0.1 to the merged breakpoint's
+  // slope_change; these cancel exactly in theory, but rounding (0.1+0.1+0.1 != 0.3) can leave the
+  // post-crossing m at 0.0 or a few ULPs off. rho is huge so eta is negligible.
   LineSearchCase lc(3);
   lc.lx = Vec::Constant(3, 0.0);
   lc.ux = Vec::Constant(3, std::numeric_limits<double>::infinity());
@@ -706,12 +700,9 @@ TEST(UpdateSsnSystem, CachesATrY1ExactlyOnceMatchingIndependentMatVec) {
 }
 
 TEST(UpdateSsnSystem, ATrY1StaysBitIdenticalAcrossRepeatedPrepareAndSolveCallsWithoutReUpdate) {
-  // A_tr_y1_ is recomputed unconditionally on every update_ssn_system() call, so the "cache"
-  // property under test is that it survives repeated calls to the rest of the per-SSN-iteration
-  // pipeline (prepare_newton_system -> solve_newton_direction -> line_search... -> update_iterate,
-  // mirroring solve_ssn()'s own loop) without that pipeline ever calling update_ssn_system() again
-  // -- exactly how the real outer PMM loop uses it (called once per PMM iteration, read many times
-  // across the SSN iterations within it).
+  // A_tr_y1_ is set by update_ssn_system() (once per PMM iteration); check it survives repeated
+  // runs of the per-SSN-iteration pipeline (prepare_newton_system -> solve_newton_direction ->
+  // line_search... -> update_iterate).
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
   Vec x_pmm(3);
@@ -873,10 +864,8 @@ TEST(PrepareNewtonSystem, ActiveWChangeAloneRebuildsGWithoutChangingActiveK) {
 }
 
 TEST(PrepareNewtonSystem, HDiagRebuildsOnMuOnlyChangeWithoutActiveSetChange) {
-  // Regression test: H_diag = Q + mu*(1-diag_P_K) + I/rho depends on mu, but was previously only
-  // rebuilt on delta.k_changed -- a mu-only drift (which happens every PMM outer iteration) left
-  // it stale. z=y2=0 in this fixture, so u_/v_ (hence the active set) are unaffected by mu,
-  // isolating a pure mu-only change with k_changed/w_changed both false.
+  // H_diag = Q + mu*(1-diag_P_K) + I/rho depends on mu, so a mu-only change (every PMM iteration)
+  // must rebuild it. With z=y2=0 the active set doesn't depend on mu: k_changed/w_changed are false.
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
   Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
@@ -1342,9 +1331,8 @@ TEST(SolveNewtonDirection, IterativeRefinementCorrectsArtificiallyInjectedError)
   const double res_before = kkt_residual(ns.dxdy_);
   ASSERT_GT(res_before, ns.refine_abs_tol);  // corruption is large enough to actually need refining
 
-  // Poison prev_dy_ with a correctly-sized (so the size-only warm_start gate in solve_using_cg()
-  // wouldn't reject it) but wrong vector -- a size check alone couldn't catch stale-but-right-size
-  // content surviving refinement.
+  // Poison prev_dy_ with a wrong vector of the right size, which solve_using_cg()'s size-only
+  // warm_start check would accept.
   ns.prev_dy_ = Vec::Constant(s, 999.0);
 
   ns.iterative_refine_dxdy();
@@ -1432,10 +1420,8 @@ TEST(SolveUsingLdlt, ForcedReanalyzeWhenSystemSizeChangesButPatternFlagWasNotMar
   Vec sol2 = ns.solve_using_ldlt(G2, H2, Vec::Zero(3), r2_2);
   ExpectKktResidualSmall(sol2, G2, H2, Vec::Zero(3), r2_2, ns.mu);
 
-  // K_ldlt_built_ ends up true again either way (the forced-reanalyze branch resets it to false,
-  // then the full-rebuild branch it triggers sets it back to true within the same call), so the
-  // flag alone can't distinguish "really reassembled" from "coincidentally unchanged" -- ground-
-  // truth the reassembly itself against an independently-assembled K = [-H2, G2^T; G2, (1/mu)I].
+  // K_ldlt_built_ ends up true either way, so check the reassembled K against an independently
+  // assembled K = [-H2, G2^T; G2, (1/mu)I].
   EXPECT_TRUE(ns.K_ldlt_built_);
   Eigen::MatrixXd expected_K2 = Eigen::MatrixXd::Zero(5, 5);
   for (int i = 0; i < 3; ++i) expected_K2(i, i) = -H2(i);
@@ -1470,9 +1456,8 @@ TEST(SolveUsingLdlt, KLdltBuiltStaysTrueAcrossDiagonalOnlyPatch) {
   ASSERT_TRUE(ns.K_ldlt_built_);
   ASSERT_FALSE(ns.ldlt_pattern_dirty_);
 
-  // Same G (same pattern): only H_diag values change, as prepare_newton_system() would signal via
-  // ldlt_numeric_dirty_ on a mu/rho-only drift -- this must take the diagonal-patch branch, which
-  // never touches K_ldlt_built_.
+  // Same G: only H_diag changes (ldlt_numeric_dirty_ on a mu/rho-only change), so the
+  // diagonal-patch branch runs and K_ldlt_built_ is untouched.
   ns.ldlt_numeric_dirty_ = true;
   Vec H2 = Vec::Constant(3, 5.0);
   Vec sol2 = ns.solve_using_ldlt(G1, H2, Vec::Zero(3), Vec::Zero(1));
@@ -1482,13 +1467,9 @@ TEST(SolveUsingLdlt, KLdltBuiltStaysTrueAcrossDiagonalOnlyPatch) {
 }
 
 TEST(SolveUsingLdlt, ConsumesFreshHDiagAfterMuRhoOnlyChangeBetweenPrepareCalls) {
-  // End-to-end regression test: a mu/rho-only change must both mark ldlt_numeric_dirty_ (now set by
-  // prepare_newton_system() whenever it recomputes H_diag) and rebuild the H_diag member -- before
-  // the H_diag fix, prepare_newton_system() only rebuilt H_diag on k_changed, so a fresh
-  // refactorization could still bake in a stale H_diag (fresh mu in the (1/mu)I block, stale
-  // mu/rho in the -H block). This exercises the real call sequence (update_ssn_system ->
-  // prepare_newton_system -> solve_using_ldlt(ns.G, ns.H_diag, ...)) to prove H_diag is fresh by
-  // the time solve_using_ldlt() consumes it.
+  // A mu/rho-only change must set ldlt_numeric_dirty_ and rebuild H_diag, or the refactorization
+  // would mix a fresh (1/mu)I block with a stale -H block. Runs the real sequence
+  // update_ssn_system -> prepare_newton_system -> solve_using_ldlt(ns.G, ns.H_diag, ...).
   SsnFixture f(DefaultA(), DefaultB());  // N=3, M=1, l=2
   SSN<double> ns = f.Make();
 
@@ -1609,9 +1590,8 @@ TEST(SolveUsingCg, PcgFailureLatchPermanentlyRoutesToTheDirectSolver) {
                                 /*update_prec=*/true, /*prec_pattern_changed=*/true,
                                 /*schur_use_ldlt=*/false);
 
-  // The Cholesky preconditioner genuinely failed, so the permanent direct-solver latch must now be
-  // engaged, and this first call's own result must have gone through S's Cholesky (failed) and then
-  // solve_using_ldlt().
+  // The preconditioner's Cholesky failed, so the direct-solver latch must be set, and this call must
+  // have gone through S's Cholesky (failed) and then solve_using_ldlt().
   EXPECT_TRUE(ns.pcg_failed);
   EXPECT_FALSE(ns.direct_use_ldlt);
   EXPECT_TRUE(ns.schur_chol_failed_);
@@ -1632,10 +1612,9 @@ TEST(SolveUsingCg, PcgFailureLatchPermanentlyRoutesToTheDirectSolver) {
   const int krylov_iter_after_first_call = ns.krylov_iter;
   const int fact_after_first_call = ns.fact;
 
-  // A second, perfectly well-posed system (positive mu, well-conditioned G) that PCG could easily
-  // solve -- if the latches are honored, solve_using_cg() must route straight to the direct solver,
-  // and from there to solve_using_ldlt(), without ever touching the preconditioner/CG machinery or
-  // retrying S's Cholesky, so krylov_fail/krylov_iter/schur_chol_fact must not move.
+  // A well-posed second system: with the latches set, solve_using_cg() must go straight to
+  // solve_using_ldlt() without CG or another Cholesky on S, so krylov_fail/krylov_iter/
+  // schur_chol_fact must not move.
   ns.mu = 1.0;
   SpMat G2 = DefaultA();  // 1x3, well-conditioned equality row
   SpMat G2_tr = SpMat(G2.transpose());
@@ -1726,12 +1705,10 @@ TEST(SolveUsingCg, PcgFailureFallsBackToTheKktSystemWhenTheThresholdPrefersIt) {
 }
 
 // ===================== cross-path agreement =====================
-// For a fixed (G, H_diag, active_K, r1, r2, mu, rho), PCG+Cholesky, PCG+LDLT, PCG+SMW (updated from
-// either a Cholesky or an LDLT snapshot), the direct solver on either of its systems (LDLT on K,
-// Cholesky on S), and solve_using_ldlt() all solve the same augmented KKT system K[dx;dy]=[r1;r2] --
-// the preconditioner only affects PCG's convergence path, and SMW is just a cheaper way to reach the
-// same preconditioning matrix as a fresh factorization. This checks all seven routes agree with each
-// other and each independently satisfies the KKT residual.
+// For fixed (G, H_diag, active_K, r1, r2, mu, rho), seven routes solve the same KKT system
+// K[dx;dy]=[r1;r2]: PCG+Cholesky, PCG+LDLT, PCG+SMW (from a Cholesky or an LDLT snapshot), the
+// direct solver (LDLT on K or Cholesky on S), and solve_using_ldlt(). They must agree with each
+// other and each satisfy the KKT residual.
 
 namespace {
 
@@ -1743,9 +1720,8 @@ void ExpectAllSolvePathsAgree(const SpMat& A, const SpMat& B, const BoolArr& act
   SsnFixture f(A, B);
   const Vec H_diag_inv = H_diag.cwiseInverse();
 
-  // SSN<double> is neither copyable (cg's ConjugateGradient member isn't) nor safely returnable
-  // by value from a named local (no viable move ctor either), so set up each instance in place via
-  // a by-reference helper rather than a factory function that returns SSN<double>.
+  // SSN<double> is neither copyable nor movable, so each instance is set up in place by a
+  // by-reference helper.
   auto setup_ns = [&](SSN<double>& ns) {
     ns.mu = mu;
     ns.rho = rho;
@@ -1995,10 +1971,8 @@ TEST(LineSearchWithSteepestDescentFallback, RetryWithSteepestDescentSucceedsAfte
   ns.dx_ << -0.5, -0.5, -0.5;  // ascent direction: zeta1 = dx.dot([-1,-1,-1]) = 1.5 >= 0 -> tau=0
   ns.dy2_ = Vec::Zero(2);
 
-  // grad_Atr_resp_ is cached once per SSN iteration and read again during the retry's
-  // compute_grad_Lagrangian() call inside line_search_with_steepest_descent_fallback() below --
-  // capture it up front the same way that internal call does, to check it stays bit-identical
-  // across the retry (true because Ax_ssn_ provably doesn't move between them).
+  // grad_Atr_resp_ is cached once per SSN iteration and reused by the retry below; capture it now
+  // to check it is bit-identical after the retry (Ax_ssn_ doesn't move in between).
   ns.make_line_search_params();
   const Vec grad_Atr_resp_before = ns.grad_Atr_resp_;
 
@@ -2397,9 +2371,8 @@ TEST(SolveSsn, MaxInnerIterationsZeroTerminatesImmediatelyWithoutUpdatingIterate
 }
 
 TEST(SolveSsn, TerminatesImmediatelyWithInterruptedStatusWhenInterruptedFlagIsSet) {
-  // interrupted_() is checked as the very first statement of the SSN loop body, so an
-  // unconditionally-true flag stops the loop before any iteration runs -- same shape as the
-  // ssn_max_in_iter=0 case above, but via the interruption mechanism instead of the iteration cap.
+  // interrupted_() is checked first in the SSN loop body, so an always-true flag stops the loop
+  // before any iteration runs (like ssn_max_in_iter=0 above).
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
   ns.interrupted_ = [] { return true; };
@@ -2419,9 +2392,7 @@ TEST(SolveSsn, TerminatesImmediatelyWithInterruptedStatusWhenInterruptedFlagIsSe
 }
 
 TEST(SolveSsn, TerminatesImmediatelyWithTimeLimitStatusWhenTimeLimitExceededFlagIsSet) {
-  // Same shape as the interrupted_ test above, but for time_limit_exceeded_: checked as the
-  // second statement of the SSN loop body (after interrupted_), so an unconditionally-true flag
-  // stops the loop before any iteration runs.
+  // Same for time_limit_exceeded_, checked right after interrupted_.
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
   ns.time_limit_exceeded_ = [] { return true; };
@@ -2465,12 +2436,9 @@ TEST(SolveSsn, ConvergesToAnalyticMinimizerWithNoEqualityOrInequalityConstraints
 }
 
 TEST(SolveSsn, ConvergesToStrictlyInteriorMinimizerWithNoEqualityOrInequalityConstraints) {
-  // M=0, l=0: G is a 0-row Schur complement (G.rows() = M + n_active_W = 0), exercising the fully
-  // degenerate box-only case end-to-end. Distinct from
-  // ConvergesToAnalyticMinimizerWithNoEqualityOrInequalityConstraints (whose optimum sits exactly
-  // on the box boundary): here c is chosen so the unconstrained minimizer already lies strictly
-  // inside (-1,1), so dist_K stays 0 throughout and the solve never needs to touch a box boundary
-  // at all, isolating the 0x0-Schur/LDLT-padding bookkeeping from any active-set-transition logic.
+  // M=0, l=0: G has 0 rows (the fully degenerate box-only case). Unlike
+  // ConvergesToAnalyticMinimizerWithNoEqualityOrInequalityConstraints (optimum on the boundary),
+  // the minimizer lies strictly inside (-1,1), so dist_K stays 0 and the active set never changes.
   //   min_x  c*x + (mu/2) dist_K(z/mu+x)^2 + (1/(2 rho)) (x-x_bar)^2,
   // with c=0.2, z=0, mu=rho=1, x_bar=0, box=[-1,1]: interior formula reduces to c*x + x^2/2,
   // minimized at x* = -c = -0.2 (strictly inside the box).

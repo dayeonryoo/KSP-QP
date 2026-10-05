@@ -257,21 +257,16 @@ py::dict solve_from_data(const py::dict& pd_dict,
     Vec x_sol, y1_sol, y2_sol, z_sol;
     {
         py::gil_scoped_release release;
-        // trace_path is diagnostic-only: when set, writes a per-PMM-iteration and
-        // per-SSN-inner-iteration CSV trace (active-set sizes, ssn_opt, mu/rho)
-        // to that file. Default "" preserves prior silent behavior exactly.
+        // Diagnostic-only: a non-empty trace_path writes a per-PMM- and per-SSN-iteration
+        // CSV trace (active-set sizes, ssn_opt, mu/rho) to that file. Default "": silent.
         bool trace = !trace_path.empty();
         Problem<T>  prob(pd, (T)tol, (int)max_iter, time_limit,
                          trace ? PrintWhen::ALWAYS : PrintWhen::NEVER,
                          trace ? PrintWhat::SSN    : PrintWhat::NONE);
         KSP_QP<T>  solver(prob);
-        // Diagnostic-only: override rho's initial value (default rho_limit, i.e. pinned at
-        // its ceiling from PMM iteration 0). rho does not appear in the outer termination
-        // check (compute_residual_unscaled_inf_norms/primal_infeas/dual_infeas) or in
-        // objective_value(), only in update_PMM_parameters()'s own schedule and inside SSN's
-        // H_diag/gradient -- so this cannot corrupt what "converged" means, only the search
-        // dynamics used to get there. Sentinel -1 (default) leaves rho at its usual rho_limit
-        // start, matching prior behavior exactly.
+        // Diagnostic-only: override rho's initial value (default -1 keeps rho_limit). rho is
+        // not in the termination checks or objective_value(), so this changes only the
+        // search path, not what "converged" means.
         if (rho_init > 0.0) solver.rho = (T)rho_init;
         std::ofstream trace_file;
         if (trace) {

@@ -52,10 +52,9 @@ public:
     Eigen::Index rows() const { return m_; }
     Eigen::Index cols() const { return m_; }
 
-    // Called once per Krylov (CG) iteration. t_/u_ are persistent scratch buffers (sized once
-    // in the constructor), so only the returned result allocates -- not the two intermediates.
-    // Returned by value (not by reference into a shared buffer): a caller combining two calls
-    // on the same S in one expression (e.g. a*(S*v1) + b*(S*v2)) must see independent results.
+    // Called once per CG iteration; t_/u_ are preallocated scratch, so only the result allocates.
+    // Returned by value so two products on the same S in one expression (a*(S*v1) + b*(S*v2))
+    // stay independent.
     template <typename Rhs>
     Vec operator*(const Eigen::MatrixBase<Rhs>& v) const {
         t_.noalias() = G_tr * v;

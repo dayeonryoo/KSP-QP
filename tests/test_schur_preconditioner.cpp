@@ -204,8 +204,7 @@ TEST(DirectFactorization, MuOnlyChangeMatchesFreshDenseRecomputationAtNewMu) {
   prec.compute(0);
   ASSERT_EQ(prec.fact_count(), 1);
 
-  // Same G/H_diag/active_K/rho, only mu changes, and neither size nor pattern changed:
-  // this should take factorize_by_chol's diagonal-shift-only fast path (numeric_dirty_ stays false).
+  // Only mu changes: factorize_by_chol's diagonal-shift path (numeric_dirty_ stays false).
   const double mu2 = 8.0;
   prec.arm(G, G_tr, f.H_diag, active_K, active_W, B_rm, mu2, f.rho, /*rebuild=*/false, /*prec_pattern_changed=*/false, false);
   prec.compute(0);
@@ -236,8 +235,7 @@ TEST(DirectFactorization, MuOnlyChangeMatchesFreshDenseRecomputationAtNewMuLdlt)
   prec.compute(0);
   ASSERT_EQ(prec.fact_count(), 1);
 
-  // Same G/H_diag/active_K/rho, only mu changes, and neither size nor pattern changed:
-  // this should take factorize_by_ldlt's in-place-block-overwrite fast path (numeric_dirty_ stays false).
+  // Only mu changes: factorize_by_ldlt's in-place block overwrite (numeric_dirty_ stays false).
   const double mu2 = 8.0;
   prec.arm(G, G_tr, f.H_diag, active_K, active_W, B_rm, mu2, f.rho, /*rebuild=*/false, /*prec_pattern_changed=*/false,
            /*use_ldlt=*/true);
@@ -269,9 +267,8 @@ TEST(DirectFactorization, CholRebuildsOnRhoOnlyChangeWithoutPatternChange) {
   prec.compute(0);
   ASSERT_EQ(prec.fact_count(), 1);
 
-  // Same G/active_K/active_W/mu as the last build -- only rho changed, standing in for H_diag's
-  // active-K entries drifting (H_diag(i) = Q_diag(i) + 1/rho there). Unlike a mu-only change,
-  // E = 1/H_diag is nonlinear in rho, so this must fully rebuild G E G^T rather than diagonal-shift.
+  // Only rho changes (H_diag(i) = Q_diag(i) + 1/rho on active_K). E = 1/H_diag is nonlinear in
+  // rho, so chol must fully rebuild G E G^T.
   const Eigen::VectorXd H_diag2 = (Eigen::VectorXd(3) << 6.0, 7.0, 9.0).finished();
   const double rho2 = 7.0;
   prec.arm(G, G_tr, H_diag2, active_K, active_W, B_rm, f.mu, rho2, /*rebuild=*/false,
@@ -304,10 +301,8 @@ TEST(DirectFactorization, LdltPatchesTopLeftBlockOnRhoOnlyChangeWithoutPatternCh
   prec.compute(0);
   ASSERT_EQ(prec.fact_count(), 1);
 
-  // Same shape as the chol test above, but LDLT's -H_act sits directly on P_hat's diagonal (no
-  // matrix product), so a rho-only change should be a cheap in-place patch, not a full triplet
-  // rebuild -- verified indirectly here via correctness; the patch-vs-rebuild code path itself is
-  // exercised by construction (numeric_dirty_ is false: prec_pattern_changed/size are unchanged).
+  // LDLT version of the test above: -H_act sits on P_hat's diagonal, so a rho-only change is an
+  // in-place patch (numeric_dirty_ is false); checked via correctness.
   const Eigen::VectorXd H_diag2 = (Eigen::VectorXd(3) << 6.0, 7.0, 9.0).finished();
   const double rho2 = 7.0;
   prec.arm(G, G_tr, H_diag2, active_K, active_W, B_rm, f.mu, rho2, /*rebuild=*/false,
@@ -379,12 +374,9 @@ TEST(SmwBranch, SmwActivatesOnSingleKFlipWithEverythingElseRetained) {
 }
 
 TEST(SmwBranch, RejectsSmwWhenRhoChangedSinceSnapshotEvenWithNonzeroRankDelta) {
-  // Companion to SmwActivatesOnSingleKFlipWithEverythingElseRetained: same single-K-flip delta
-  // (which alone would be SMW-eligible, rank=1), but rho also changed since the snapshot. The
-  // low-rank update only recomputes H_diag-derived values for the flipped index (column 2); it
-  // implicitly reuses P_old (factorized against the snapshot's rho) for everything else -- e.g.
-  // column 0/1's contribution to the capacitance math. A rho drift silently invalidates that
-  // reuse, so this must be rejected at the gate and fall back to a full, correct rebuild.
+  // Companion to SmwActivatesOnSingleKFlipWithEverythingElseRetained: the same rank-1 K flip, but
+  // rho also changed since the snapshot. The update reuses P_old (factorized with the old rho)
+  // outside the flipped column, so it must be rejected at the gate and fall back to a full rebuild.
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});  // s stays 1 throughout
   const SpMat G = DenseToSparse(G_dense);
@@ -398,8 +390,7 @@ TEST(SmwBranch, RejectsSmwWhenRhoChangedSinceSnapshotEvenWithNonzeroRankDelta) {
   prec.compute(0);
   ASSERT_EQ(prec.fact_count(), 1);
 
-  // Same single-K-flip delta as the companion test, but rho also changed (standing in for
-  // H_diag's active-K entries drifting on top of the flip).
+  // Same K flip as the companion test, plus a rho change.
   const std::vector<bool> active_k2 = {true, true, false};
   const BoolArr active_K2 = ToBoolArr(active_k2);
   const Eigen::VectorXd H_diag2 = (Eigen::VectorXd(3) << 6.0, 7.0, 9.0).finished();
@@ -421,10 +412,8 @@ TEST(SmwBranch, RejectsSmwWhenRhoChangedSinceSnapshotEvenWithNonzeroRankDelta) {
 }
 
 TEST(SmwBranch, RejectsSmwWhenMuChangedSinceSnapshotEvenWithNonzeroRankDelta) {
-  // Companion to the rho version above: same single-K-flip delta, but mu changes instead (rho
-  // fixed). Unlike rho, mu doesn't affect H_diag on active_K entries at all (H_diag's mu term
-  // is mu*(1-diag_P_K), which is exactly 0 there), so H_diag itself is unchanged here but due to
-  // the (1/mu)I block, there is a full-rank shift.
+  // As above, but mu changes instead of rho. H_diag is unchanged on active_K (its mu term
+  // mu*(1-diag_P_K) is 0 there), but the (1/mu)I block shifts at full rank.
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});  // s stays 1 throughout
   const SpMat G = DenseToSparse(G_dense);
@@ -828,9 +817,8 @@ TEST(FinishFactorization, LdltFullRebuildAcrossSizeChangeMatchesDenseOnBothFacto
 }
 
 TEST(FinishFactorization, SmwAfterLdltFullRebuildMatchesDense) {
-  // Companion to SmwActivatesOnSingleKFlipWithEverythingElseRetained, but for the LDLT branch:
-  // solve_smw() reads n_act_ from the snapshot taken by finish_factorization() after the initial
-  // full LDLT build, so this exercises that n_act_ (not just s_current_) survives the LDLT path.
+  // LDLT version of SmwActivatesOnSingleKFlipWithEverythingElseRetained: solve_smw() reads n_act_
+  // as set by the last full LDLT build.
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});  // s stays 1 throughout
   const SpMat G = DenseToSparse(G_dense);
@@ -951,13 +939,12 @@ TEST(FinishFactorization, ScratchBuffersResetCorrectlyAcrossProblemSizeChange) {
 
 // ===================== diagonal-patch index cache (diag_idx_chol_ / ldlt_diag_*_idx_ / ldlt_act_idx_) =====================
 //
-// These caches store flat storage-index offsets into sol.P/sol.P_hat's valuePtr() array,
-// used by the mu/rho-only patch paths to write via valuePtr()[idx] (O(1)) instead of coeffRef(i,i) 
-// (O(log nnz)). This index write is tested by comparing the cached offset directly against
-// an independently-computed &P.coeffRef(i,i) - P.valuePtr() ground truth, not just via solve().
+// These caches hold diagonal entries' indices into sol.P/sol.P_hat's valuePtr(), used by the
+// mu/rho-only patch paths. Tests compare them against &P.coeffRef(i,i) - P.valuePtr() directly,
+// not just via solve().
 //
-// Fixture shape used throughout: active_K = {true, false, true} (n_act=2), active_W = {true, true}
-// (s=3), so n_act != s and a top/bottom-block or index mix-up is actually detectable.
+// Fixture: active_K = {true, false, true} (n_act=2), active_W = {true, true} (s=3), so n_act != s
+// and a top/bottom-block mix-up is detectable.
 
 TEST(DiagonalPatchIndexCache, CholDiagIdxPointsAtTrueDiagonalEntriesAfterFullRebuild) {
   Fixture f;
@@ -995,8 +982,7 @@ TEST(DiagonalPatchIndexCache, CholDiagIdxSurvivesUnchangedAcrossConsecutiveMuOnl
   prec.compute(0);
   const std::vector<int> diag_idx_before = SchurPreconditionerTestPeer::diag_idx_chol(prec);
 
-  // Same G/H_diag/active_K/rho, only mu changes: factorize_by_chol()'s cheap diagonal-shift path
-  // (numeric_dirty_ stays false), so diag_idx_chol_ must not be touched at all.
+  // Only mu changes: the diagonal-shift path (numeric_dirty_ stays false) must not touch diag_idx_chol_.
   const double mu2 = 8.0;
   prec.arm(G, G_tr, f.H_diag, active_K, active_W, B_rm, mu2, f.rho, /*rebuild=*/false,
            /*prec_pattern_changed=*/false, /*use_ldlt=*/false);
@@ -1004,9 +990,8 @@ TEST(DiagonalPatchIndexCache, CholDiagIdxSurvivesUnchangedAcrossConsecutiveMuOnl
 
   EXPECT_EQ(SchurPreconditionerTestPeer::diag_idx_chol(prec), diag_idx_before);
 
-  // If the cache pointed at the wrong entry, the patch would silently write to entry j instead of i,
-  // and this independent coeffRef(i,i) O(log nnz) lookup into the TRUE (i,i) slot would still
-  // read the stale, un-patched value here.
+  // A wrong cached index would patch another entry, leaving the true (i,i) value (read here via
+  // coeffRef) stale.
   auto& P = SchurPreconditionerTestPeer::chol_P(prec);
   const Eigen::MatrixXd P2 = DenseSchurComplement(G_dense, f.H_diag, active_k, mu2);
   for (int i = 0; i < 3; ++i)
@@ -1034,9 +1019,8 @@ TEST(DiagonalPatchIndexCache, CholDiagIdxRebuildsWithNewSizeAndAddressesAcrossPa
   const SpMat G2_tr = DenseToSparse(G2_dense.transpose());
   const BoolArr active_W2 = ToBoolArr({true, false});
 
-  // force_rebuild=true: this single-row addition would otherwise be SMW-eligible (like
-  // SmwBranch::SmwHandlesSingleWRowAddition) and bypass factorize_by_chol() entirely; force a
-  // genuine full rebuild to test diag_idx_chol_'s from-scratch reconstruction specifically.
+  // force_rebuild=true: this row addition is otherwise SMW-eligible (see
+  // SmwBranch::SmwHandlesSingleWRowAddition); force a full rebuild to test diag_idx_chol_'s reconstruction.
   prec.arm(G2, G2_tr, f.H_diag, active_K, active_W2, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/true, /*use_ldlt=*/false, /*force_rebuild=*/true);
   prec.compute(0);
@@ -1049,11 +1033,9 @@ TEST(DiagonalPatchIndexCache, CholDiagIdxRebuildsWithNewSizeAndAddressesAcrossPa
 }
 
 TEST(DiagonalPatchIndexCache, CholDiagIdxRebuildsOnRhoOnlyChangeDespiteLookingLikeAPatch) {
-  // Regression test for the chol/ldlt asymmetry:
-  // unlike LDLT, a rho-only change on the Cholesky path is NOT a cheap patch -- E = 1/H_diag is
-  // nonlinear in rho, so factorize_by_chol()'s guard is "numeric_dirty_ || rho_changed", fully
-  // reassigning sol.P (a fresh object) and rebuilding diag_idx_chol_ from scratch. A test that
-  // assumed rho-only behaves like mu-only here would silently be exercising the rebuild path.
+  // Unlike LDLT, a rho-only change on the Cholesky path is a full rebuild (E = 1/H_diag is nonlinear
+  // in rho; the guard is "numeric_dirty_ || rho_changed"), so sol.P is reassigned and
+  // diag_idx_chol_ rebuilt from scratch.
   Fixture f;
   const std::vector<bool> active_k = {true, false, true};
   const Eigen::MatrixXd G_dense = f.StackG({true, true});
@@ -1187,9 +1169,9 @@ TEST(DiagonalPatchIndexCache, LdltDiagIdxRebuildsWithNewSizesAcrossActiveSetPatt
   const BoolArr active_K2 = ToBoolArr(active_k2);
   const BoolArr active_W2 = ToBoolArr({true, false});
 
-  // force_rebuild=true: the combined K-flip + W-row-deletion delta here is otherwise SMW-eligible
-  // (see SmwBranch::SmwHandlesSimultaneousKFlipAndWRowAddAndDelete); force a genuine full rebuild
-  // to test the index caches' from-scratch reconstruction specifically.
+  // force_rebuild=true: this K-flip + W-row-deletion delta is otherwise SMW-eligible (see
+  // SmwBranch::SmwHandlesSimultaneousKFlipAndWRowAddAndDelete); force a full rebuild to test the
+  // index caches' reconstruction.
   prec.arm(G2, G2_tr, f.H_diag, active_K2, active_W2, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/true, /*use_ldlt=*/true, /*force_rebuild=*/true);
   prec.compute(0);
@@ -1263,8 +1245,8 @@ TEST(DiagonalPatchIndexCache, LdltActIdxReflectsNewActiveKAfterPatternChange) {
   prec.arm(G, G_tr, f.H_diag, active_K1, active_W, B_rm, f.mu, f.rho, true, true, /*use_ldlt=*/true);
   prec.compute(0);
 
-  // force_rebuild=true: a 2-column K flip is otherwise SMW-eligible (rank 2, within threshold);
-  // force a genuine full rebuild to test ldlt_act_idx_'s from-scratch reconstruction specifically.
+  // force_rebuild=true: a 2-column K flip is otherwise SMW-eligible (rank 2); force a full rebuild
+  // to test ldlt_act_idx_'s reconstruction.
   const BoolArr active_K2 = ToBoolArr({true, true, false});
   prec.arm(G, G_tr, f.H_diag, active_K2, active_W, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/true, /*use_ldlt=*/true, /*force_rebuild=*/true);
@@ -1335,9 +1317,9 @@ TEST(CachedRowCounts, NActUpdatesOnLdltFullRebuildWithDifferentActiveKCount) {
   prec.compute(0);
   ASSERT_EQ(SchurPreconditionerTestPeer::n_act(prec), 2);
 
-  // force_rebuild=true: a single K flip is otherwise SMW-eligible and would leave n_act_ pinned
-  // (see NActStaysPinnedToLastFullRebuildAcrossAnSmwActiveKFlip below); force a genuine full
-  // rebuild here to test that n_act_ DOES update when one actually happens.
+  // force_rebuild=true: a single K flip is otherwise SMW-eligible and would leave n_act_ unchanged
+  // (see NActStaysPinnedToLastFullRebuildAcrossAnSmwActiveKFlip below); force a full rebuild to
+  // test that n_act_ updates.
   const BoolArr active_K2 = ToBoolArr({true, true, true});
   prec.arm(G, G_tr, f.H_diag, active_K2, active_W, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/true, /*use_ldlt=*/true, /*force_rebuild=*/true);
@@ -1346,11 +1328,9 @@ TEST(CachedRowCounts, NActUpdatesOnLdltFullRebuildWithDifferentActiveKCount) {
 }
 
 TEST(CachedRowCounts, NActStaysPinnedToLastFullRebuildAcrossAnSmwActiveKFlip) {
-  // n_act_ is only ever written by finish_factorization() on a full rebuild; a successful SMW
-  // update (finalize_smw_success()) never touches it, even though the true active-K count has
-  // changed. solve_smw() still reads the pinned value correctly (see the companion
-  // FinishFactorization::SmwAfterLdltFullRebuildMatchesDense test) -- this pins down the raw
-  // member value itself, not just the downstream solve() correctness.
+  // n_act_ is written only by finish_factorization() on a full rebuild, so an SMW update leaves it
+  // at the old active-K count, as solve_smw() expects (see
+  // FinishFactorization::SmwAfterLdltFullRebuildMatchesDense). This checks the member value itself.
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});  // s stays 1 throughout
   const SpMat G = DenseToSparse(G_dense);
@@ -1389,9 +1369,8 @@ TEST(CachedRowCounts, MRowsComputedOnceFromFirstArmCallWithNonzeroRows) {
 }
 
 TEST(CachedRowCounts, MRowsStaysConstantAcrossLaterCallsWithDifferentActiveWCounts) {
-  // Once set, M_rows_ is frozen: set_data()'s guard is `M_rows_ < 0 && G.rows() > 0`, so it is
-  // never recomputed on later calls even if a (synthetic, here) G/active_W combination would
-  // produce a different value if recomputed from scratch.
+  // Once set, M_rows_ is frozen (set_data()'s guard is `M_rows_ < 0 && G.rows() > 0`), even if a
+  // later G/active_W would imply a different value.
   Fixture f;
   const Eigen::MatrixXd G1_dense = f.StackG({false, false});
   const SpMat G1 = DenseToSparse(G1_dense);
@@ -1404,8 +1383,7 @@ TEST(CachedRowCounts, MRowsStaysConstantAcrossLaterCallsWithDifferentActiveWCoun
   prec.set_data(G1, G1_tr, f.H_diag, active_K, active_W1, B_rm, f.mu, f.rho, true, true);
   ASSERT_EQ(SchurPreconditionerTestPeer::M_rows(prec), 1);
 
-  // A synthetic 4-row G with only 1 active_W row would naively recompute to M_rows=3 if the guard
-  // didn't freeze it -- deliberately inconsistent with the fixture's real equality-row count.
+  // A synthetic 4-row G with 1 active_W row would recompute to M_rows=3, unlike the fixture's real count.
   const Eigen::MatrixXd G2_dense = Eigen::MatrixXd::Identity(4, 3);
   const SpMat G2 = DenseToSparse(G2_dense);
   const SpMat G2_tr = DenseToSparse(G2_dense.transpose());
@@ -1439,9 +1417,8 @@ TEST(CachedRowCounts, MRowsRemainsUnsetUntilFirstNonzeroRowGCallThenLatches) {
 
 TEST(CachedRowCounts, SetNumEqualityRowsPinsMRowsImmediatelyEvenWithZeroRowG) {
   // Unlike set_data()'s lazy inference (MRowsRemainsUnsetUntilFirstNonzeroRowGCallThenLatches
-  // above), set_num_equality_rows() pins M_rows_ up front -- exactly the fix for the bug where a
-  // G.rows() == 0 first call (no equality rows and no active W rows yet) left M_rows_ at -1 and
-  // spuriously disabled SMW via smw_gate_open()'s MissingData check.
+  // above), set_num_equality_rows() sets M_rows_ up front, so a first call with G.rows() == 0
+  // doesn't leave M_rows_ at -1 and disable SMW (MissingData).
   Prec prec;
   prec.set_num_equality_rows(0);
   EXPECT_EQ(SchurPreconditionerTestPeer::M_rows(prec), 0);
@@ -1492,8 +1469,7 @@ TEST(CachedRowCounts, SCurrentTracksRowCountAcrossFullRebuildAndSmwRowCountChang
   ASSERT_TRUE(prec.used_smw());
   EXPECT_EQ(SchurPreconditionerTestPeer::s_current(prec), 3);
 
-  // A genuine no-op re-arm of the same G2/active_W2/mu/rho must NOT see a spurious size_changed --
-  // direct evidence s_current_ was correctly refreshed by finalize_smw_success(), not left stale.
+  // A no-op re-arm must not see size_changed, i.e. finalize_smw_success() refreshed s_current_.
   const int fact_count_before = prec.fact_count();
   const int smw_count_before = prec.smw_count();
   prec.arm(G2, G2_tr, f.H_diag, active_K, active_W2, B_rm, f.mu, f.rho, /*rebuild=*/false,
@@ -1545,8 +1521,8 @@ TEST(SmwSnapshotState, StructuralChangeRecopiesGAndActiveSetsOnPatternChangedFul
   const SpMat G2 = DenseToSparse(G2_dense);
   const SpMat G2_tr = DenseToSparse(G2_dense.transpose());
   const BoolArr active_W2 = ToBoolArr({true, false});
-  // force_rebuild=true: this combined K-flip + W-row-deletion delta is otherwise SMW-eligible;
-  // force a genuine full rebuild to test the structural-change re-snapshot specifically.
+  // force_rebuild=true: this K-flip + W-row-deletion delta is otherwise SMW-eligible; force a full
+  // rebuild to test the structural re-snapshot.
   prec.arm(G2, G2_tr, f.H_diag, active_K2, active_W2, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/true, /*use_ldlt=*/false, /*force_rebuild=*/true);
   prec.compute(0);
@@ -1557,11 +1533,9 @@ TEST(SmwSnapshotState, StructuralChangeRecopiesGAndActiveSetsOnPatternChangedFul
 }
 
 TEST(SmwSnapshotState, HDiagOldRefreshesOnLdltRhoOnlyPatchButActiveSetSnapshotDoesNot) {
-  // Load-bearing case: snapshot_state()'s structural_change=false path skips re-copying
-  // G_old_/active_K_old_/active_W_old_ (provably unchanged on a mu/rho-only call)
-  // but always refreshes H_diag_old_/mu_old_/rho_old_, since the cheap diagonal-patch path
-  // also rewrites the live P_hat's (rho-dependent) diagonal without a full rebuild --
-  // H_diag_old_ must track that or the next SMW capacitance solve would be wrong.
+  // snapshot_state(structural_change=false) skips G_old_/active_K_old_/active_W_old_ (unchanged on
+  // a mu/rho-only call) but refreshes H_diag_old_/mu_old_/rho_old_: the diagonal patch rewrites
+  // P_hat's rho-dependent diagonal, and the next SMW capacitance solve needs H_diag_old_ to match.
   Fixture f;
   const std::vector<bool> active_k = {true, false, true};
   const Eigen::MatrixXd G_dense = f.StackG({true, true});
@@ -1591,10 +1565,8 @@ TEST(SmwSnapshotState, HDiagOldRefreshesOnLdltRhoOnlyPatchButActiveSetSnapshotDo
 }
 
 TEST(SmwSnapshotState, MuAndRhoOldRefreshImmediatelyReenablesSmwEligibilityOnNextActiveSetDelta) {
-  // Chains mu_old_/rho_old_'s refresh with real SMW eligibility: if mu_old_ were left stale at the
-  // pre-patch value, the third call's gate would incorrectly reject with MuChangedSinceSnapshot
-  // even though mu has been stable since the second call -- a two-step build-then-patch test
-  // cannot see this, only a three-step one can.
+  // Needs three steps: if the patch left mu_old_ stale, the third call's gate would wrongly reject
+  // with MuChangedSinceSnapshot although mu has not changed since the second call.
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});  // s stays 1 throughout
   const SpMat G = DenseToSparse(G_dense);
@@ -1714,10 +1686,8 @@ TEST(ShouldRetryAfterFailure, ShouldRetryAfterFailureReturnsTrueAndRecordsFailur
 // ===================== SMW: cumulative multi-step updates & threshold boundaries =====================
 
 TEST(SmwCumulativeUpdates, ConsecutiveSmwUpdatesAccumulateRankAgainstOriginalSnapshot) {
-  // Successive successful SMW calls all diff against the snapshot from the last full rebuild, not
-  // against each other -- so smw_last_rank() after N consecutive single-K-flip SMW calls reads N
-  // (cumulative), and every intermediate solve() must still match dense ground truth for the
-  // current active set even though the cached factorization is still the original one.
+  // Consecutive SMW calls diff against the last full-rebuild snapshot, not each other: after N
+  // single-K-flip calls smw_last_rank() is N, and every solve() must still match the dense ground truth.
   Fixture f;
   const Eigen::MatrixXd G_dense = f.StackG({false, false});  // s stays 1 throughout
   const SpMat G = DenseToSparse(G_dense);
@@ -1903,9 +1873,8 @@ TEST(SmwCumulativeUpdates, SmwRejectsWithNoSnapshotAfterFailStreakClearsSnapshot
   prec.reset_smw_fail_streak();
   ASSERT_FALSE(prec.smw_suppressed());
 
-  // When the fail-streak hit its threshold, record_smw_rebuild() cleared G_old_.
-  // So although has_snapshot_ is still true even with the streak reset (only release() clears that),
-  // (!has_snapshot_ || G_old_.rows() == 0) hits its second half and rejects the SMW update.
+  // The fail streak made record_smw_rebuild() clear G_old_. has_snapshot_ is still true (only
+  // release() clears it), so the gate rejects via G_old_.rows() == 0 && snapshot_wiped_by_fail_streak_.
   prec.arm(G, G_tr, f.H_diag, active_K2, active_W, B_rm, f.mu, f.rho, /*rebuild=*/true,
            /*prec_pattern_changed=*/false, false);
   prec.compute(0);
@@ -2125,11 +2094,9 @@ TEST(DegenerateActiveSet, SmwHandlesSimultaneousKFlipAndWRowAddAndDelete) {
 }
 
 TEST(DegenerateActiveSet, SmwFallsBackWhenCapacitanceMatrixIsSingular) {
-  // Two candidate W rows with identical coefficients, both newly activated in the same delta (q=2):
-  // their V_plus_ columns are identical, so the capacitance matrix's added-row block is
-  // exactly rank-1 up to the (1/mu) regularization -- with mu large enough that regularization is
-  // negligible relative to the sqrt(eps) rank-detection threshold, the block is detected as singular
-  // and try_build_smw() falls back to a full rebuild.
+  // Two identical W rows activated together (q=2): the capacitance's added-row block is rank-1 up
+  // to (1/mu)I, and with mu large that is below the sqrt(eps) pivot threshold, so try_build_smw()
+  // falls back to a full rebuild.
   Eigen::MatrixXd A_row(1, 3);
   A_row << 1.0, 1.0, 1.0;
   Eigen::MatrixXd B_rows(2, 3);
@@ -2169,10 +2136,9 @@ TEST(DegenerateActiveSet, SmwFallsBackWhenCapacitanceMatrixIsSingular) {
 }
 
 TEST(DegenerateActiveSet, SmwSucceedsFromLegitimatelyEmptyZeroByZeroSnapshot) {
-  // M_rows = 0 (a 0x3 "A"): no equality constraints. Two candidate W rows, both inactive at the
-  // first build, so G is a genuine 0x0 matrix -- not a snapshot wiped by record_smw_rebuild()'s
-  // fail-streak path. A subsequent W-row activation must still be able to use SMW against this
-  // legitimately-empty snapshot instead of being falsely rejected as NoSnapshot.
+  // M_rows = 0 (a 0x3 "A") and both W rows inactive at the first build, so G has 0 rows: an empty
+  // snapshot, not a wiped one. A later W-row activation must use SMW against it, not reject it as
+  // NoSnapshot.
   Eigen::MatrixXd B_rows(2, 3);
   B_rows << 1.0, 0.0, 0.0,
             0.0, 1.0, 0.0;
@@ -2221,10 +2187,8 @@ TEST(DegenerateActiveSet, SmwSucceedsFromLegitimatelyEmptyZeroByZeroSnapshot) {
 // ===================== public-API edge cases: alternate constructor, release() =====================
 
 TEST(PublicApiEdgeCases, MissingDataReasonWhenSetDataNeverCalled) {
-  // The 5-arg constructor sets G_/G_tr_/H_diag_/active_K_/mu_ directly, bypassing set_data()/
-  // arm() entirely -- so active_W_/B_rm_ stay null and M_rows_ stays -1 forever. A full
-  // factorization only needs G_/H_diag_/active_K_/mu_, so this is a legitimate way to use
-  // the class purely as a direct Cholesky/LDLT preconditioner with SMW permanently disabled.
+  // The 5-arg constructor bypasses set_data()/arm(), so active_W_/B_rm_ stay null and M_rows_
+  // stays -1: a plain Cholesky/LDLT preconditioner with SMW disabled.
   Fixture f;
   const std::vector<bool> active_k = {true, true, true};
   const Eigen::MatrixXd G_dense = f.StackG({false, false});
@@ -2242,8 +2206,8 @@ TEST(PublicApiEdgeCases, MissingDataReasonWhenSetDataNeverCalled) {
   const Eigen::MatrixXd P = DenseSchurComplement(G_dense, f.H_diag, active_k, f.mu);
   EXPECT_TRUE(prec.solve(b).isApprox(P.colPivHouseholderQr().solve(b), kTol));
 
-  // rebuild_ is now correctly cleared after a successful factorization, so a second compute()
-  // call with nothing changed is a no-op -- no redundant refactorization.
+  // rebuild_ is cleared after a successful factorization, so a second compute() with nothing
+  // changed is a no-op.
   prec.compute(0);
   EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::None);
@@ -2280,12 +2244,9 @@ TEST(PublicApiEdgeCases, ReleaseIsSafeOnFreshObjectAndIdempotent) {
 }
 
 // ===================== scratch-buffer leakage (state-poisoning) =====================
-// try_build_smw() reuses several private scratch buffers (smw_tmp_, smw_ldlt_padded_, Y_all_,
-// r_pad_) across calls via zero_resize(), which only re-zeroes a buffer when its size changes.
-// When two consecutive SMW updates have identical rank/shape, correctness depends entirely on 
-// the class's own logic overwriting every entry that matters. These tests deliberately
-// poison the buffers with NaN/Inf between two same-shape SMW calls (simulating reused/garbage
-// heap memory) and prove the second call's result is still correct.
+// try_build_smw() reuses scratch buffers (smw_tmp_, smw_ldlt_padded_, Y_all_, r_pad_) across calls;
+// zero_resize() only re-zeroes on a size change. These tests poison the buffers with NaN/Inf
+// between two same-shape SMW calls and check the second result is still correct.
 
 namespace {
 
@@ -2311,10 +2272,8 @@ struct LeakageFixture {
   }
 };
 
-// Y_all_ is resized (not zero-filled) then written column-by-column across its entire column
-// range every call, and r_pad_/smw_ldlt_padded_ are cleared via an unconditional setZero() (not
-// zero_resize()) every call -- so all three are expected to come out clean regardless of prior
-// content, even when zero_resize() itself would have no-opped on a same-size reuse.
+// Y_all_ is fully overwritten every call and r_pad_/smw_ldlt_padded_ are setZero()'d every call,
+// so all three come out clean regardless of prior content.
 void PoisonFullyOverwrittenBuffers(Prec& prec, bool use_ldlt) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
@@ -2331,11 +2290,8 @@ void PoisonFullyOverwrittenBuffers(Prec& prec, bool use_ldlt) {
   }
 }
 
-// smw_tmp_ is different: zero_resize() no-ops on a same-size reuse, and compute_y_all() only
-// ever writes/clears the single (or few) entries it touches per basis vector -- every other
-// entry is assumed to already be zero, an invariant maintained purely by the previous call
-// having correctly reset its own touched entries, not by any defensive clear on entry. Poisoning
-// the whole vector (as "reused garbage heap memory" would look) violates that assumption.
+// smw_tmp_ is different: compute_y_all() only writes and clears the entries it touches, relying on
+// the rest being zero from the previous call. Poisoning the whole vector breaks that invariant.
 void PoisonSmwTmpScratch(Prec& prec) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
@@ -2360,12 +2316,10 @@ struct LeakageDelta2 {
   }
 };
 
-// Drives `prec` through Epoch A (full rebuild) then delta #1 (a rank-2 SMW update), verified
-// against dense ground truth. `prec` is not copyable/movable (it holds a non-relocatable
-// std::variant of Eigen factorizations), so it's taken and left armed by reference; `f`/`B_rm`
-// must outlive `prec` (arm() stores pointers, though not across this call -- delta #1's own G/
-// active_K/active_W locals are re-pointed-away-from by the next arm() call before anything would
-// dereference them again).
+// Drives `prec` through Epoch A (full rebuild) and delta #1 (a rank-2 SMW update), checked against
+// dense ground truth. `prec` is not copyable or movable, so it is taken by reference and left armed.
+// arm() stores pointers: `f`/`B_rm` must outlive `prec`, and delta #1's locals dangle after return,
+// which is safe only because the caller's next arm() re-points them.
 void ArmThroughEpochAAndDelta1(Prec& prec, const LeakageFixture& f, const RowMajorSpMat& B_rm,
                                 bool use_ldlt) {
   // Epoch A: full rebuild. All K active; W rows 0 and 1 active, row 2 inactive.
@@ -2403,9 +2357,8 @@ void ArmThroughEpochAAndDelta1(Prec& prec, const LeakageFixture& f, const RowMaj
 
 }  // namespace
 
-// Poisons only the buffers that are unconditionally fully overwritten every call (Y_all_,
-// r_pad_, smw_ldlt_padded_). Delta #2 is expected to complete cleanly via SMW, proving those
-// buffers' correctness never depended on zero_resize()'s size-triggered clear.
+// Poisons only the fully overwritten buffers (Y_all_, r_pad_, smw_ldlt_padded_); delta #2 must
+// still succeed via SMW.
 static void RunFullyOverwrittenBufferScenario(bool use_ldlt) {
   LeakageFixture f;
   const RowMajorSpMat B_rm = f.B_rm();
@@ -2524,9 +2477,7 @@ TEST(SnapshotDesync, RapidActiveSetOscillationNeverDriftsFromSnapshotClassificat
   EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
-  // Step 2: revert K col 2 -- exactly back to the snapshot's own state. Must be recognized as
-  // rank 0 (not silently treated as "still rank 1" or some other stale value), so the
-  // snapshot's factorization is exactly P and is reused without refactorizing.
+  // Step 2: revert K col 2, back to the snapshot: rank 0, so the snapshot's factorization is reused.
   step(k_base, w_base);
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 1);
@@ -2546,17 +2497,14 @@ TEST(SnapshotDesync, RapidActiveSetOscillationNeverDriftsFromSnapshotClassificat
   EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
-  // Step 5: deactivate W row 0 again (back to matching the snapshot) and flip K col 0 off in
-  // the same call. rank=1 (only the K flip contributes; the W row is back to its snapshot
-  // state).
+  // Step 5: deactivate W row 0 (back to the snapshot) and flip K col 0 off: rank=1 (the K flip only).
   step({false, true, true}, {false, false});
   EXPECT_TRUE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 1);
 
-  // Step 6: revert everything -- exactly back to the snapshot's state again. Must be recognized
-  // as rank 0 a second time, proving the zero-delta detection doesn't "wear out" or drift after
-  // repeated oscillation; the snapshot's factorization is reused again.
+  // Step 6: revert everything to the snapshot again: rank 0 a second time, so zero-delta detection
+  // doesn't drift with repeated oscillation.
   step(k_base, w_base);
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 1);
@@ -2568,9 +2516,8 @@ TEST(SnapshotDesync, LongDeterministicOscillationMatchesIndependentlyComputedRan
   Fixture f;
   const RowMajorSpMat B_rm = f.B_rm();
 
-  // Each state is (K0, K1, K2, W0, W1). Includes a revisited non-snapshot state (s1 == s3) and
-  // two exact returns to the live snapshot (s8 == s0, s14 == s8), each of which must be
-  // recognized as rank 0 and reuse the snapshot's factorization rather than silently drifting.
+  // Each state is (K0, K1, K2, W0, W1). Includes a revisited non-snapshot state (s1 == s3) and two
+  // returns to the live snapshot (s8 == s0, s14 == s8), which must read as rank 0.
   struct State {
     bool k0, k1, k2, w0, w1;
   };
@@ -2648,12 +2595,9 @@ TEST(SnapshotDesync, LongDeterministicOscillationMatchesIndependentlyComputedRan
 }
 
 // ===================== zero-row Schur complement (0x0 P / trivial P_hat row-block) =====================
-// s = G.rows() can legitimately be 0 (M_rows_ == 0 and no active W rows). solve_direct()'s
-// LDLT .tail(0), finalize_smw_success()'s z_new_.resize(s_new) with s_new == 0, and
-// solve_smw()'s empty-range head()/tail() assignments are all untested at s == 0 elsewhere in
-// this file -- DegenerateActiveSet.SmwSucceedsFromLegitimatelyEmptyZeroByZeroSnapshot builds a
-// 0-row G but never calls solve() on it directly, and never drives an *SMW update* down to
-// exactly 0 rows (only up, from 0).
+// s = G.rows() can be 0 (M_rows_ == 0 and no active W rows). These tests cover solve_direct()'s
+// LDLT .tail(0), finalize_smw_success() with s_new == 0, and solve_smw()'s empty head()/tail()
+// ranges, including an SMW update down to 0 rows.
 
 TEST(ZeroRowSchurComplement, DirectSolveOnZeroRowGCholesky) {
   Eigen::MatrixXd B_rows(2, 3);
@@ -2685,9 +2629,7 @@ TEST(ZeroRowSchurComplement, DirectSolveOnZeroRowGCholesky) {
 }
 
 TEST(ZeroRowSchurComplement, DirectSolveOnZeroRowGLdlt) {
-  // For LDLT, s=0 does NOT make P_hat empty -- it collapses to just the -H_act block (n_act x
-  // n_act), since the G_act/(1/mu)I blocks vanish with s=0. This exercises factoring and
-  // solving that non-trivial-but-zero-row-space P_hat.
+  // For LDLT, s=0 leaves P_hat = -H_act (n_act x n_act), since the G_act and (1/mu)I blocks vanish.
   Eigen::MatrixXd B_rows(2, 3);
   B_rows << 1.0, 0.0, 0.0,
             0.0, 1.0, 0.0;
@@ -2759,10 +2701,9 @@ TEST(ZeroRowSchurComplement, SmwDeletionLandsExactlyOnZeroRows) {
 }
 
 TEST(ZeroRowSchurComplement, SmwCumulativeAdditionsFromZeroRowSnapshot) {
-  // Companion to DegenerateActiveSet.SmwSucceedsFromLegitimatelyEmptyZeroByZeroSnapshot, taken
-  // one step further: a *second* SMW addition still measured against the same s_old_==0
-  // snapshot (an SMW-only update never calls snapshot_state()), so Y_all_/V_plus_ get built
-  // with zero rows twice in a row, landing at a genuinely non-trivial s_new == 2.
+  // Extends DegenerateActiveSet.SmwSucceedsFromLegitimatelyEmptyZeroByZeroSnapshot with a second
+  // SMW addition against the same s_old_ == 0 snapshot, so Y_all_/V_plus_ are built with zero rows
+  // twice and s_new reaches 2.
   Eigen::MatrixXd B_rows(2, 3);
   B_rows << 1.0, 0.0, 0.0,
             0.0, 1.0, 0.0;
@@ -2821,19 +2762,15 @@ TEST(ZeroRowSchurComplement, SmwCumulativeAdditionsFromZeroRowSnapshot) {
 }
 
 // ===================== near-singular capacitance: realistic (non-exact) perturbations =====================
-// Companion to DegenerateActiveSet.SmwFallsBackWhenCapacitanceMatrixIsSingular, which only
-// covers exactly-identical rows. Real data is rarely exactly degenerate -- these check that the
-// sqrt(eps)-thresholded rank detection in factorize_capacitance() behaves sensibly on
-// realistic near-degenerate data: a perturbation far below the threshold should still read as
-// singular, and one comfortably above it should not be a false-positive rejection.
+// Extends DegenerateActiveSet.SmwFallsBackWhenCapacitanceMatrixIsSingular (exactly identical rows)
+// to near-degenerate data: a perturbation far below factorize_capacitance()'s sqrt(eps) threshold
+// must still read as singular, and one well above it must not be rejected.
 
 TEST(NearSingularCapacitance, SubEpsilonRowPerturbationStillReadsAsSingular) {
   Eigen::MatrixXd A_row(1, 3);
   A_row << 1.0, 1.0, 1.0;
-  // Row 1 differs from row 0 by 1e-15 in a *second* column (not a scalar rescale of the same
-  // column -- scaling column 0 alone would keep the two rows exactly parallel, hence exactly
-  // rank-1, for *any* scale factor, never actually testing the threshold). sqrt(eps) ~= 1.49e-8
-  // for double, so 1e-15 is ~7 orders of magnitude below it.
+  // Row 1 differs from row 0 by 1e-15 in a second column (rescaling column 0 would keep the rows
+  // exactly parallel). 1e-15 is ~7 orders of magnitude below sqrt(eps) ~= 1.49e-8.
   Eigen::MatrixXd B_rows(2, 3);
   B_rows << 1.0, 0.0,     0.0,
             1.0, 1e-15,   0.0;
@@ -2975,11 +2912,9 @@ TEST(NearSingularCapacitance, EquilibrationKeepsAWellConditionedMixedUpdateAtLar
 }
 
 // ===================== randomized Cholesky/LDLT cross-check =====================
-// DirectFactorization.LdltAndCholeskyPathsAgreeOnIdenticalData only exercises the tiny
-// 3-column Fixture (s up to 2). A larger, seeded-random system stresses factorize_by_chol's
-// G*E*G_tr assembly against factorize_by_ldlt's augmented P_hat assembly together, at a scale
-// where a subtle indexing/sign bug in one path but not the other is more likely to surface.
-// The seed is a fixed literal for full reproducibility across runs/platforms.
+// A larger, fixed-seed random system than DirectFactorization.LdltAndCholeskyPathsAgreeOnIdenticalData's
+// 3-column fixture, cross-checking factorize_by_chol's G*E*G_tr assembly against factorize_by_ldlt's
+// P_hat assembly.
 
 TEST(RandomizedCholLdltConsistency, FiftyColumnRandomSystemCholeskyAndLdltAgree) {
   std::mt19937 rng(12345);

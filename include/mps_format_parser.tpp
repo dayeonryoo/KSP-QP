@@ -2,37 +2,22 @@
 #include "mps_format_parser.hpp"
 
 // Default choices of the parser:
-//  - Column bounds: default is [0, +inf) unless overridden by a BOUNDS entry.
-//    A negative UP value with no other explicit lower-bound entry (LO/FX/MI/BV/FR)
-//    for that column relaxes the lower bound to -inf.
-//  - Row bounds: E/L/G rows follow [rhs-|range|, rhs+|range|];
-//    a RANGES entry's sign is ignored (only its magnitude matters).
-//    A second N-type row (i.e. not the objective) is always free (-inf, +inf),
-//    and any RHS or RANGES entry against it is accepted but silently ignored.
-//  - Objective: the first N row encountered becomes the objective row;
-//    a file with no N row at all gets an implicit "OBJ" row.
-//    An RHS entry naming the objective row is added to obj_const,
-//    and obj_const is negated during problem formulation (by to_kspqp())
-//    since it was read off the RHS side of the equation.
-//  - RHS/RANGES/BOUNDS set names (e.g. "RHS", "BND") are read only to
-//    determine token layout on a given line; they are never validated for
-//    consistency across lines, so a second block under a different set
-//    name still applies on top of the first.
-//  - Duplicate entries for the same (row, col) in COLUMNS, or the same
-//    (row, col) pair in QUADOBJ, are summed rather than overwritten or
-//    rejected. QUADOBJ is stored lower-triangular only: (i, j) with i < j
-//    is swapped to (j, i), and the upper triangle is never populated.
-//  - Format detection (fixed vs. free columns) happens once per file, from
-//    the first value-bearing line: fixed-column parsing is attempted first,
-//    and the file is only concluded to be free-format if that fixed-column
-//    reading disagrees with a whitespace-delimited reading of the same
-//    line. Once decided, the format is used for the rest of the file --
-//    except that any individual line whose tokens overflow the fixed fields
-//    is read free-format regardless, since the fixed reading would silently
-//    truncate it (see fixed_fields_would_truncate()).
-//  - Bounds/RHS/RANGES magnitudes at or beyond to_kspqp()'s inf_cap are
-//    treated as infinite, and lower/upper pairs within eq_tol of each other
-//    are snapped to their exact midpoint (inclusive at diff == eq_tol).
+//  - Column bounds: [0, +inf) unless set in BOUNDS. A negative UP with no explicit
+//    lower-bound entry (LO/FX/MI/BV/FR) for that column sets the lower bound to -inf.
+//  - Row bounds: E = [rhs-|range|, rhs+|range|], L = [rhs-|range|, rhs],
+//    G = [rhs, rhs+|range|]; a RANGES entry's sign is ignored.
+//    N rows other than the objective are free; RHS/RANGES entries on them are ignored.
+//  - Objective: the first N row, or an implicit "OBJ" row if there is none. An RHS entry
+//    on it is added to obj_const, which to_kspqp() negates since it comes from the RHS.
+//  - RHS/RANGES/BOUNDS set names only determine a line's token layout; they are not
+//    checked across lines, so a second set applies on top of the first.
+//  - Duplicate (row, col) entries in COLUMNS or QUADOBJ are summed. QUADOBJ is stored
+//    lower-triangular: (i, j) with i < j is swapped to (j, i).
+//  - Fixed vs. free format is decided once per file, from the first value-bearing line:
+//    fixed unless its fixed-column and whitespace readings disagree. A line whose tokens
+//    overflow the fixed fields is read free-format regardless (fixed_fields_would_truncate()).
+//  - In to_kspqp(), magnitudes >= inf_cap are infinite. Column bounds within eq_tol
+//    (inclusive) are snapped to their midpoint; rows within eq_tol become equalities.
 
 template <typename T>
 ParsedModel<T> MpsFormatParser<T>::parse(const std::string& filename) {
@@ -143,8 +128,7 @@ KSPQPdata<T> MpsFormatParser<T>::to_kspqp(const ParsedModel<T>& model, T eq_tol,
     pd.m = (int)eq_rows.size();
     pd.l = (int)ineq_rows.size();
 
-    // Map each original row to its compacted index within its partition (-1 if in neither, i.e. a free row).
-    // Mutually exclusive, so between them every row of model.A is claimed by at most one of pd.A/pd.B below.
+    // Original row -> compacted index within its partition (-1 if not in it; free rows are in neither).
     std::vector<int> eq_row_map(model.num_rows, -1), ineq_row_map(model.num_rows, -1);
 
     pd.b = Vec(pd.m);
@@ -161,12 +145,9 @@ KSPQPdata<T> MpsFormatParser<T>::to_kspqp(const ParsedModel<T>& model, T eq_tol,
         pd.uw(i) = model.row_upper(r);
     }
 
-    // Construct A (equality rows) and B (inequality rows) together in a single pass over model.A.
-    // eq_row_map/ineq_row_map partition its nonzeros between the two, so together they hold at most nnz(model.A) entries.
-    // Since model.A's InnerIterator is already column-major with strictly increasing row indices
-    // -- a property eq_row_map/ineq_row_map preserve within each partition -- 
-    // the fill pass can append straight into pd.A/pd.B's compressed storage
-    // via reserve()+startVec()+insertBack(), skipping the Triplet stage entirely.
+    // Build A (equality rows) and B (inequality rows) in one pass over model.A. Row indices stay
+    // increasing within each column after remapping, so entries go straight into compressed
+    // storage via insertBack(), with no triplets.
     Eigen::Index eq_nnz = 0, ineq_nnz = 0;
     for (int col = 0; col < model.A.outerSize(); ++col)
         for (typename SpMat::InnerIterator it(model.A, col); it; ++it) {
@@ -334,8 +315,7 @@ void MpsFormatParser<T>::parse_rhs(const std::vector<std::string_view>& tokens) 
         throw std::runtime_error("Malformed RHS line: expected at least 2 tokens, got " +
                                   std::to_string(tokens.size()) + ".");
 
-    // The RHS set name (if present) is read only to detect which token layout this line uses;
-    // it is not tracked or validated across lines.
+    // With 3 or 5 tokens, tokens[0] is the RHS set name; skip it.
     const size_t start_idx = (tokens.size() == 3 || tokens.size() == 5) ? 1 : 0;
 
     // Ensure rhs_values is large enough to hold the RHS for all constraints.
@@ -430,9 +410,9 @@ void MpsFormatParser<T>::parse_bounds(const std::vector<std::string_view>& token
 
         if (!needs_value) {
             // Value-less types (FR/MI/PL/BV) have no value field, so the standard
-            // layout <type> <bound_name> <col_name> is the default reading.  Fall back
-            // to <type> <col_name> <value> only when tokens[2] cannot be a column name
-            // (unknown *and* numeric) while tokens[1] is a known column.
+            // layout <type> <bound_name> <col_name> is the default reading.
+            // Fall back to <type> <col_name> <value> only when tokens[2] cannot be
+            // a column name (unknown *and* numeric) while tokens[1] is a known column.
             // BOUNDS follows COLUMNS, so col_map_ already holds every real column;
             // is_number() alone must not decide, or numeric column names (e.g. DPKLO1,
             // whose columns are named "1".."133") get mistaken for bound values.
@@ -587,7 +567,7 @@ void MpsFormatParser<T>::finalize_row_bounds() {
         T range = std::abs(range_values_[i]);
         // E: [rhs - |range|, rhs + |range|]
         // L: [rhs - |range|, rhs]
-        // G: [rhs, rhs + |range|)
+        // G: [rhs, rhs + |range|]
         // N: free
 
         if (type == 'E') {
@@ -786,18 +766,11 @@ void MpsFormatParser<T>::split_free_by_section(const std::vector<std::string_vie
     }
 }
 
-// True if reading `line` by fixed columns would chop a token in half: some token
-// begins inside one of the six fixed fields but runs past that field's end.
-//
-// Such a line cannot be expressed in the fixed layout at all, so the fixed reading
-// is guaranteed wrong -- and wrong silently, since a truncated number usually still
-// parses.  Values written at full double precision are the common case:
-// "1.1305249478260869e+01" does not fit the 12-column value field and would be read
-// as "1.1305249478", losing the exponent and with it a factor of ten.
-//
-// A name with embedded spaces -- the one thing fixed format buys you -- splits into
-// tokens that each sit wholly inside their field, so this stays false for the files
-// that genuinely need fixed-column parsing.
+// True if reading `line` by fixed columns would cut a token: some token starts inside a fixed
+// field but runs past its end. The fixed reading is then silently wrong, since a truncated number
+// usually still parses: "1.1305249478260869e+01" overflows the 12-column value field and would be
+// read as "1.1305249478". Names with embedded spaces (the reason for fixed format) split into
+// tokens that each fit inside their field, so they are unaffected.
 template <typename T>
 bool MpsFormatParser<T>::fixed_fields_would_truncate(std::string_view line,
                                                       const std::vector<std::string_view>& toks) {
@@ -816,16 +789,13 @@ bool MpsFormatParser<T>::fixed_fields_would_truncate(std::string_view line,
 
 template <typename T>
 void MpsFormatParser<T>::tokenize_line(const std::string& line, Section sec) {
-    // Format is decided once per file by decide_format_from(), but a single line whose
-    // tokens overflow the fixed fields is read free regardless: the fixed reading of
-    // such a line would silently truncate. Files mixing the two are rare but legal,
-    // and this keeps the override local instead of reinterpreting the whole file.
+    // A line whose tokens overflow the fixed fields is read free-format even in a fixed-format file.
     if (format_ == Format::FREE || fixed_fields_would_truncate(line, ws_tokens_)) {
         split_free_by_section(ws_tokens_, sec, tokens_); // reuse this line's whitespace split
         return;
     }
 
-    // Otherwise, try fixed-format first, but validate that the number of tokens is correct for the section.
+    // Otherwise read fixed-format, falling back to free if the token count is wrong for the section.
     split_fixed_by_section(line, sec, tokens_);
 
     auto ok_for_section = [&](const std::vector<std::string_view>& t) {
