@@ -45,6 +45,10 @@ Outputs
   files pair up on (M, N, loop_mode, step, rep); in the "shared" loop mode every run solves
   the same instances (same reference trajectory), which xbar_norm confirms.
 
+  mpc_kspqp.csv also has ksp_mode (pcg or direct) and KSP-QP's factorization log and run-time
+  split (experimental; see include/solve_profile.hpp). With --trace, KSP-QP's per-event /
+  per-SSN-iteration / per-PMM-iteration rows go to mpc_kspqp_trace_{events,ssn,pmm}.csv.
+
 === HOW TO RUN ===
   python3 benchmark_mpc.py --out 0926              # -> results/0926_mpc_{kspqp,qpalm}.csv
   python3 benchmark_mpc.py --solver ksp-qp --out 0926   # rerun KSP-QP only, keep 0926_mpc_qpalm.csv
@@ -85,11 +89,12 @@ from benchmark_common import (
     provenance,
     check_header,
     replace_rows,
+    trace_rows,
 )
 import mpc_generator as mg
 
-SCHEMA_VERSION = 3          # bump on any CSV_FIELDS or file-layout change; old CSVs are not appendable
-                            # (3: one file per solver)
+SCHEMA_VERSION = 4          # bump on any CSV_FIELDS or file-layout change; old CSVs are not appendable
+                            # (3: one file per solver; 4: mpc_kspqp.csv adds KSPQP_EXTRA)
 
 # Sweep grid. The cross product is filtered by MAX_NZ, which drops only the
 # top-right corner (large M *and* large N simultaneously).
@@ -167,8 +172,8 @@ def _solve_osqp_x(qpalm_data: tuple, tol: float, time_limit: float):
 
 
 def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int,
-                   direct: bool = False):
-    r = ksp_qp_bind.solve_from_data(pdd, tol, max_iter, time_limit, direct=direct)
+                   direct: bool = False, trace: bool = False):
+    r = ksp_qp_bind.solve_from_data(pdd, tol, max_iter, time_limit, direct=direct, trace=trace)
     result = {
         "status": int(r["status"]),
         "solved": int(r["status"] == 0),
@@ -182,13 +187,17 @@ def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int,
         "fact": int(r["fact"]),
         "smw_count": int(r["smw_count"]),
         "tol_achieved": float(r["pmm_tol_achieved"]),
+        "ksp_mode": "direct" if direct else "pcg",
+        **{k: r[k] for k in KSPQP_EXTRA if k != "ksp_mode"},
     }
+    if trace:
+        result["_trace"] = {t: r[f"trace_{t}"] for t in TRACE_TABLES}
     return result, np.asarray(r["x"], dtype=np.float64)
 
 
-def _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct=False):
+def _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct=False, trace=False):
     if solver_name == "ksp-qp":
-        return _solve_kspqp_x(pdd, tol, time_limit, max_iter, direct)
+        return _solve_kspqp_x(pdd, tol, time_limit, max_iter, direct, trace)
     if solver_name == "qpalm":
         return _solve_qpalm_x(kspqp_to_qpalm(pdd), tol, time_limit, pdd.get("obj_const", 0.0))
     raise ValueError(f"Unknown solver_name: {solver_name}")
@@ -233,8 +242,9 @@ def _set_high_qos():
 
 
 def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_iter,
-                    solvers, direct, conn):
+                    solvers, direct, trace, conn):
     rows = []
+    traces = []  # (step and repeat, KSP-QP's trace tables) per traced solve
     try:
         _set_high_qos()
         sysm = mg.platoon_system(M)
@@ -255,8 +265,10 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
                     xbar = xbar_source[t] if loop_mode == "shared" else state[solver_name]
                     pdd = mg.generate_mpc_qp(sysm, N, xbar)
                     t0 = time.perf_counter()
-                    result, x = _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct)
+                    result, x = _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct, trace)
                     wall = time.perf_counter() - t0
+                    if "_trace" in result:
+                        traces.append(({"step": t, "rep": rep}, result.pop("_trace")))
 
                     rows.append({
                         "M": M, "N": N, "step": t, "rep": rep,
@@ -269,7 +281,7 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
                     if loop_mode == "own" and rep == reps - 1 and t < T - 1:
                         u0 = x[sysm.n_x:sysm.n_x + sysm.n_u]
                         state[solver_name] = mg.step_dynamics(sysm, state[solver_name], u0)
-        conn.send({"rows": rows})
+        conn.send({"rows": rows, "traces": traces})
     except Exception as e:
         conn.send({"error": f"{type(e).__name__}: {e}"})
     conn.close()
@@ -300,13 +312,23 @@ CSV_FIELDS = [
     "outer_iter", "inner_iter", "krylov_iter", "fact", "smw_count",
 ]
 
+# mpc_kspqp.csv also has KSP-QP's mode and its factorization log and run-time split
+# (experimental; include/solve_profile.hpp): fact_<reason>, smw_update, ..., t_<phase>.
+KSPQP_EXTRA = ["ksp_mode", "ssn_tol_achieved", "linesearch_fail", "krylov_fail",
+               "kkt_ldlt_fact", "schur_chol_fact", *ksp_qp_bind.profile_columns()]
+FIELDS = {"ksp-qp": CSV_FIELDS + KSPQP_EXTRA, "qpalm": CSV_FIELDS}
+
+# --trace: KSP-QP's per-event / per-SSN-iteration / per-PMM-iteration rows, led by the
+# configuration key and (step, rep), in mpc_kspqp_trace_<table>.csv.
+TRACE_TABLES = ("events", "ssn", "pmm")
+
 
 def _provenance() -> dict:
     return {"schema_version": SCHEMA_VERSION, **provenance()}
 
 
 def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
-               prov, cooldown=0.0, loop_mode="shared", direct=False) -> None:
+               prov, cooldown=0.0, loop_mode="shared", direct=False, trace_paths=None) -> None:
     sysm = mg.platoon_system(M)
     pdd0 = mg.generate_mpc_qp(sysm, N, sysm.xbar0)
     n_z = int(pdd0["n"])
@@ -325,17 +347,23 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
 
     out = _run_isolated(_worker_rollout,
                         (M, N, loop_mode, xbar_source, T, reps, tol, time_limit,
-                         max_iter, solvers, direct))
+                         max_iter, solvers, direct, bool(trace_paths)))
     if "error" in out:
         print(f"    ERROR - {out['error']}", flush=True)
         for s in solvers:
             replace_rows(csv_paths[s], [{**meta, "solver": s, "status": -99, "solved": 0}],
-                         CONFIG_KEY, CSV_FIELDS)
+                         CONFIG_KEY, FIELDS[s])
         return
 
     for s in solvers:
         replace_rows(csv_paths[s], [{**meta, **r} for r in out["rows"] if r["solver"] == s],
-                     CONFIG_KEY, CSV_FIELDS)
+                     CONFIG_KEY, FIELDS[s])
+    if trace_paths and out["traces"]:
+        config = {k: meta[k] for k in CONFIG_KEY}
+        for table, path in trace_paths.items():
+            columns = list(out["traces"][0][1][table])
+            rows = [row for key, tables in out["traces"] for row in trace_rows(tables[table], {**config, **key})]
+            replace_rows(path, rows, CONFIG_KEY, [*CONFIG_KEY, "step", "rep", *columns])
 
     # Timed repeats: discard repeat 0 (allocator / page-fault warm-up), report the
     # minimum of the rest -- the least scheduler-contaminated estimate for a
@@ -381,6 +409,9 @@ def main() -> None:
     parser.add_argument("--direct", action="store_true",
                         help="Run KSP-QP with its experimental direct solver (LDLT on K or "
                              "Cholesky on its Schur complement) instead of PCG")
+    parser.add_argument("--trace", action="store_true",
+                        help="Also write KSP-QP's per-event, per-SSN-iteration and per-PMM-iteration "
+                             "rows to mpc_kspqp_trace_{events,ssn,pmm}.csv (experimental)")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -395,8 +426,10 @@ def main() -> None:
 
     # Never mix schema versions in one file -- that is how the archived CSVs ended up
     # with columns that no longer exist.
-    for p in csv_paths.values():
-        check_header(p, CSV_FIELDS)
+    for s, p in csv_paths.items():
+        check_header(p, FIELDS[s])
+    trace_paths = ({t: result_dir / f"{name_prefix}mpc_kspqp_trace_{t}.csv" for t in TRACE_TABLES}
+                   if args.trace and "ksp-qp" in solvers else None)
 
     configs = sweep_configs(args.M, args.N, args.max_nz)
     prov = _provenance()
@@ -407,7 +440,7 @@ def main() -> None:
     for i, (M, N) in enumerate(configs, 1):
         print(f"\n[{i}/{len(configs)}]")
         run_config(M, N, args.T, args.reps, args.tol, args.time_limit, max_iter,
-                   solvers, csv_paths, prov, args.cooldown, args.loop_mode, args.direct)
+                   solvers, csv_paths, prov, args.cooldown, args.loop_mode, args.direct, trace_paths)
 
     print("\nResults written to: " + ", ".join(str(p) for p in csv_paths.values()))
 

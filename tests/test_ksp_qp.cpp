@@ -1734,6 +1734,27 @@ namespace {
 // Direct-mode bookkeeping: no Krylov work, every factorization is K's or S's, and at most one
 // factorization per Newton solve (iterative refinement, unchanged matrices and SMW updates reuse it;
 // a rejected SMW update is replaced by exactly one). Every SMW update is the direct solver's.
+// The profile accounts for every factorization, SMW update and PCG failure, and its disjoint phases
+// add up to the run time.
+void ExpectProfileAccounting(const KSP_QP<double>& ns, const Solution<double>& sol) {
+  const SolveProfile& p = ns.profile;
+  EXPECT_EQ(p.fact_total(), sol.fact);
+  EXPECT_EQ(p.smw_update, sol.smw_count);
+  EXPECT_EQ(p.pcg_fail, sol.krylov_fail);
+  EXPECT_LE(p.fact_analyzed, sol.fact);
+  EXPECT_LE(p.krylov_refine, sol.krylov_iter);
+  const SolvePhases& t = p.t;
+  for (double v : {t.setup, t.prep, t.fact, t.lowrank, t.krylov, t.direct_solve, t.linesearch, t.update,
+                   t.analyze, t.prec_apply, t.prec_apply_smw, t.refine})
+    EXPECT_GE(v, 0.0);
+  EXPECT_GE(t.ssn_other, 0.0);  // the two remainders: negative would mean a phase was counted twice
+  EXPECT_GE(t.pmm_other, 0.0);
+  EXPECT_NEAR(t.setup + t.ssn_total() + t.pmm_other, sol.run_time, 1e-9);
+  EXPECT_LE(t.analyze, t.fact);
+  EXPECT_LE(t.prec_apply_smw, t.prec_apply);
+  EXPECT_LE(t.prec_apply, t.krylov);
+}
+
 void ExpectDirectModeAccounting(const KSP_QP<double>& ns, const Solution<double>& sol) {
   EXPECT_EQ(sol.krylov_iter, 0);
   EXPECT_FALSE(ns.pcg_failed);
@@ -1741,6 +1762,39 @@ void ExpectDirectModeAccounting(const KSP_QP<double>& ns, const Solution<double>
   EXPECT_LE(sol.fact, sol.ssn_iter + sol.pmm_iter + 1);
   EXPECT_EQ(sol.smw_count, ns.direct_smw_count);
   EXPECT_LE(ns.direct_smw_reject, ns.direct_smw_count);
+  ExpectProfileAccounting(ns, sol);
+}
+
+// A random feasible QP (half of Q's diagonal zero) with box and two-sided inequality constraints,
+// large enough that the active sets keep changing within SSN runs.
+Problem<double> RandomFeasibleQp() {
+  std::mt19937 rng(2024);
+  std::uniform_real_distribution<double> unit(-1.0, 1.0);
+  std::uniform_real_distribution<double> prob(0.0, 1.0);
+  const int n = 40, m = 8, l = 20;
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(m, n), B = Eigen::MatrixXd::Zero(l, n);
+  for (int i = 0; i < m; ++i)
+    for (int j = 0; j < n; ++j)
+      if (prob(rng) < 0.3) A(i, j) = unit(rng);
+  for (int i = 0; i < l; ++i)
+    for (int j = 0; j < n; ++j)
+      if (prob(rng) < 0.3) B(i, j) = unit(rng);
+  Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(n, n);
+  Vec c(n), x_feas(n);
+  for (int j = 0; j < n; ++j) {
+    if (prob(rng) < 0.5) Q(j, j) = 2.0 * prob(rng);
+    c(j) = unit(rng);
+    x_feas(j) = 0.5 * unit(rng);
+  }
+  const Vec b = A * x_feas;
+  const Vec Bx = B * x_feas;
+  Vec lw(l), uw(l);
+  for (int i = 0; i < l; ++i) {
+    lw(i) = Bx(i) - 0.2 * prob(rng);
+    uw(i) = Bx(i) + 0.2 * prob(rng);
+  }
+  return MakeProblem(n, m, l, DenseToSparse(Q), DenseToSparse(A), DenseToSparse(B), c, b, 0.0,
+                     Vec::Constant(n, -1.0), Vec::Constant(n, 1.0), lw, uw);
 }
 
 }  // namespace
@@ -1870,35 +1924,7 @@ TEST(KspQpSolveDirectMode, DefaultModeNeverUsesTheDirectSolverWhenPcgSucceeds) {
 }
 
 TEST(KspQpSolveDirectMode, SmwUpdatesReachTheSameOptimumAsRefactorizingAndPcg) {
-  // A random feasible QP (half of Q's diagonal zero) with box and two-sided inequality constraints,
-  // large enough that the active sets keep changing within SSN runs.
-  std::mt19937 rng(2024);
-  std::uniform_real_distribution<double> unit(-1.0, 1.0);
-  std::uniform_real_distribution<double> prob(0.0, 1.0);
-  const int n = 40, m = 8, l = 20;
-  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(m, n), B = Eigen::MatrixXd::Zero(l, n);
-  for (int i = 0; i < m; ++i)
-    for (int j = 0; j < n; ++j)
-      if (prob(rng) < 0.3) A(i, j) = unit(rng);
-  for (int i = 0; i < l; ++i)
-    for (int j = 0; j < n; ++j)
-      if (prob(rng) < 0.3) B(i, j) = unit(rng);
-  Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(n, n);
-  Vec c(n), x_feas(n);
-  for (int j = 0; j < n; ++j) {
-    if (prob(rng) < 0.5) Q(j, j) = 2.0 * prob(rng);
-    c(j) = unit(rng);
-    x_feas(j) = 0.5 * unit(rng);
-  }
-  const Vec b = A * x_feas;
-  const Vec Bx = B * x_feas;
-  Vec lw(l), uw(l);
-  for (int i = 0; i < l; ++i) {
-    lw(i) = Bx(i) - 0.2 * prob(rng);
-    uw(i) = Bx(i) + 0.2 * prob(rng);
-  }
-  auto problem = MakeProblem(n, m, l, DenseToSparse(Q), DenseToSparse(A), DenseToSparse(B), c, b, 0.0,
-                              Vec::Constant(n, -1.0), Vec::Constant(n, 1.0), lw, uw);
+  auto problem = RandomFeasibleQp();
 
   KSP_QP<double> pcg(problem);
   ASSERT_FALSE(pcg.setup_failed);
@@ -1925,4 +1951,80 @@ TEST(KspQpSolveDirectMode, SmwUpdatesReachTheSameOptimumAsRefactorizingAndPcg) {
   EXPECT_EQ(refactorizing.direct_smw_count, 0);
   EXPECT_GT(smw.direct_smw_count, 0) << "the SMW run never updated; this comparison would be vacuous";
   EXPECT_LT(sol_smw.fact, sol_refactorizing.fact);  // the updates replaced refactorizations
+}
+
+// ===================== factorization log and run-time split =====================
+
+namespace {
+
+const char* ModeName(int mode) { return mode == 0 ? "PCG" : mode == 1 ? "direct, SMW" : "direct, refactorizing"; }
+
+void SetMode(KSP_QP<double>& ns, int mode) {
+  ns.direct_solve = mode != 0;
+  ns.direct_smw = mode != 2;
+}
+
+}  // namespace
+
+TEST(KspQpSolveProfile, AccountsForEveryFactorizationAndTheWholeRunTime) {
+  const auto problem = RandomFeasibleQp();
+  for (const int mode : {0, 1, 2}) {
+    SCOPED_TRACE(ModeName(mode));
+    KSP_QP<double> ns(problem);
+    ASSERT_FALSE(ns.setup_failed);
+    SetMode(ns, mode);
+    const auto sol = ns.solve();
+    ASSERT_EQ(sol.opt, TerminationStatus::Optimal);
+    ExpectProfileAccounting(ns, sol);
+    EXPECT_EQ(ns.profile.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);
+    EXPECT_GT(ns.profile.fact_by_reason[static_cast<int>(FactReason::MuRho)], 0);  // mu ramps up
+  }
+}
+
+TEST(KspQpSolveProfile, TraceRowsMatchTheCountersAndLeaveTheResultsUnchanged) {
+  const auto problem = RandomFeasibleQp();
+  for (const int mode : {0, 1, 2}) {
+    SCOPED_TRACE(ModeName(mode));
+    KSP_QP<double> plain(problem), traced(problem);
+    SetMode(plain, mode);
+    SetMode(traced, mode);
+    traced.trace.enabled = true;
+    const auto sol = plain.solve();
+    const auto sol_t = traced.solve();
+
+    EXPECT_TRUE(plain.trace.events.empty() && plain.trace.ssn.empty() && plain.trace.pmm.empty());
+    EXPECT_EQ(sol_t.opt, sol.opt);
+    EXPECT_EQ(sol_t.pmm_iter, sol.pmm_iter);
+    EXPECT_EQ(sol_t.ssn_iter, sol.ssn_iter);
+    EXPECT_EQ(sol_t.krylov_iter, sol.krylov_iter);
+    EXPECT_EQ(sol_t.fact, sol.fact);
+    EXPECT_EQ(sol_t.smw_count, sol.smw_count);
+    EXPECT_EQ(sol_t.obj_val, sol.obj_val);
+    EXPECT_TRUE(sol_t.x == sol.x);
+    EXPECT_EQ(traced.profile.fact_by_reason, plain.profile.fact_by_reason);
+
+    const auto& tr = traced.trace;
+    EXPECT_EQ(static_cast<int>(tr.pmm.size()), sol.pmm_iter);
+    int steps = 0;
+    for (const auto& row : tr.ssn) {
+      steps += row.ls_outcome == SsnLsOutcome::Step;
+      EXPECT_GE(row.pmm_iter, 1);
+      EXPECT_LE(row.pmm_iter, sol.pmm_iter);
+    }
+    EXPECT_EQ(steps, sol.ssn_iter);
+    int facts = 0, smw = 0, pcg_fail = 0;
+    for (const auto& e : tr.events) {
+      facts += e.action == LinAction::Factorize;
+      smw += e.action == LinAction::SmwUpdate;
+      pcg_fail += e.action == LinAction::PcgFail;
+    }
+    EXPECT_EQ(facts, sol.fact);
+    EXPECT_EQ(smw, sol.smw_count);
+    EXPECT_EQ(pcg_fail, sol.krylov_fail);
+    int pmm_facts = 0;
+    for (const auto& row : tr.pmm) pmm_facts += row.facts;
+    EXPECT_EQ(pmm_facts, sol.fact);
+    ASSERT_FALSE(tr.pmm.empty());
+    EXPECT_EQ(tr.pmm.back().rule, PmmRule::Stop);  // the last PMM iteration ended the run
+  }
 }

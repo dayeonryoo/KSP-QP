@@ -251,7 +251,7 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `max_iter` | `int` | Maximum PMM outer iterations |
 | `time_limit` | `double` | Wall-clock limit in seconds on setup + solve (default `600`) |
 | `when` | `PrintWhen` | `NEVER` / `EVERY10` / `ALWAYS` |
-| `what` | `PrintWhat` | `NONE` / `MINIMAL` / `SSN` / `TUNING` / `FULL` (see ["Tuning: printing and timers"](#tuning-printing-and-timers)) |
+| `what` | `PrintWhat` | `NONE` / `MINIMAL` / `SSN` / `TUNING` / `FULL` (see ["Tuning: printing and profiling"](#tuning-printing-and-profiling)) |
 
 ### C++ `Solution<T>`
 
@@ -314,23 +314,30 @@ residual check rejected. The SMW updates are not used in the fallback after a PC
 
 ### Python `ksp_qp_bind`
 
-**`solve_from_sif(filename, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, direct=False, direct_smw=True)`**
+**`solve_from_sif(filename, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, direct=False, direct_smw=True, trace=False)`**
 Parse and solve a SIF/MPS file. Returns a dict with keys:
 `status`, `obj_val`, `setup_time`, `solve_time`, `run_time`, `pmm_iter`, `ssn_iter`,
 `krylov_iter`, `fact`, `smw_count`, `pmm_tol_achieved`, `system`, `kkt_ldlt_fact`,
-`schur_chol_fact`, `direct_smw_count`, `direct_smw_reject`, `x`, `y1`, `y2`, `z`.
+`schur_chol_fact`, `direct_smw_count`, `direct_smw_reject`, `ssn_tol_achieved`, `linesearch_fail`,
+`krylov_fail`, the profile keys (`profile_columns()`; see
+["Profiling and refactorization log"](#profiling-and-refactorization-log-experimental)), `x`, `y1`,
+`y2`, `z`. With `trace=True` it also returns `trace_events`, `trace_ssn` and `trace_pmm`, each a
+dict of equal-length lists (`pandas.DataFrame(r["trace_ssn"])`).
 `x` and the multipliers are returned in the original, unscaled units, so they can be
 checked directly against the problem data as given. `direct` and `direct_smw` set the
 `KSP_QP<T>` members of the same names (see ["Linear solver"](#linear-solver-for-the-ssn-newton-systems));
 `system` is `"S"` when only PCG ran, otherwise `"D"` followed by `"K"` and/or `"S"` for the
 systems the direct solver factorized.
 
-**`solve_from_data(pd, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, trace_path="", rho_init=-1.0, direct=False, direct_smw=True)`**
+**`solve_from_data(pd, tol=1e-6, max_iter=1_000_000_000, time_limit=600.0, trace_path="", rho_init=-1.0, direct=False, direct_smw=True, trace=False)`**
 Same, but takes already-parsed problem data — the dict returned by `parse_sif()`, or the one
 built by `pde_generator.py` / `mpc_generator.py`. Returns the same keys as `solve_from_sif`.
 `trace_path` is diagnostic-only: when set, it writes a per-iteration CSV trace (active-set
 sizes, `mu`, `rho`, residuals) and turns on per-inner-iteration reporting, which has
 non-trivial overhead — leave it empty for timing runs.
+
+**`profile_columns()`**
+The profile keys returned by the two solve functions, in a fixed order (for CSV headers).
 
 **`parse_sif(filename)`**
 Parse a SIF/MPS file and return problem data as numpy arrays.
@@ -351,7 +358,7 @@ to point at your clone from elsewhere. No editing or rebuilding is needed just t
 ```bash
 ./build/ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all] \
                       [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] \
-                      [--out FILE] [--cooldown S] [--ref FILE]
+                      [--out FILE] [--trace PREFIX] [--cooldown S] [--ref FILE]
 ```
 
 `--set` picks the problem set and, with it, the default input directory, default problem, and
@@ -374,7 +381,9 @@ instead; `--no-direct-smw` additionally turns its SMW updates off (`direct_nosmw
 The sweep is the directory listing, so adding or removing an `.mps` file is all it takes to
 change the set — the same convention `python/benchmark_netlib.py` uses.
 
-Both sets write the same CSV schema (`include/record_result.hpp`). Two columns are read
+Both sets write the same CSV schema (`include/record_result.hpp`); its last columns are the
+profile (see ["Profiling and refactorization log"](#profiling-and-refactorization-log-experimental)),
+and `--trace PREFIX` also writes the trace files `PREFIX_{events,ssn,pmm}.csv`. Two columns are read
 differently per set: on the infeasible set `agree` means "infeasibility was detected" (rather
 than "objective matched"), `abs_err`/`rel_err` are `-1` since there is no objective to compare,
 and `diverged` is always `0` because a large residual is the expected outcome there.
@@ -391,7 +400,7 @@ For a QPALM/OSQP comparison with performance profiles, use `python/benchmark_net
 
 ```bash
 ./build/ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] \
-                              [--direct [--no-direct-smw]] [--out FILE] [--cooldown S]
+                              [--direct [--no-direct-smw]] [--out FILE] [--trace PREFIX] [--cooldown S]
 ```
 
 Solves `<root>/<PROBLEM>.SIF` (default: `data/maros_meszaros/AUG2DCQP.SIF`), printing the
@@ -399,7 +408,8 @@ solution summary. Pass `--name all` to sweep the full Maros-Meszaros set against
 reference objectives, appending a row to `<root>/results/pcg_mm.csv` (override with
 `--out`) for each — `--cooldown` (default 3s) sleeps between problems in this mode, which keeps
 a long sweep from being distorted by CPU thermal throttling. `--direct` and `--no-direct-smw`
-work as for `ksp_qp_netlib` (default CSVs `results/direct_mm.csv` / `results/direct_nosmw_mm.csv`).
+work as for `ksp_qp_netlib` (default CSVs `results/direct_mm.csv` / `results/direct_nosmw_mm.csv`),
+and so do the profile columns and `--trace PREFIX`. A single-problem run also prints the profile.
 
 For comparing against QPALM/OSQP rather than just checking against reference objectives, use
 the Python benchmark instead (see below) — that's what produces performance profiles.
@@ -611,12 +621,12 @@ rebuild while iterating. The Python suite covers the PDE generators (`fem_q1.py`
 
 ---
 
-## Tuning: printing and timers
+## Tuning: printing and profiling
 
-The solver has two independent knobs for diagnosing/tuning performance: **runtime printing**
+The solver has two independent tools for diagnosing/tuning performance: **runtime printing**
 (what gets printed to stdout while solving, controlled by `Problem<T>`'s `when`/`what` fields)
-and a **compile-time step timer** (per-phase wall-clock breakdown of the SSN inner loop,
-printed to stderr).
+and the **profile** (why every factorization happened and where the run time went, recorded as
+data).
 
 ### Runtime printing — `PrintWhen` / `PrintWhat` (`include/printing.hpp`)
 
@@ -644,41 +654,85 @@ PMM/SSN hyperparameters — it shows residuals, `mu`/`rho`/`eps`, and failure co
 Turning printing off (`PrintWhen::NEVER` or `PrintWhat::NONE`) removes the stdout overhead
 entirely, which matters when timing large sweeps.
 
-### Compile-time step timers — `SSN_ENABLE_TIMERS` (`include/ssn.hpp`)
+### Profiling and refactorization log (experimental)
 
-A separate, more granular timer instruments the phases inside each SSN iteration (system prep,
-linear solve, preconditioner assembly/analyze/factorize, Krylov solve, LDLT fallback,
-line search, state update). It is gated by a macro so it compiles to zero overhead when off:
+Branch `direct-vs-pcg` only (`include/solve_profile.hpp`). Always on; its overhead is a few clock
+reads per SSN iteration and two per PCG iteration.
 
-```cpp
-// include/ssn.hpp
-#ifndef SSN_ENABLE_TIMERS
-#define SSN_ENABLE_TIMERS 0   // set to 1 to enable
-#endif
-```
+**Per run** (`KSP_QP<T>::profile` after `solve()`): it appears as the last columns of the C++
+drivers' CSVs, as keys of the Python solve functions' dict, and in `mm_kspqp.csv` /
+`mpc_kspqp.csv`. It has:
 
-Enable it either by editing that line directly, or by passing the define at configure time
-without touching the source:
+- **`fact_<reason>`**: the factorizations, of the PCG preconditioner or of the direct solver, by
+  why they were done. They add up to `fact`.
+- **Other counts:**
+  - `fact_analyzed`: the factorizations that included a symbolic analysis.
+  - `smw_update` (= `smw_count`): the Newton systems solved through an SMW update instead.
+  - `smw_reuse`: the systems solved with the last factorization as is.
+  - `pcg_fail` (= `krylov_fail`).
+  - `krylov_refine`: the Krylov iterations spent in iterative refinement.
+  - `ls_steepest`: the steepest-descent line-search retries.
+- **`t_<phase>`**: the run time split into disjoint phases that add up to `run_time` (see below).
 
-```bash
-cmake -B build -DCMAKE_CXX_FLAGS="-DSSN_ENABLE_TIMERS=1"
-cmake --build build --config Release
-```
+| reason | why the factorization was done |
+|---|---|
+| `initial` | first factorization of the run (direct mode: of the direct solver) |
+| `mu_rho` | mu and/or rho changed since the last factorization |
+| `rank` | the active sets moved too far from the last factorization's for an SMW update (rank > 50) |
+| `singular` | the SMW capacitance matrix was (near-)singular |
+| `pcg_fail` | PCG failed through an SMW-updated preconditioner, so it was rebuilt in full and retried |
+| `suppressed` | SMW updates were off after 5 failures in a row (until the next PMM iteration) |
+| `no_snapshot` | no factorization to update from (snapshot wiped after a fail streak, or invalidated) |
+| `switch` | switch between Cholesky and LDLT (preconditioner callback, or the direct solver's system) |
+| `direct_fallback` | PCG failed for good: first factorization of the direct solver |
+| `active_set` | direct solver without SMW updates (after a PCG failure, or `--no-direct-smw`): the active sets changed |
+| `smw_residual` | direct mode: an SMW-updated solve failed the 1e-10 residual check |
+| `chol_failed` | Cholesky on S failed, so LDLT on K took over |
 
-When enabled, every SSN iteration prints a line like this to **stderr** (independent of the
-`PrintWhen`/`PrintWhat` settings above):
+When several reasons apply, the first in the order the SMW checks run wins: a forced rebuild,
+the method, the snapshot, rho, mu, the rank, then the capacitance matrix. The trace keeps the
+change flags.
 
-```
-[Timer] ssn_iter=3 total=0.1234s | prep=0.0012 linear_solve=0.1180 (prec_setup=0.0500 [assembly=0.0100 analyze=0.0150 factorize=0.0250] krylov_solve=0.0680) linesearch=0.0030 state_update=0.0012
-```
+| phase | contents |
+|---|---|
+| `t_setup` | `KSP_QP` constructor (scaling, factor of Q, ...) |
+| `t_prep` | building each Newton system: active sets, H, G, right-hand side, factorization choice |
+| `t_fact` | full factorizations: assembly, symbolic analysis, numeric factorization |
+| `t_lowrank` | SMW update setups, accepted or not |
+| `t_krylov` | PCG solves (main and refinement), preconditioner applications included |
+| `t_direct_solve` | the direct solver's triangular solves, plain or through an SMW update |
+| `t_linesearch` | exact line search and its steepest-descent retry |
+| `t_update` | iterate update, gradient, SSN termination check |
+| `t_ssn_other` | rest of the Newton solves (dx recovery, refinement residuals, bookkeeping) |
+| `t_pmm_other` | rest of `solve()` (residual norms, multipliers, penalties, infeasibility checks) |
 
-If the direct solver ran (direct mode, or after PCG failed), further lines report its breakdown:
-`kkt_ldlt` (LDLT on the KKT system: analyze/factorize/solve), `schur_chol` (Cholesky on the
-Schur complement: assembly/analyze/factorize/solve) and `direct_smw` (SMW updates of either
-factorization: setup/solves). This is the tool to use when profiling
-*where* time goes inside the solver (e.g. preconditioner factorization vs. CG iterations);
-`PrintWhat::TUNING` is the tool for watching *convergence behavior* (residuals, PMM parameters)
-across iterations.
+The last four columns are informational parts of these phases:
+- `t_analyze` is part of `t_fact`;
+- `t_prec_apply`, and `t_prec_apply_smw` within it, are part of `t_krylov`;
+- `t_refine` is all of iterative refinement.
+
+**Trace** (opt-in: `KSP_QP<T>::trace.enabled = true`, the drivers' `--trace PREFIX`, Python
+`trace=True`, or the benchmarks' `--trace`):
+
+- **`events`**: one row per factorization, SMW update or reuse, and PCG failure. Each row has:
+  - its PMM and SSN iteration;
+  - `target` (`prec` | `direct`), `action`, `reason`, `method` (`chol` | `ldlt`);
+  - the SMW rank and its parts h/p/q;
+  - mu and rho, and whether mu, rho or the active sets changed;
+  - the time spent;
+  - for a PCG failure, its kind, iterations and error.
+- **`ssn`**: one row per SSN iteration, including one that ended at the line search without a step
+  (`ls_outcome`). Each row has:
+  - the active-set sizes and flips;
+  - the main solve's setup and reason;
+  - Krylov iterations, step size and gradient norm;
+  - the phases.
+- **`pmm`**: one row per PMM iteration. Each row has:
+  - the SSN status;
+  - mu, rho and the SSN tolerance before and after, with the update rule
+    (`x2` / `x0.5` / `x1.1` / `keep` / `stop`);
+  - the four residual norms;
+  - the factorizations, SMW updates and Krylov iterations in that iteration, and its time.
 
 ---
 
@@ -695,6 +749,7 @@ KSP-QP/
 │   ├── schur_operator.hpp              # Schur complement as a matrix-free linear operator
 │   ├── schur_preconditioner.hpp        # preconditioner (factorization reuse, SMW low-rank updates)
 │   ├── schur_smw_update.hpp            # SMW low-rank updates of the direct solver's factorization
+│   ├── solve_profile.hpp               # factorization log and run-time split (experimental)
 │   ├── problem.hpp                     # Problem<T>: problem data + solver settings
 │   ├── solution.hpp                    # Solution<T> and the TerminationStatus enum
 │   ├── ksp_qp_types.hpp                # ParsedModel / KSPQPdata data structures

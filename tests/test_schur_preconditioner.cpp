@@ -335,6 +335,11 @@ TEST(DirectFactorization, FirstBuildNeverUsesSmwAndIncrementsFactCount) {
 
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 1);
+  EXPECT_TRUE(prec.last_build().ran);
+  EXPECT_TRUE(prec.last_build().initial);
+  EXPECT_EQ(prec.last_build().action, Prec::BuildAction::Factorized);
+  EXPECT_TRUE(prec.last_build().analyzed);
+  EXPECT_EQ(prec.last_build().reject, Prec::SmwRejectReason::None);  // no SMW attempt on a first build
 }
 
 // ===================== SMW branch / edge cases =====================
@@ -364,6 +369,11 @@ TEST(SmwBranch, SmwActivatesOnSingleKFlipWithEverythingElseRetained) {
   EXPECT_EQ(prec.fact_count(), 1);  // no full refactorization needed
   EXPECT_EQ(prec.smw_last_rank(), 1);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::None);
+  EXPECT_FALSE(prec.last_build().initial);
+  EXPECT_EQ(prec.last_build().action, Prec::BuildAction::SmwUpdated);
+  EXPECT_EQ(prec.last_build().rank, 1);
+  EXPECT_EQ(prec.last_build().p, 1);
+  EXPECT_GE(prec.last_build().t_smw_setup, 0.0);
 
   Eigen::VectorXd b(1);
   b << 2.5;
@@ -402,6 +412,10 @@ TEST(SmwBranch, RejectsSmwWhenRhoChangedSinceSnapshotEvenWithNonzeroRankDelta) {
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);  // full rebuild, not a low-rank patch
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RhoChangedSinceSnapshot);
+  EXPECT_TRUE(prec.last_build().rho_changed);
+  EXPECT_FALSE(prec.last_build().mu_changed);
+  EXPECT_EQ(prec.last_build().action, Prec::BuildAction::Factorized);
+  EXPECT_EQ(prec.last_build().rank, -1);  // refused before the delta was classified
 
   Eigen::VectorXd b(1);
   b << 2.5;
@@ -438,6 +452,8 @@ TEST(SmwBranch, RejectsSmwWhenMuChangedSinceSnapshotEvenWithNonzeroRankDelta) {
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);  // full rebuild, not a low-rank patch
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::MuChangedSinceSnapshot);
+  EXPECT_TRUE(prec.last_build().mu_changed);
+  EXPECT_FALSE(prec.last_build().rho_changed);
 
   Eigen::VectorXd b(1);
   b << 2.5;
@@ -559,6 +575,9 @@ TEST(SmwBranch, FallsBackToFullRebuildWhenDeltaRankExceedsThreshold) {
   EXPECT_EQ(prec.fact_count(), 2);
   EXPECT_EQ(prec.smw_last_rank(), N);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankExceedsThreshold);
+  EXPECT_EQ(prec.last_build().action, Prec::BuildAction::Factorized);
+  EXPECT_EQ(prec.last_build().rank, N);
+  EXPECT_EQ(prec.last_build().q, N);
 }
 
 TEST(SmwBranch, ForceFullRebuildBypassesEligibleSmw) {
@@ -584,6 +603,7 @@ TEST(SmwBranch, ForceFullRebuildBypassesEligibleSmw) {
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ForcedRebuild);
+  EXPECT_EQ(prec.last_build().skip_cause, Prec::SkipCause::PcgFailure);
 }
 
 TEST(SmwBranch, RecordSmwRebuildSuppressesSmwAfterFailStreak) {
@@ -613,6 +633,34 @@ TEST(SmwBranch, RecordSmwRebuildSuppressesSmwAfterFailStreak) {
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::Suppressed);
+}
+
+TEST(SmwBranch, ArmWhileSuppressedRecordsSuppressionAsTheCauseOfTheForcedRebuild) {
+  // Through arm(), as SSN calls it, suppression becomes a forced rebuild; last_build() tells it apart
+  // from the retry after a PCG failure (arm(force_rebuild=true)).
+  Fixture f;
+  const Eigen::MatrixXd G_dense = f.StackG({false, false});
+  const SpMat G = DenseToSparse(G_dense);
+  const SpMat G_tr = DenseToSparse(G_dense.transpose());
+  const BoolArr active_W = ToBoolArr({false, false});
+  const RowMajorSpMat B_rm = f.B_rm();
+  const BoolArr active_K1 = ToBoolArr({true, true, true});
+  const BoolArr active_K2 = ToBoolArr({true, true, false});
+
+  Prec prec;
+  prec.arm(G, G_tr, f.H_diag, active_K1, active_W, B_rm, f.mu, f.rho, true, true, false);
+  prec.compute(0);
+  ASSERT_EQ(prec.fact_count(), 1);
+
+  for (int i = 0; i < 5; ++i) prec.record_smw_rebuild();
+  prec.arm(G, G_tr, f.H_diag, active_K2, active_W, B_rm, f.mu, f.rho, /*rebuild=*/true,
+           /*prec_pattern_changed=*/false, false);
+  prec.compute(0);
+
+  EXPECT_FALSE(prec.used_smw());
+  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ForcedRebuild);
+  EXPECT_EQ(prec.last_build().skip_cause, Prec::SkipCause::Suppressed);
 }
 
 TEST(SmwBranch, ResetSmwFailStreakReenablesSmw) {
@@ -695,6 +743,7 @@ TEST(SmwBranch, FactorizationMethodSwitchForcesFullRebuildInsteadOfSmw) {
   EXPECT_FALSE(prec.used_smw());
   EXPECT_EQ(prec.fact_count(), 2);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::FactorizationMethodChanged);
+  EXPECT_TRUE(prec.last_build().ldlt);
   EXPECT_TRUE(prec.used_ldlt_at_last_fact());
 }
 
@@ -753,6 +802,7 @@ TEST(FinishFactorization, ComputeSkipsRefactorizationWhenNothingChangesCholesky)
            /*prec_pattern_changed=*/false, /*use_ldlt=*/false);
   prec.compute(0);
   EXPECT_EQ(prec.fact_count(), 1);
+  EXPECT_FALSE(prec.last_build().ran);  // nothing to log: the factorization is reused as is
 }
 
 TEST(FinishFactorization, ComputeSkipsRefactorizationWhenNothingChangesLdlt) {
@@ -1806,6 +1856,8 @@ TEST(SmwCumulativeUpdates, SmwReusesSnapshotFactorizationOnZeroRankDelta) {
   EXPECT_EQ(prec.fact_count(), 1);
   EXPECT_EQ(prec.smw_last_rank(), 0);
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::ReusedSnapshot);
+  EXPECT_EQ(prec.last_build().action, Prec::BuildAction::ReusedSnapshot);
+  EXPECT_EQ(prec.last_build().rank, 0);
 
   Eigen::VectorXd b(1);
   b << 2.5;

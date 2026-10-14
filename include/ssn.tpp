@@ -165,23 +165,13 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     // Set up preconditioner and call cg.compute().
     // force_rebuild=true skips SMW and recomputes G E G^T from scratch.
     auto setup_prec = [&](bool force_rebuild) {
-        SSN_TIMER_BLOCK(timer_prec_setup);
         cg.preconditioner().arm(G, G_tr, H_diag, active_K, active_W, B_rm, mu, rho,
                                 update_prec, prec_pattern_changed, schur_use_ldlt, force_rebuild);
-#if SSN_ENABLE_TIMERS
-        // TIMER: snapshot SchurPreconditioner's cumulative phase timers so we can diff after compute().
-        const double prec_assembly_before  = cg.preconditioner().assembly_time();
-        const double prec_analyze_before   = cg.preconditioner().analyze_time();
-        const double prec_factorize_before = cg.preconditioner().factorize_time();
-#endif
         cg.compute(S);
-        fact      += cg.preconditioner().consume_fact_count_delta();
+        const int new_facts = cg.preconditioner().consume_fact_count_delta();
+        fact      += new_facts;
         smw_count  = cg.preconditioner().smw_count();
-#if SSN_ENABLE_TIMERS
-        timer_prec_assembly  += cg.preconditioner().assembly_time()  - prec_assembly_before;
-        timer_prec_analyze   += cg.preconditioner().analyze_time()   - prec_analyze_before;
-        timer_prec_factorize += cg.preconditioner().factorize_time() - prec_factorize_before;
-#endif
+        record_prec_build(new_facts);
     };
 
     // Run PCG. Returns false (and counts a krylov_fail) on preconditioner failure or on
@@ -190,25 +180,32 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         if (cg.preconditioner().info() != Eigen::Success) {
             std::cout << "[PCG] CG failed due to preconditioner failure.\n";
             krylov_fail++;
+            record_pcg_fail(PcgFailKind::PrecFailed, 0, std::numeric_limits<double>::quiet_NaN());
             return false;
         }
 
         Vec dy_;
         bool warm_start = (prev_dy_.size() == s); // prev_dy_ is empty on the first SSN iteration or if the active set changed.
         {
-            SSN_TIMER_BLOCK(timer_krylov_solve);
+            const double apply0 = cg.preconditioner().apply_time(), apply_smw0 = cg.preconditioner().apply_smw_time();
+            SSN_TIMER_BLOCK(it_.krylov);
             if (warm_start) {
                 dy_ = cg.solveWithGuess(rhs, prev_dy_);
             } else {
                 dy_ = cg.solve(rhs);
             }
+            it_.prec_apply     += cg.preconditioner().apply_time()     - apply0;
+            it_.prec_apply_smw += cg.preconditioner().apply_smw_time() - apply_smw0;
         }
         krylov_iter += cg.iterations();
+        (in_refinement_ ? it_state_.krylov_refine : it_state_.krylov) += static_cast<int>(cg.iterations());
 
         T err = cg.error();
+        if (!in_refinement_) it_state_.pcg_err = static_cast<double>(err);
         if (cg.info() != Eigen::Success) {
             if (!(err <= T(1e-10))) { // Acceptable error threshold for PCG failure.
                 krylov_fail++;
+                record_pcg_fail(PcgFailKind::NoConvergence, static_cast<int>(cg.iterations()), static_cast<double>(err));
                 return false;
             }
         }
@@ -237,6 +234,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     } catch (const std::bad_alloc&) {
         std::cout << "[PCG] CG failed due to bad_alloc.\n";
         krylov_fail++;
+        record_pcg_fail(PcgFailKind::BadAlloc, -1, std::numeric_limits<double>::quiet_NaN());
         switch_to_direct();
         return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
     }
@@ -254,6 +252,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         } catch (const std::bad_alloc&) {
             std::cout << "[PCG] CG failed due to bad_alloc.\n";
             krylov_fail++;
+            record_pcg_fail(PcgFailKind::BadAlloc, -1, std::numeric_limits<double>::quiet_NaN());
             switch_to_direct();
             return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
         }
@@ -282,7 +281,10 @@ void SSN<T>::decide_direct_system(const SpMat& G) {
     // Same cost model and threshold as the preconditioner's choice, but over all columns:
     // the exact K and S contain every column, not just the active_K ones.
     if (all_cols_.size() != G.cols()) all_cols_ = BoolArr::Constant(G.cols(), true);
+    const bool was_ldlt = direct_use_ldlt;
     direct_use_ldlt = choose_schur_ldlt(G, all_cols_);
+    if (direct_ldlt_decisions_made_ > 0 && direct_use_ldlt != was_ldlt && kkt_ldlt_fact + schur_chol_fact > 0)
+        direct_pending_reason_ = FactReason::MethodSwitch;
     ++direct_ldlt_decisions_made_;
     if (direct_use_ldlt) release_chol(); // no-op unless switching away from the Schur complement
 }
@@ -323,12 +325,43 @@ typename SSN<T>::Vec SSN<T>::solve_direct(const SpMat& G, const SpMat& G_tr, con
         const bool refactor_pending = use_ldlt ? (ldlt_pattern_dirty_ || ldlt_numeric_dirty_)
                                                : (!chol_ || chol_pattern_dirty_ || chol_numeric_dirty_);
         if (direct_smw_enabled() && !direct_force_full_ && refactor_pending) {
-            SSN_TIMER_BLOCK(timer_direct_smw_setup);
-            const auto outcome = direct_smw_.setup(G, H_diag, active_W, B_rm, mu, rho, use_ldlt,
-                                                   direct_base_solve(use_ldlt));
-            if (outcome == SchurSmwUpdate<T>::Outcome::Updated) {
+            using Smw = SchurSmwUpdate<T>;
+            double t_setup = 0.0;
+            typename Smw::Outcome outcome;
+            {
+                SSN_TIMER_BLOCK(t_setup);
+                outcome = direct_smw_.setup(G, H_diag, active_W, B_rm, mu, rho, use_ldlt, direct_base_solve(use_ldlt));
+            }
+            it_.lowrank += t_setup;
+            if (outcome == Smw::Outcome::Rejected) {
+                // The refactorization that follows is logged with the reason the update was refused.
+                switch (direct_smw_.last_reject_reason()) {
+                    case Smw::RejectReason::Suppressed:              direct_pending_reason_ = FactReason::SmwSuppressed; break;
+                    case Smw::RejectReason::BaseChanged:             direct_pending_reason_ = FactReason::MethodSwitch; break;
+                    case Smw::RejectReason::MuChangedSinceSnapshot:
+                    case Smw::RejectReason::RhoChangedSinceSnapshot: direct_pending_reason_ = FactReason::MuRho; break;
+                    case Smw::RejectReason::RankExceedsThreshold:    direct_pending_reason_ = FactReason::RankExceeded; break;
+                    case Smw::RejectReason::SingularCapacitance:
+                    case Smw::RejectReason::NonFinite:               direct_pending_reason_ = FactReason::SingularCapacitance; break;
+                    case Smw::RejectReason::NoSnapshot: // before the first direct factorization: Initial
+                        if (kkt_ldlt_fact + schur_chol_fact > 0) direct_pending_reason_ = FactReason::NoSnapshot;
+                        break;
+                    default:                                         direct_pending_reason_ = FactReason::Other; break;
+                }
+            } else {
+                LinEvent<T> e = make_event(LinTarget::Direct, outcome == Smw::Outcome::Updated ? LinAction::SmwUpdate
+                                                                                               : LinAction::SmwReuse);
+                e.ldlt = use_ldlt;
+                e.rank = direct_smw_.last_rank();
+                e.h = direct_smw_.last_h();
+                e.p = direct_smw_.last_p();
+                e.q = direct_smw_.last_q();
+                e.t_smw_setup = t_setup;
+                record_event(e);
+            }
+            if (outcome == Smw::Outcome::Updated) {
                 ++direct_smw_count;
-            } else if (outcome == SchurSmwUpdate<T>::Outcome::ReusedSnapshot) {
+            } else if (outcome == Smw::Outcome::ReusedSnapshot) {
                 // The active sets are back to the snapshot's: the stored factorization is exact again.
                 if (use_ldlt) ldlt_pattern_dirty_ = ldlt_numeric_dirty_ = false;
                 else          chol_pattern_dirty_ = chol_numeric_dirty_ = false;
@@ -339,7 +372,7 @@ typename SSN<T>::Vec SSN<T>::solve_direct(const SpMat& G, const SpMat& G_tr, con
 
     if (direct_smw_enabled() && direct_smw_.active() && direct_smw_.rows() == G.rows() &&
         direct_smw_.snapshot_base_is_ldlt() == use_ldlt) {
-        SSN_TIMER_BLOCK(timer_direct_smw_solve);
+        SSN_TIMER_BLOCK(it_.direct_solve);
         // Solve S dy = G H^{-1} r1 + r2 through the update, then recover dx = H^{-1} (G^T dy - r1).
         const int s = G.rows();
         const int n = G.cols();
@@ -381,8 +414,12 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
     if (ldlt_pattern_dirty_ || ldlt_numeric_dirty_) {
         // K_ldlt_ and ldlt_ are about to change, so an SMW snapshot of the old factorization no longer holds.
         direct_smw_.invalidate();
+        double t_assembly = 0.0, t_analyze = 0.0, t_factorize = 0.0;
+        const bool analyzed = ldlt_pattern_dirty_;
 
         if (ldlt_pattern_dirty_ || !K_ldlt_built_) {
+            {
+            SSN_TIMER_BLOCK(t_assembly);
             // Full rebuild: G's sparsity changed (active_W changed) or first call.
             // Assemble K = [-H, G^T; G, (1/mu) I] from triplets and cache it.
             ldlt_trip_.clear();
@@ -411,13 +448,15 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
             ldlt_diag_bot_idx_.resize(s);
             for (int i = 0; i < s; ++i)
                 ldlt_diag_bot_idx_[i] = static_cast<int>(&K_ldlt_.coeffRef(n + i, n + i) - K_ldlt_.valuePtr());
+            }
 
             if (ldlt_pattern_dirty_) {
-                SSN_TIMER_BLOCK(timer_ldlt_analyze);
+                SSN_TIMER_BLOCK(t_analyze);
                 ldlt_.analyzePattern(K_ldlt_);
                 ldlt_pattern_dirty_ = false;
             }
         } else {
+            SSN_TIMER_BLOCK(t_assembly);
             // Pattern unchanged (active_W same): patch the -H and (1/mu)I diagonals in place.
             for (int i = 0; i < n; ++i)
                 K_ldlt_.valuePtr()[ldlt_diag_top_idx_[i]] = -H_diag(i);
@@ -427,12 +466,15 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
         }
 
         {
-            SSN_TIMER_BLOCK(timer_ldlt_factorize);
+            SSN_TIMER_BLOCK(t_factorize);
             ldlt_.factorize(K_ldlt_);
         }
+        it_.fact += t_assembly + t_analyze + t_factorize;
+        it_.analyze += t_analyze;
         if (ldlt_.info() != Eigen::Success)
             throw std::runtime_error("LDLT factorization of the augmented Lagrangian system failed.");
         ldlt_numeric_dirty_ = false;
+        record_direct_fact(/*ldlt=*/true, analyzed, t_assembly, t_analyze, t_factorize);
         fact++;
         kkt_ldlt_fact++;
 
@@ -442,7 +484,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
 
     Vec result;
     {
-        SSN_TIMER_BLOCK(timer_ldlt_solve);
+        SSN_TIMER_BLOCK(it_.direct_solve);
         result = ldlt_.solve(ldlt_solve_rhs_);
     }
     if (ldlt_.info() != Eigen::Success)
@@ -476,10 +518,11 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
     if (!chol_ || chol_pattern_dirty_ || chol_numeric_dirty_) {
         // S_chol_ and chol_ are about to change, so an SMW snapshot of the old factorization no longer holds.
         direct_smw_.invalidate();
+        double t_assembly = 0.0, t_analyze = 0.0, t_factorize = 0.0;
 
         try {
             {
-                SSN_TIMER_BLOCK(timer_chol_assembly);
+                SSN_TIMER_BLOCK(t_assembly);
                 // Free the old S first: the temporaries of the product below are the memory peak.
                 SpMat().swap(S_chol_);
 
@@ -503,17 +546,19 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
             // A changed nonzero count means a changed pattern, even if no flag said so.
             if (S_chol_.nonZeros() != chol_nnz_at_analyze_) chol_pattern_dirty_ = true;
 
-            if (!chol_ || chol_pattern_dirty_) {
-                SSN_TIMER_BLOCK(timer_chol_analyze);
+            const bool analyzed = !chol_ || chol_pattern_dirty_;
+            if (analyzed) {
+                SSN_TIMER_BLOCK(t_analyze);
                 chol_ = std::make_unique<SimplicialLLT64<SpMat>>();
                 chol_->analyzePattern(S_chol_);
                 chol_nnz_at_analyze_ = S_chol_.nonZeros();
                 chol_pattern_dirty_ = false;
             }
             {
-                SSN_TIMER_BLOCK(timer_chol_factorize);
+                SSN_TIMER_BLOCK(t_factorize);
                 chol_->factorize(S_chol_);
             }
+            record_direct_fact(/*ldlt=*/false, analyzed, t_assembly, t_analyze, t_factorize);
             fact++;
             schur_chol_fact++;
             if (chol_->info() != Eigen::Success) {
@@ -528,6 +573,8 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
             ok = false;
             reason = "bad_alloc";
         }
+        it_.fact += t_assembly + t_analyze + t_factorize;
+        it_.analyze += t_analyze;
     }
 
     if (!ok) {
@@ -535,6 +582,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
                   << "), falling back to LDLT on the KKT system.\n";
         schur_chol_failed_ = true;
         release_chol();
+        direct_pending_reason_ = FactReason::CholFailed;
         return solve_using_ldlt(G, H_diag, r1, r2);
     }
 
@@ -543,7 +591,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
     chol_rhs_.noalias() = G * chol_Hinv_r1_ + r2;
     Vec dy;
     {
-        SSN_TIMER_BLOCK(timer_chol_solve);
+        SSN_TIMER_BLOCK(it_.direct_solve);
         dy = chol_->solve(chol_rhs_);
     }
     if (chol_->info() != Eigen::Success)
@@ -749,8 +797,7 @@ T exact_line_search(const SsnLineSearchParams<T>& p,
 
 template <typename T>
 typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
-    {
-    SSN_TIMER_BLOCK(timer_prep);
+    SSN_TIMER_BLOCK(it_.prep);
     u_.noalias() = z / mu + x_cur_;
     v_ = Bx_ssn_ + ((1 - alpha) * y2_cur_ - y2) / mu;
 
@@ -759,13 +806,14 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     compute_subgrad_and_dist(v_, lw, uw, true,  new_active_W_, dist_W_v_);
     // W is active when v lies outside [lw, uw], so invert the inside-[lw, uw] subgradient.
     new_active_W_ = (new_active_W_ == false);
-    }
 
     // Detect active-set changes; recompute on any single change.
     bool first_ssn_iter = (active_K.size() == 0);
+    const int flips_K = first_ssn_iter ? -1 : static_cast<int>((active_K != new_active_K_).count());
+    const int flips_W = first_ssn_iter ? -1 : static_cast<int>((active_W != new_active_W_).count());
     ActiveSetDelta delta{
-        /*k_changed=*/first_ssn_iter || (active_K != new_active_K_).any(),
-        /*w_changed=*/first_ssn_iter || (active_W != new_active_W_).any(),
+        /*k_changed=*/first_ssn_iter || flips_K > 0,
+        /*w_changed=*/first_ssn_iter || flips_W > 0,
     };
 
     bool update_prec = delta.k_changed || delta.w_changed; // true means rebuilding prec is needed.
@@ -773,6 +821,14 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
 
     // Recompute H if active_K changed or mu/rho drifted since H_diag was last built.
     bool recompute_H = delta.k_changed || (mu != H_diag_mu_) || (rho != H_diag_rho_);
+
+    // What changed since the previous SSN iteration, for the factorization log.
+    it_state_.k_changed   = delta.k_changed;
+    it_state_.w_changed   = delta.w_changed;
+    it_state_.mu_changed  = (mu != H_diag_mu_);
+    it_state_.rho_changed = (rho != H_diag_rho_);
+    it_state_.flips_K     = flips_K;
+    it_state_.flips_W     = flips_W;
 
     // Direct-solver flags: K's and S's sparsity follows G (active_W); their values change when
     // H_diag is recomputed or G is rebuilt.
@@ -783,7 +839,6 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     }
 
     if (recompute_H) {
-        SSN_TIMER_BLOCK(timer_prep);
         if (delta.k_changed) {
             active_K = new_active_K_;
         }
@@ -802,7 +857,6 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
 
     // If active_W changed, recompute G.
     if (delta.w_changed) {
-        SSN_TIMER_BLOCK(timer_prep);
         prev_dy_.resize(0); // No warm-starting for CG
 
         active_W = new_active_W_;
@@ -812,8 +866,6 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
         rebuild_G(); // Rebuild G = [A; active rows of B] and G_tr.
     }
 
-    {
-    SSN_TIMER_BLOCK(timer_prep);
     // Compute dy2 in inactive_W: dy2_inactive_W = - (mu / alpha) * dist_W(v)(inactive_W) - y2(inactive_W) = - y2(inactive_W),
     // since v lies in [lw, uw] on inactive_W, where dist_W(v) = 0 exactly.
     split_by_mask(y2_cur_, active_W, y2_active_W_, y2_inactive_W_);
@@ -834,16 +886,13 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
     r2_.resize(M + n_active_W);
     r2_.head(M) = y1 / mu - Ax_ssn_ + b;
     r2_.tail(n_active_W) = -dist_W_v_active_.head(n_active_W) - (alpha / mu) * y2_active_W_.head(n_active_W);
-    }
 
     // Determines the factorization method, each locked after its first 3 decisions:
     // for the direct solver (K or S, over all columns) once it is in use, otherwise for the PCG preconditioner.
     const bool use_direct = direct_solve || pcg_failed;
     if ((delta.k_changed || delta.w_changed) && use_direct && direct_ldlt_decisions_made_ < 3) {
-        SSN_TIMER_BLOCK(timer_prep);
         decide_direct_system(G);
     } else if ((delta.k_changed || delta.w_changed) && !use_direct && schur_ldlt_decisions_made_ < 3) {
-        SSN_TIMER_BLOCK(timer_prep);
         schur_use_ldlt = choose_schur_ldlt(G, active_K);
         ++schur_ldlt_decisions_made_;
     }
@@ -855,6 +904,7 @@ template <typename T>
 typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_residual) {
     // Iterative refinement: correct the residual of K [dx;dy] = [r1_;r2_], K = [-H, G^T; G, (1/mu)I].
     // The residual after the last of refine_max_iter corrections is measured only if need_final_residual.
+    SSN_TIMER_BLOCK(it_.refine);
     const int s = static_cast<int>(r2_.size());
     const T ref_norm = std::max(inf_norm(r1_), inf_norm(r2_));
     T res_norm = std::numeric_limits<T>::quiet_NaN();
@@ -873,8 +923,10 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
         if (res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol) || k == refine_max_iter) break;
 
         prev_dy_.resize(0); // cold-start for iterative refinement
+        in_refinement_ = true;
         Vec correction = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, rho1, rho2,
                                         mu, krylov_tol, krylov_max_in_iter, false, false, schur_use_ldlt);
+        in_refinement_ = false;
         dxdy_ += correction;
         prev_dy_ = dxdy_.tail(s); // warm-start for the next SSN iteration's main solve
     }
@@ -883,7 +935,7 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
 
 template <typename T>
 void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed) {
-    SSN_TIMER_BLOCK(timer_linear_solve);
+    SSN_TIMER_BLOCK(it_.linear_solve);
     // Solve for dx and dy2_active_W.
     dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
 
@@ -899,6 +951,7 @@ void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed)
             ++direct_smw_reject;
             direct_smw_.record_failure();
             direct_force_full_ = direct_stale_ = true;
+            direct_pending_reason_ = FactReason::SmwResidual;
             dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
             iterative_refine_dxdy();
         }
@@ -919,7 +972,7 @@ void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed)
 template <typename T>
 typename SSN<T>::LineSearchResult SSN<T>::line_search_with_steepest_descent_fallback(T ssn_tol) {
 
-    SSN_TIMER_BLOCK(timer_linesearch);
+    SSN_TIMER_BLOCK(it_.linesearch);
     const SsnLineSearchParams<T> line_search_params = make_line_search_params();
 
     Adx_.noalias() = A * dx_;
@@ -939,6 +992,7 @@ typename SSN<T>::LineSearchResult SSN<T>::line_search_with_steepest_descent_fall
         }
 
         // Retry linesearch with the steepest-descent direction.
+        it_state_.ls_steepest = true;
         dx_  = -grad_L.head(N);
         dy2_ = -grad_L.tail(l);
         Adx_.noalias() = A * dx_;
@@ -959,7 +1013,7 @@ typename SSN<T>::LineSearchResult SSN<T>::line_search_with_steepest_descent_fall
 
 template <typename T>
 void SSN<T>::update_iterate(T tau, int ssn_iter_count) {
-    SSN_TIMER_BLOCK(timer_state_update);
+    SSN_TIMER_BLOCK(it_.update);
     x_cur_  += tau * dx_;
     y2_cur_ += tau * dy2_;
 
@@ -1033,21 +1087,22 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
     while (_iter < ssn_max_in_iter) {
         if (interrupted_()) { _opt = TerminationStatus::Interrupted; break; }
         if (time_limit_exceeded_()) { _opt = TerminationStatus::TimeLimit; break; }
-#if SSN_ENABLE_TIMERS
-        // TIMER: reset per-phase accumulators for this SSN iteration.
-        timer_prep = timer_linear_solve = timer_prec_setup = timer_krylov_solve = 0.0;
-        timer_prec_assembly = timer_prec_analyze = timer_prec_factorize = 0.0;
-        timer_ldlt_analyze = timer_ldlt_factorize = timer_ldlt_solve = 0.0;
-        timer_chol_assembly = timer_chol_analyze = timer_chol_factorize = timer_chol_solve = 0.0;
-        timer_direct_smw_setup = timer_direct_smw_solve = 0.0;
-        timer_linesearch = timer_state_update = 0.0;
-#endif
+        begin_iteration(ssn_iter + _iter + 1);
+
         auto [update_prec, prec_pattern_changed] = prepare_newton_system();
         solve_newton_direction(update_prec, prec_pattern_changed);
 
         LineSearchResult ls = line_search_with_steepest_descent_fallback(ssn_tol);
-        if (ls.outcome == LineSearchOutcome::AcceptOptimal) { _opt = TerminationStatus::Optimal; break; }
-        if (ls.outcome == LineSearchOutcome::Fail)          { _opt = TerminationStatus::LineSearchFailed; break; }
+        if (ls.outcome == LineSearchOutcome::AcceptOptimal) {
+            end_iteration(SsnLsOutcome::AcceptOptimal, T(0), ssn_tol);
+            _opt = TerminationStatus::Optimal;
+            break;
+        }
+        if (ls.outcome == LineSearchOutcome::Fail) {
+            end_iteration(SsnLsOutcome::Fail, T(0), ssn_tol);
+            _opt = TerminationStatus::LineSearchFailed;
+            break;
+        }
 
         update_iterate(ls.tau, _iter);
         _iter++;
@@ -1059,41 +1114,12 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
                                         n_active_W, static_cast<int>(active_K.count()), -1});
         }
 
-#if SSN_ENABLE_TIMERS
-        // TIMER: step-by-step timer for this SSN iteration.
+        std::optional<TerminationStatus> term;
         {
-            const double total = timer_prep + timer_linear_solve + timer_linesearch + timer_state_update;
-            fprintf(stderr,
-                "[Timer] ssn_iter=%d total=%.4fs | prep=%.4f "
-                "linear_solve=%.4f (prec_setup=%.4f [assembly=%.4f analyze=%.4f factorize=%.4f] krylov_solve=%.4f) "
-                "linesearch=%.4f state_update=%.4f\n",
-                ssn_iter + _iter, total, timer_prep, timer_linear_solve, timer_prec_setup,
-                timer_prec_assembly, timer_prec_analyze, timer_prec_factorize, timer_krylov_solve,
-                timer_linesearch, timer_state_update);
-
-            // If the direct solver ran (direct mode, or after PCG failed), report LDLT on K and Cholesky on S.
-            const double ldlt_total = timer_ldlt_analyze + timer_ldlt_factorize + timer_ldlt_solve;
-            if (ldlt_total > 0.0) {
-                fprintf(stderr,
-                    "[Timer]   kkt_ldlt total=%.4fs | analyzePattern=%.4f factorize=%.4f solve=%.4f\n",
-                    ldlt_total, timer_ldlt_analyze, timer_ldlt_factorize, timer_ldlt_solve);
-            }
-            const double chol_total = timer_chol_assembly + timer_chol_analyze + timer_chol_factorize + timer_chol_solve;
-            if (chol_total > 0.0) {
-                fprintf(stderr,
-                    "[Timer]   schur_chol total=%.4fs | assembly=%.4f analyzePattern=%.4f factorize=%.4f solve=%.4f\n",
-                    chol_total, timer_chol_assembly, timer_chol_analyze, timer_chol_factorize, timer_chol_solve);
-            }
-            const double smw_total = timer_direct_smw_setup + timer_direct_smw_solve;
-            if (smw_total > 0.0) {
-                fprintf(stderr,
-                    "[Timer]   direct_smw total=%.4fs | setup=%.4f solve=%.4f\n",
-                    smw_total, timer_direct_smw_setup, timer_direct_smw_solve);
-            }
+            SSN_TIMER_BLOCK(it_.update);
+            term = check_ssn_termination(ssn_tol, stagnation, prev_tol_achieved);
         }
-#endif
-
-        auto term = check_ssn_termination(ssn_tol, stagnation, prev_tol_achieved);
+        end_iteration(SsnLsOutcome::Step, ls.tau, ssn_tol);
         if (term) { _opt = term; break; }
     }
 
@@ -1104,4 +1130,199 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
     y2 = y2_cur_;
     opt = *_opt;
     iter = _iter;
+}
+
+// ===================== factorization log and run-time split (solve_profile.hpp) =====================
+
+template <typename T>
+FactReason SSN<T>::prec_fact_reason(const typename SchurPreconditioner<T>::BuildInfo& b) {
+    // The first check that refused an SMW update decides (smw_gate_open()'s order).
+    using Reject = typename SchurPreconditioner<T>::SmwRejectReason;
+    using Cause = typename SchurPreconditioner<T>::SkipCause;
+    if (b.initial) return FactReason::Initial;
+    switch (b.reject) {
+        case Reject::ForcedRebuild:
+            return b.skip_cause == Cause::Suppressed ? FactReason::SmwSuppressed : FactReason::PcgFailure;
+        case Reject::Suppressed:                 return FactReason::SmwSuppressed;
+        case Reject::FactorizationMethodChanged: return FactReason::MethodSwitch;
+        case Reject::NoSnapshot:                 return FactReason::NoSnapshot;
+        case Reject::RhoChangedSinceSnapshot:
+        case Reject::MuChangedSinceSnapshot:     return FactReason::MuRho;
+        case Reject::RankExceedsThreshold:       return FactReason::RankExceeded;
+        case Reject::SingularCapacitance:        return FactReason::SingularCapacitance;
+        default:                                 return FactReason::Other;
+    }
+}
+
+template <typename T>
+LinEvent<T> SSN<T>::make_event(LinTarget target, LinAction action) const {
+    LinEvent<T> e;
+    e.pmm_iter = pmm_index_;
+    e.ssn_iter = it_state_.index;
+    e.target = target;
+    e.action = action;
+    e.mu = mu;
+    e.rho = rho;
+    e.mu_changed = it_state_.mu_changed;
+    e.rho_changed = it_state_.rho_changed;
+    e.k_changed = it_state_.k_changed;
+    e.w_changed = it_state_.w_changed;
+    e.s = static_cast<int>(G.rows());
+    return e;
+}
+
+template <typename T>
+void SSN<T>::record_event(const LinEvent<T>& e) {
+    switch (e.action) {
+        case LinAction::Factorize:
+            ++profile_.fact_by_reason[static_cast<int>(e.reason)];
+            if (e.analyzed) ++profile_.fact_analyzed;
+            ++it_state_.facts;
+            break;
+        case LinAction::SmwUpdate: ++profile_.smw_update; ++it_state_.smw; break;
+        case LinAction::SmwReuse:  ++profile_.smw_reuse; break;
+        case LinAction::PcgFail:   ++profile_.pcg_fail; break;
+    }
+    if (e.action != LinAction::PcgFail && it_state_.setup < 0) { // the main solve's setup comes first
+        it_state_.setup = static_cast<int>(e.action);
+        it_state_.reason = e.reason;
+        it_state_.rank = e.rank;
+    }
+    if (trace_ && trace_->enabled) trace_->events.push_back(e);
+}
+
+template <typename T>
+void SSN<T>::record_prec_build(int new_facts) {
+    // One event per factorization counted in fact (new_facts is 0 or 1), or per SMW update / reuse.
+    const auto& b = cg.preconditioner().last_build();
+    it_.fact    += b.t_assembly + b.t_analyze + b.t_factorize;
+    it_.analyze += b.t_analyze;
+    it_.lowrank += b.t_smw_setup;
+    if (!b.ran) return;
+
+    using Action = typename SchurPreconditioner<T>::BuildAction;
+    LinAction action;
+    if (new_facts > 0)                           action = LinAction::Factorize;
+    else if (b.action == Action::SmwUpdated)     action = LinAction::SmwUpdate;
+    else if (b.action == Action::ReusedSnapshot) action = LinAction::SmwReuse;
+    else return;
+
+    LinEvent<T> e = make_event(LinTarget::Prec, action);
+    if (action == LinAction::Factorize) {
+        e.reason = prec_fact_reason(b);
+        e.analyzed = b.analyzed;
+    }
+    e.ldlt = b.ldlt;
+    e.rank = b.rank;
+    e.h = b.h;
+    e.p = b.p;
+    e.q = b.q;
+    e.mu_changed = b.mu_changed;   // since the preconditioner's last factorization or update
+    e.rho_changed = b.rho_changed;
+    e.t_assembly = b.t_assembly;
+    e.t_analyze = b.t_analyze;
+    e.t_factorize = b.t_factorize;
+    e.t_smw_setup = b.t_smw_setup;
+    record_event(e);
+}
+
+template <typename T>
+void SSN<T>::record_pcg_fail(PcgFailKind kind, int iters, double err) {
+    LinEvent<T> e = make_event(LinTarget::Prec, LinAction::PcgFail);
+    e.ldlt = schur_use_ldlt;
+    e.pcg_fail = kind;
+    e.pcg_iters = iters;
+    e.pcg_err = err;
+    record_event(e);
+}
+
+template <typename T>
+void SSN<T>::record_direct_fact(bool ldlt, bool analyzed, double t_assembly, double t_analyze, double t_factorize) {
+    // Called right before fact++ at each direct factorization, so the counts still exclude it.
+    LinEvent<T> e = make_event(LinTarget::Direct, LinAction::Factorize);
+    e.reason = consume_direct_reason();
+    e.ldlt = ldlt;
+    e.analyzed = analyzed;
+    e.t_assembly = t_assembly;
+    e.t_analyze = t_analyze;
+    e.t_factorize = t_factorize;
+    record_event(e);
+}
+
+template <typename T>
+FactReason SSN<T>::consume_direct_reason() {
+    // A reason set where the refactorization was decided comes first; then the first direct
+    // factorization of the run; then what changed this SSN iteration, mu/rho before the active sets.
+    const FactReason pending = direct_pending_reason_;
+    direct_pending_reason_ = FactReason::Count;
+    if (pending != FactReason::Count) return pending;
+    if (kkt_ldlt_fact + schur_chol_fact == 0) return direct_solve ? FactReason::Initial : FactReason::DirectFallback;
+    if (it_state_.mu_changed || it_state_.rho_changed) return FactReason::MuRho;
+    if (it_state_.k_changed || it_state_.w_changed) return FactReason::ActiveSetChange;
+    return FactReason::Other;
+}
+
+template <typename T>
+void SSN<T>::begin_iteration(int ssn_index) {
+    it_ = IterTimes{};
+    it_state_ = IterState{};
+    it_state_.index = ssn_index;
+    direct_pending_reason_ = FactReason::Count;
+}
+
+template <typename T>
+void SSN<T>::end_iteration(SsnLsOutcome outcome, T tau, T ssn_tol) {
+    // The Newton solve's remainder: RHS, dx recovery, refinement residuals, bookkeeping.
+    const double ssn_other = it_.linear_solve - (it_.fact + it_.lowrank + it_.krylov + it_.direct_solve);
+
+    SolvePhases& t = profile_.t;
+    t.prep += it_.prep;
+    t.fact += it_.fact;
+    t.analyze += it_.analyze;
+    t.lowrank += it_.lowrank;
+    t.krylov += it_.krylov;
+    t.prec_apply += it_.prec_apply;
+    t.prec_apply_smw += it_.prec_apply_smw;
+    t.direct_solve += it_.direct_solve;
+    t.refine += it_.refine;
+    t.ssn_other += ssn_other;
+    t.linesearch += it_.linesearch;
+    t.update += it_.update;
+    profile_.krylov_refine += it_state_.krylov_refine;
+    if (it_state_.ls_steepest) ++profile_.ls_steepest;
+
+    if (!trace_ || !trace_->enabled) return;
+    SsnRow<T> row;
+    row.pmm_iter = pmm_index_;
+    row.ssn_iter = it_state_.index;
+    row.mu = mu;
+    row.rho = rho;
+    row.ssn_tol = ssn_tol;
+    row.n_act_K = static_cast<int>(active_K.count());
+    row.n_act_W = n_active_W;
+    row.flips_K = it_state_.flips_K;
+    row.flips_W = it_state_.flips_W;
+    row.setup = it_state_.setup;
+    row.reason = it_state_.reason;
+    row.rank = it_state_.rank;
+    row.facts = it_state_.facts;
+    row.smw = it_state_.smw;
+    row.krylov = it_state_.krylov;
+    row.krylov_refine = it_state_.krylov_refine;
+    row.pcg_err = it_state_.pcg_err;
+    row.ls_outcome = outcome;
+    row.ls_steepest = it_state_.ls_steepest;
+    row.tau = tau;
+    row.grad_norm = outcome == SsnLsOutcome::Step ? tol_achieved : std::numeric_limits<T>::quiet_NaN();
+    row.t_prep = it_.prep;
+    row.t_fact = it_.fact;
+    row.t_lowrank = it_.lowrank;
+    row.t_krylov = it_.krylov;
+    row.t_direct_solve = it_.direct_solve;
+    row.t_ssn_other = ssn_other;
+    row.t_linesearch = it_.linesearch;
+    row.t_update = it_.update;
+    row.t_prec_apply = it_.prec_apply;
+    row.t_refine = it_.refine;
+    trace_->ssn.push_back(row);
 }

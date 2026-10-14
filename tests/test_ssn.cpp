@@ -1439,6 +1439,9 @@ TEST(DirectSmw, UpdateFailingTheResidualCheckIsRefactorizedAndStillSolved) {
     EXPECT_EQ(ns.direct_smw_count, 1);
     EXPECT_EQ(ns.direct_smw_reject, 1);
     EXPECT_EQ(ns.fact, 2);  // the rejected update was replaced by a factorization of the current system
+    EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);
+    EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::SmwResidual)], 1);
+    EXPECT_EQ(ns.profile_.smw_update, 1);
     EXPECT_FALSE(ns.direct_smw_.active());
     EXPECT_EQ(ns.direct_smw_.fail_streak(), 1);
 
@@ -1502,8 +1505,34 @@ TEST(DirectSmw, SwitchedOffRefactorizesOnEveryChange) {
   DirectStep(ns, {false, false, true}, {true, false});
   ExpectNewtonSystemSolved(ns);
   EXPECT_EQ(ns.fact, 3);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::ActiveSetChange)], 2);  // a K flip, then a W row
   EXPECT_EQ(ns.direct_smw_count, 0);
   EXPECT_FALSE(ns.direct_smw_.has_snapshot());
+}
+
+// ===================== factorization log =====================
+
+TEST(FactorizationLog, PreconditionerFactorizationReasonFollowsTheSmwChecks) {
+  using Prec = SchurPreconditioner<double>;
+  using Reject = Prec::SmwRejectReason;
+  auto reason = [](bool initial, Reject reject, Prec::SkipCause cause = Prec::SkipCause::None) {
+    Prec::BuildInfo b;
+    b.initial = initial;
+    b.reject = reject;
+    b.skip_cause = cause;
+    return SSN<double>::prec_fact_reason(b);
+  };
+  EXPECT_EQ(reason(true, Reject::None), FactReason::Initial);
+  EXPECT_EQ(reason(false, Reject::ForcedRebuild, Prec::SkipCause::PcgFailure), FactReason::PcgFailure);
+  EXPECT_EQ(reason(false, Reject::ForcedRebuild, Prec::SkipCause::Suppressed), FactReason::SmwSuppressed);
+  EXPECT_EQ(reason(false, Reject::FactorizationMethodChanged), FactReason::MethodSwitch);
+  EXPECT_EQ(reason(false, Reject::NoSnapshot), FactReason::NoSnapshot);
+  EXPECT_EQ(reason(false, Reject::RhoChangedSinceSnapshot), FactReason::MuRho);
+  EXPECT_EQ(reason(false, Reject::MuChangedSinceSnapshot), FactReason::MuRho);
+  EXPECT_EQ(reason(false, Reject::RankExceedsThreshold), FactReason::RankExceeded);
+  EXPECT_EQ(reason(false, Reject::SingularCapacitance), FactReason::SingularCapacitance);
+  EXPECT_EQ(reason(false, Reject::None), FactReason::Other);
 }
 
 TEST(SolveNewtonDirection, HandlesZeroActiveWDegenerateCase) {
@@ -1816,6 +1845,8 @@ TEST(SolveUsingChol, CholeskyFailureFallsBackToLdltOnKForTheRestOfTheRun) {
   EXPECT_EQ(ns.krylov_fail, 0);      // not a Krylov failure
   EXPECT_EQ(ns.schur_chol_fact, 1);  // the failed attempt still counts as a factorization
   EXPECT_EQ(ns.kkt_ldlt_fact, 1);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);     // the failed Cholesky on S
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::CholFailed)], 1);  // LDLT on K taking over
   ExpectKktResidualSmall(sol1, G, H_diag, r1, r2, ns.mu);
   EXPECT_TRUE(ns.direct_smw_.has_snapshot());  // SMW updates continue from the LDLT factorization
   EXPECT_TRUE(ns.direct_smw_.snapshot_base_is_ldlt());
@@ -1865,6 +1896,13 @@ TEST(SolveUsingCg, PcgFailureLatchPermanentlyRoutesToTheDirectSolver) {
   EXPECT_EQ(ns.schur_chol_fact, 1);
   EXPECT_EQ(ns.kkt_ldlt_fact, 1);
   EXPECT_GT(ns.krylov_fail, 0);
+  // Logged: the preconditioner's first factorization, the PCG failure, then the direct solver's first
+  // factorization (Cholesky on S, which fails) and LDLT on K taking over.
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::DirectFallback)], 1);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::CholFailed)], 1);
+  EXPECT_EQ(ns.profile_.fact_total(), ns.fact);
+  EXPECT_EQ(ns.profile_.pcg_fail, ns.krylov_fail);
   EXPECT_EQ(ns.prev_dy_.size(), 0);  // switch_to_direct() releases the now-unused CG warm-start cache
   ASSERT_EQ(sol1.size(), 2);
   {

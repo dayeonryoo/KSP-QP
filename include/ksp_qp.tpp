@@ -688,7 +688,7 @@ void KSP_QP<T>::printable_sol(const Vec& x, const Vec& y1, const Vec& y2, const 
 }
 
 template <typename T>
-void KSP_QP<T>::update_PMM_parameters(const ResVec& res_norms, const ResVec& new_res_norms, typename SSN<T>::TerminationStatus ssn_opt, T ssn_res, int ssn_inner_iters) {
+PmmRule KSP_QP<T>::update_PMM_parameters(const ResVec& res_norms, const ResVec& new_res_norms, typename SSN<T>::TerminationStatus ssn_opt, T ssn_res, int ssn_inner_iters) {
     using SsnStatus = typename SSN<T>::TerminationStatus;
 
     T worst_res = res_norms.maxCoeff();
@@ -698,16 +698,20 @@ void KSP_QP<T>::update_PMM_parameters(const ResVec& res_norms, const ResVec& new
         mu = std::min(mu_limit, T(2) * mu);
         rho = std::min(rho_limit, T(2) * rho);
         ssn_tol = std::max(eps_limit, T(0.1) * ssn_tol);
+        return PmmRule::Double;
 
     } else if (ssn_opt == SsnStatus::LineSearchFailed) {
         mu = std::max(mu0, T(0.5) * mu);
         rho = std::max(rho0, T(0.5) * rho);
         ssn_tol = std::min({new_worst_res, T(1.1) * ssn_tol, T(1e-2)});
+        return PmmRule::Halve;
 
     } else if (new_worst_res > T(0.9) * worst_res) {
         mu = std::min(mu_limit, T(1.1) * mu);
         rho = std::min(rho_limit, T(1.1) * rho);
+        return PmmRule::Increase;
     }
+    return PmmRule::Keep;
 }
 
 template <typename T>
@@ -841,15 +845,17 @@ void KSP_QP<T>::accept_ssn_iterate(const SSN<T>& NS) {
 }
 
 template <typename T>
-void KSP_QP<T>::update_multipliers_if_accurate(typename SSN<T>::TerminationStatus ssn_opt, Vec& delta_y1, Vec& delta_z) {
+bool KSP_QP<T>::update_multipliers_if_accurate(typename SSN<T>::TerminationStatus ssn_opt, Vec& delta_y1, Vec& delta_z) {
     // Update multipliers y1, z if SSN solve is optimal or accurate enough.
     if (ssn_opt == SSN<T>::TerminationStatus::Optimal || ssn_tol_achieved <= T(100) * pmm_tol_achieved) {
         delta_y1 = -mu * (Ax_scratch_ - b);
         y1 += delta_y1;
         delta_z = mu * (x - proj(z / mu + x, lx, ux));
         z += delta_z;
+        return true;
     }
     // else, keep y1, z, delta_y1, delta_z from previous PMM iteration
+    return false;
 }
 
 template <typename T>
@@ -863,9 +869,13 @@ Solution<T> KSP_QP<T>::solve() {
 
     // If setup failed, return the status set during setup: NumericalError for a setup error,
     // or PrimalInfeasible if check_bounds() found an empty box interval.
+    profile = SolveProfile{};
+    trace.clear();
     if (setup_failed) {
         auto solving_end = now_();
         double solve_time = time_diff_s(solving_start, solving_end); // in seconds
+        profile.t.setup = setup_time;
+        profile.t.pmm_other = solve_time;
         return Solution<T>(opt, Vec::Zero(n), Vec::Zero(m), Vec::Zero(l), Vec::Zero(n),
                             T(1e20), 0, 0, 0, 0, 0, T(1e20), T(1e20),
                             setup_time, solve_time, 0, 0);
@@ -906,6 +916,7 @@ Solution<T> KSP_QP<T>::solve() {
     NS.report_ = report_;
     NS.direct_solve = direct_solve;
     NS.direct_smw = direct_smw;
+    NS.trace_ = &trace;
 
     // Print header.
     print_header(when, what);
@@ -927,10 +938,15 @@ Solution<T> KSP_QP<T>::solve() {
         // ----------------------------------------------
 
         // Call semismooth Newton method.
+        const auto pmm_start = std::chrono::steady_clock::now();
+        const T mu_in = mu, rho_in = rho, ssn_tol_in = ssn_tol; // for the trace row below
+        const int fact_in = NS.fact, smw_in = NS.profile_.smw_update, krylov_in = NS.krylov_iter;
         x_old_scratch_  = x;
         y2_old_scratch_ = y2;
+        NS.pmm_index_ = pmm_iter + 1;
         NS.update_ssn_system(x, y1, y2, z, delta_y1, delta_z, mu, rho, alpha, ssn_iter);
         NS.solve_ssn(ssn_tol);
+        const double t_ssn = time_diff_s(pmm_start, std::chrono::steady_clock::now());
 
         ssn_iter += NS.iter;
         ssn_tol_achieved = NS.tol_achieved;
@@ -944,7 +960,7 @@ Solution<T> KSP_QP<T>::solve() {
 
         // Update (x, y1, y2, z).
         accept_ssn_iterate(NS);
-        update_multipliers_if_accurate(NS.opt, delta_y1, delta_z);
+        const bool multipliers_updated = update_multipliers_if_accurate(NS.opt, delta_y1, delta_z);
 
         // Compute new residual norms.
         ResVec new_res_norms = compute_residual_unscaled_inf_norms(Ax_scratch_, Bx_scratch_, Qx_scratch_);
@@ -964,29 +980,64 @@ Solution<T> KSP_QP<T>::solve() {
                                     /*show_pmm_iter=*/true, NS.n_active_W, -1,
                                     static_cast<int>(NS.opt)});
 
+        // Trace row of this PMM iteration; finish_pmm_row() completes it with the penalty update.
+        PmmRow<T>* row = nullptr;
+        if (trace.enabled) {
+            PmmRow<T> r;
+            r.pmm_iter = pmm_iter;
+            r.ssn_iters = NS.iter;
+            r.ssn_status = static_cast<int>(NS.opt);
+            r.mu = mu_in;
+            r.rho = rho_in;
+            r.ssn_tol = ssn_tol_in;
+            r.res_primal = new_res_norms(0);
+            r.res_dual = new_res_norms(1);
+            r.res_comp_x = new_res_norms(2);
+            r.res_comp_Bx = new_res_norms(3);
+            r.multipliers_updated = multipliers_updated;
+            r.facts = NS.fact - fact_in;
+            r.smw = NS.profile_.smw_update - smw_in;
+            r.krylov = NS.krylov_iter - krylov_in;
+            r.t_ssn = t_ssn;
+            trace.pmm.push_back(r);
+            row = &trace.pmm.back();
+        }
+        auto finish_pmm_row = [&](PmmRule rule) {
+            if (!row) return;
+            row->rule = rule;
+            row->mu_next = mu;
+            row->rho_next = rho;
+            row->ssn_tol_next = ssn_tol;
+            row->t_pmm_other = time_diff_s(pmm_start, std::chrono::steady_clock::now()) - row->t_ssn;
+        };
+
         // Check termination criterion.
         if (pmm_tol_achieved < tol) {
+            finish_pmm_row(PmmRule::Stop);
             result = TerminationStatus::Optimal;
             break;
         }
 
         // Infeasibility checks
         if (primal_infeas(delta_y1, y2 - y2_old_scratch_, delta_z)) {
+            finish_pmm_row(PmmRule::Stop);
             result = TerminationStatus::PrimalInfeasible; std::cout << "[Infeasibility] Primal infeasible.\n";
             break;
         }
         if (dual_infeas(x - x_old_scratch_, Adx_scratch_, Bdx_scratch_)) {
+            finish_pmm_row(PmmRule::Stop);
             result = TerminationStatus::DualInfeasible; std::cout << "[Infeasibility] Dual infeasible.\n";
             break;
         }
 
         // Update PMM parameters based on SSN solve quality.
-        update_PMM_parameters(res_norms, new_res_norms, NS.opt, ssn_tol_achieved, NS.iter);
+        const PmmRule rule = update_PMM_parameters(res_norms, new_res_norms, NS.opt, ssn_tol_achieved, NS.iter);
         res_norms = new_res_norms; // for next iteration
 
         // Carry Ax, Bx forward.
         Ax_old_scratch_.swap(Ax_scratch_);
         Bx_old_scratch_.swap(Bx_scratch_);
+        finish_pmm_row(rule);
 
         // NS.opt catches an interruption/time limit hit inside the SSN loop; the second condition
         // catches one hit between PMM iterations.
@@ -1038,6 +1089,11 @@ Solution<T> KSP_QP<T>::solve() {
     schur_chol_fact = NS.schur_chol_fact;
     direct_smw_count = NS.direct_smw_count;
     direct_smw_reject = NS.direct_smw_reject;
+
+    // Run-time split: setup, the SSN phases, and the rest of solve(), so the phases add up to run_time.
+    profile = NS.profile_;
+    profile.t.setup = setup_time;
+    profile.t.pmm_other = solve_time - profile.t.ssn_total();
 
     // SMW updates of the preconditioner (PCG mode) or of the direct solver's factorization (direct mode);
     // the direct solver only uses them in direct mode, so the two never mix within a run.

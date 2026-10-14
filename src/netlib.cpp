@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
             "Usage: ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all]\n"
-            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--out FILE] [--cooldown S] [--ref FILE]\n"
+            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--out FILE] [--trace PREFIX] [--cooldown S] [--ref FILE]\n"
             "  Solves one Netlib LP from ROOT/IN/PROBLEM.mps, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in, --ref and --out are resolved relative to this (default: ./)\n"
             "  --set SET        which problem set to use: feasible or infeasible (default: feasible)\n"
@@ -118,6 +118,9 @@ int main(int argc, char** argv) {
             "  --out FILE       (--name all only) output CSV path, relative to --root\n"
             "                   (default: results/pcg_netlib.csv or results/pcg_infeas.csv, per --set;\n"
             "                   direct_ instead of pcg_ with --direct, direct_nosmw_ with --no-direct-smw)\n"
+            "  --trace PREFIX   also write PREFIX_events.csv (every factorization, SMW update and PCG\n"
+            "                   failure, with its reason), PREFIX_ssn.csv and PREFIX_pmm.csv (one row per\n"
+            "                   SSN / PMM iteration, with the run time by phase), relative to --root\n"
             "  --cooldown S     (--name all only) seconds to sleep between problems (default: 0)\n"
             "  --ref FILE       (feasible set only) reference objectives CSV, relative to --root\n"
             "                   (default: data/netlib-main/feasible_gurobi_1e-8.csv)\n";
@@ -150,6 +153,8 @@ int main(int argc, char** argv) {
     bool direct_smw = !cli::has_flag(argc, argv, "--no-direct-smw");
     if (!direct_smw && !direct)
         std::cerr << "WARNING: --no-direct-smw has no effect without --direct\n";
+    const std::string trace_arg = cli::get_str(argc, argv, "--trace", "");
+    const std::string trace_prefix = trace_arg.empty() ? "" : root + trace_arg;
 
     if (to_lower(name) == "all") {
         std::vector<std::string> stems = list_problems(data_dir);
@@ -195,6 +200,7 @@ int main(int argc, char** argv) {
                 KSP_QP<T> solver(prob);
                 solver.direct_solve = direct;
                 solver.direct_smw = direct_smw;
+                solver.trace.enabled = !trace_prefix.empty();
 
                 // Solve the LP
                 Solution<T> sol = solver.solve();
@@ -233,7 +239,13 @@ int main(int argc, char** argv) {
                     sol.pmm_tol_achieved, sol.ssn_tol_achieved,
                     sol.run_time, sol.linesearch_fail, sol.krylov_fail
                 };
+                result.setup_time = sol.setup_time;
+                result.solve_time = sol.solve_time;
+                result.kkt_ldlt_fact = solver.kkt_ldlt_fact;
+                result.schur_chol_fact = solver.schur_chol_fact;
+                result.profile = solver.profile;
                 append_csv_result(csv_path, result);
+                if (!trace_prefix.empty()) append_trace_csvs(trace_prefix, lp_name, solver.trace);
 
             } catch (const std::exception& e) {
                 std::cerr << "ERROR solving " << lp_name << ": " << e.what() << "\n";
@@ -270,10 +282,13 @@ int main(int argc, char** argv) {
     KSP_QP<T> solver(prob);
     solver.direct_solve = direct;
     solver.direct_smw = direct_smw;
+    solver.trace.enabled = !trace_prefix.empty();
 
     // Solve:
     Solution<T> sol = solver.solve();
     sol.print_summary();
+    print_profile(solver.profile);
+    if (!trace_prefix.empty()) append_trace_csvs(trace_prefix, to_upper(name), solver.trace);
     if (solver.direct_solve || solver.pcg_failed) {
         std::cout << "Direct-solver factorizations: KKT system (LDLT) = " << solver.kkt_ldlt_fact
                   << ", Schur complement (Cholesky) = " << solver.schur_chol_fact << "\n";

@@ -12,26 +12,10 @@
 #include <memory>
 #include <variant>
 #include "amd_ordering.hpp"
+#include "solve_profile.hpp"
 
-// Timer master switch; 0 (off) by default; set via -DSSN_ENABLE_TIMERS=1.
-#ifndef SSN_ENABLE_TIMERS
-#define SSN_ENABLE_TIMERS 0
-#endif
-
-#if SSN_ENABLE_TIMERS
-#include <chrono>
-
-// RAII scoped timer; accumulates elapsed wall-clock seconds into `acc` on scope exit.
-struct SchurPrecScopedTimer {
-    std::chrono::steady_clock::time_point t0;
-    double& acc;
-    explicit SchurPrecScopedTimer(double& acc_) : t0(std::chrono::steady_clock::now()), acc(acc_) {}
-    ~SchurPrecScopedTimer() { acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
-};
-#define SCHUR_PREC_TIMER_BLOCK(acc) SchurPrecScopedTimer _schur_prec_scoped_timer(acc)
-#else
-#define SCHUR_PREC_TIMER_BLOCK(acc) do {} while (0)
-#endif
+// Adds the wall-clock seconds spent in the enclosing scope to `acc` (always on; see solve_profile.hpp).
+#define SCHUR_PREC_TIMER_BLOCK(acc) ScopedTimer _schur_prec_scoped_timer(acc)
 
 // =================================================================================================
 // Flag-dependency chain (SSN + SchurPreconditioner)
@@ -131,12 +115,15 @@ public:
     void arm(const SpMat& G, const SpMat& G_tr, const Vec& H_diag,
              const BoolArr& active_K, const BoolArr& active_W, const RowMajorSpMat& B_rm,
              T mu, T rho, bool rebuild, bool prec_pattern_changed, bool use_ldlt, bool force_rebuild = false) {
+        last_build_ = BuildInfo{};
         if (use_ldlt != use_ldlt_)       // P and P_hat differ structurally, so the cached
             prec_pattern_changed = true; // analyzePattern() is invalid.
         set_data(G, G_tr, H_diag, active_K, active_W, B_rm, mu, rho, rebuild || force_rebuild, prec_pattern_changed);
         set_use_ldlt(use_ldlt);
-        if (force_rebuild || smw_suppressed())
-            force_full_rebuild();
+        if (force_rebuild)
+            force_full_rebuild(SkipCause::PcgFailure);
+        else if (smw_suppressed())
+            force_full_rebuild(SkipCause::Suppressed);
         fact_count_at_arm_ = fact_count_;
     }
 
@@ -174,6 +161,7 @@ public:
     const Vec& solve(const Eigen::MatrixBase<Rhs>& b) const {
         if (info_ != Eigen::Success)
             throw std::runtime_error("SchurPreconditioner solve called after failed factorization.");
+        SCHUR_PREC_TIMER_BLOCK(use_smw_ ? apply_smw_time_ : apply_direct_time_);
         return use_smw_ ? solve_smw(b) : solve_direct(b);
     }
 
@@ -203,14 +191,39 @@ public:
     int  smw_last_rank() const { return smw_last_rank_; }
     bool used_ldlt_at_last_fact() const { return use_ldlt_at_last_fact_; }
 
-#if SSN_ENABLE_TIMERS
-    // TIMER: step-by-step time spent in build().
+    // Why a full rebuild was forced (skip_smw_): a PCG failure through an SMW update (arm(force_rebuild)),
+    // or SMW suppressed by the fail streak.
+    enum class SkipCause { None, PcgFailure, Suppressed };
+
+    // What compute() did since the last arm(), for SSN's factorization log (solve_profile.hpp).
+    enum class BuildAction { None, Factorized, SmwUpdated, ReusedSnapshot };
+    struct BuildInfo {
+        bool ran = false;                    // compute() called build()
+        BuildAction action = BuildAction::None;
+        bool initial = false;                // first build (or first after release())
+        bool mu_changed = false, rho_changed = false; // since the last factorization or update
+        SmwRejectReason reject = SmwRejectReason::None; // why SMW was not used (None: not attempted)
+        SkipCause skip_cause = SkipCause::None;         // set when reject == ForcedRebuild
+        int rank = -1, h = -1, p = -1, q = -1; // SMW delta against the snapshot (-1: not classified)
+        bool ldlt = false;                   // LDLT on P_hat rather than Cholesky on P
+        bool analyzed = false;               // Factorized with a symbolic analysis
+        double t_assembly = 0.0, t_analyze = 0.0, t_factorize = 0.0, t_smw_setup = 0.0; // seconds
+    };
+    const BuildInfo& last_build() const { return last_build_; }
+
+    // Cumulative wall-clock seconds: build()'s phases, and solve() calls (all, and through SMW).
     double assembly_time()  const { return assembly_time_; }
     double analyze_time()   const { return analyze_time_; }
     double factorize_time() const { return factorize_time_; }
-#endif
+    double smw_setup_time() const { return smw_setup_time_; }
+    double apply_time()     const { return apply_direct_time_ + apply_smw_time_; }
+    double apply_smw_time() const { return apply_smw_time_; }
 
-    void force_full_rebuild() { skip_smw_ = true; numeric_dirty_ = true; }
+    void force_full_rebuild(SkipCause cause = SkipCause::PcgFailure) {
+        skip_smw_ = true;
+        skip_cause_ = cause;
+        numeric_dirty_ = true;
+    }
     void record_smw_rebuild() {
         smw_fail_streak_++;
         smw_fail_total_++;
@@ -363,16 +376,50 @@ private:
     void build() {
         use_smw_ = false;
 
+        // Record what this build does (last_build()); skip_smw_ is consumed by smw_gate_open().
+        BuildInfo& b = last_build_;
+        b.ran = true;
+        b.initial = !initialized_;
+        b.mu_changed  = initialized_ && (mu_  != mu_at_last_fact_);
+        b.rho_changed = initialized_ && (rho_ != rho_at_last_fact_);
+        b.skip_cause = skip_smw_ ? skip_cause_ : SkipCause::None;
+        b.ldlt = use_ldlt_;
+        const double t_assembly0 = assembly_time_, t_analyze0 = analyze_time_, t_factorize0 = factorize_time_,
+                     t_smw_setup0 = smw_setup_time_;
+        const auto record_delta = [this, &b] {
+            if (smw_last_reject_reason_ == SmwRejectReason::RankExceedsThreshold ||
+                smw_last_reject_reason_ == SmwRejectReason::SingularCapacitance ||
+                smw_last_reject_reason_ == SmwRejectReason::ReusedSnapshot || use_smw_) {
+                b.rank = h_ + p_ + q_;
+                b.h = h_;
+                b.p = p_;
+                b.q = q_;
+            }
+        };
+
         // Case 1. Skip build() and reuse the cached factorization, via a low-rank SMW update or,
         // if the active sets are back to the snapshot's, as is.
-        if (initialized_ && info_ == Eigen::Success && try_build_smw()) {
-            rebuild_ = false;
-            return;
+        if (initialized_ && info_ == Eigen::Success) {
+            bool reused;
+            {
+                SCHUR_PREC_TIMER_BLOCK(smw_setup_time_);
+                reused = try_build_smw();
+            }
+            b.t_smw_setup = smw_setup_time_ - t_smw_setup0;
+            b.reject = smw_last_reject_reason_;
+            record_delta();
+            if (reused) {
+                b.action = use_smw_ ? BuildAction::SmwUpdated : BuildAction::ReusedSnapshot;
+                rebuild_ = false;
+                return;
+            }
         }
         V_plus_.resize(0, 0);
         Y_all_.resize(0, 0);
 
         // Case 2. Full factorization.
+        b.action = BuildAction::Factorized;
+        b.analyzed = pattern_dirty_;
         if (use_ldlt_) {
             if (!std::holds_alternative<LdltSolver>(active_solver_))
                 active_solver_.template emplace<LdltSolver>();
@@ -382,6 +429,9 @@ private:
                 active_solver_.template emplace<CholSolver>();
             factorize_by_chol();
         }
+        b.t_assembly  = assembly_time_  - t_assembly0;
+        b.t_analyze   = analyze_time_   - t_analyze0;
+        b.t_factorize = factorize_time_ - t_factorize0;
     }
 
     // Shared tail of factorize_by_ldlt/factorize_by_chol.
@@ -402,10 +452,6 @@ private:
         }
         info_ = solver.info();
         fact_count_++;
-#if SSN_ENABLE_TIMERS
-        fprintf(stderr, "[SchurFactorize] fact=%d is_ldlt=%d reselected=%d\n",
-                fact_count_, (int)is_ldlt, (int)structural_change);
-#endif
         mu_at_last_fact_       = mu_;
         rho_at_last_fact_      = rho_;
         use_ldlt_at_last_fact_ = is_ldlt;
@@ -884,12 +930,14 @@ private:
     T    mu_at_last_fact_  = T(-1);
     T    rho_at_last_fact_ = T(-1);
 
-#if SSN_ENABLE_TIMERS
-    // TIMER: cumulative wall-clock seconds spent in build().
+    // Cumulative wall-clock seconds: build()'s phases, then solve() calls without and with SMW.
     double assembly_time_  = 0.0;
     double analyze_time_   = 0.0;
     double factorize_time_ = 0.0;
-#endif
+    double smw_setup_time_ = 0.0; // try_build_smw(), accepted or not
+    mutable double apply_direct_time_ = 0.0;
+    mutable double apply_smw_time_    = 0.0;
+    BuildInfo last_build_;        // see last_build()
 
     // ------ Cholesky factorization ------
     bool use_ldlt_ = false;
@@ -927,6 +975,7 @@ private:
     // ------ SMW low-rank update ------
     // Control & failure tracking
     bool skip_smw_        = false;
+    SkipCause skip_cause_ = SkipCause::None; // why skip_smw_ was last set
     bool use_smw_         = false;
     int  smw_count_       = 0;
     int  smw_fail_streak_ = 0;

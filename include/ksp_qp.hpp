@@ -158,6 +158,12 @@ public:
     double setup_time      = 0.0;   // wall-clock time spent in this constructor, in seconds
     bool   setup_failed    = false; // true if an error occurred during setup
 
+    // Experimental (see solve_profile.hpp): solve() fills profile with the factorizations by reason and
+    // the run time by phase; with trace.enabled set beforehand, trace also gets one row per linear-solver
+    // event, SSN iteration and PMM iteration.
+    SolveProfile  profile;
+    SolveTrace<T> trace;
+
     // Clock used for setup_time/solve_time and the time_limit check in solve().
     std::function<std::chrono::steady_clock::time_point()> now_ = [] { return std::chrono::steady_clock::now(); };
 
@@ -259,11 +265,11 @@ public:
     ResVec compute_residual_unscaled_inf_norms(const Vec& Ax, const Vec& Bx, const Vec& Qx);
     T objective_value(const Vec& x_orig);
     void printable_sol(const Vec& x, const Vec& y1, const Vec& y2, const Vec& z);
-    void update_PMM_parameters(const ResVec& res_norms, const ResVec& new_res_norms, typename SSN<T>::TerminationStatus ssn_opt, T ssn_res, int ssn_inner_iters);
+    PmmRule update_PMM_parameters(const ResVec& res_norms, const ResVec& new_res_norms, typename SSN<T>::TerminationStatus ssn_opt, T ssn_res, int ssn_inner_iters);
     bool primal_infeas(const Vec& cert_y1, const Vec& cert_y2, const Vec& cert_z);
     bool dual_infeas(const Vec& delta_x, const Vec& Adx, const Vec& Bdx);
     void accept_ssn_iterate(const SSN<T>& NS);
-    void update_multipliers_if_accurate(typename SSN<T>::TerminationStatus ssn_opt, Vec& delta_y1, Vec& delta_z);
+    bool update_multipliers_if_accurate(typename SSN<T>::TerminationStatus ssn_opt, Vec& delta_y1, Vec& delta_z);
     Solution<T> solve();
 };
 

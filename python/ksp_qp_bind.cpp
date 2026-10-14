@@ -59,6 +59,42 @@ static py::array_t<double> eigen_vec_to_array(const Vec& v) {
 }
 
 /*-----------------------------------------------------------------------
+Helpers: factorization log and run-time split (solve_profile.hpp)
+-----------------------------------------------------------------------*/
+// Adds the profile's columns (fact_<reason>, smw_update, ..., t_<phase>) as flat keys.
+static void add_profile(py::dict& out, const SolveProfile& p) {
+    p.visit([&](const char* name, const auto& v) { out[py::str(name)] = v; });
+}
+
+// Trace rows -> dict of equal-length lists, one per column (pandas.DataFrame(d) reads it).
+template <typename Row>
+static py::dict rows_to_dict(const std::vector<Row>& rows) {
+    std::vector<std::string> names;
+    Row{}.visit([&](const char* name, const auto&) { names.emplace_back(name); });
+    std::vector<py::list> cols(names.size());
+    for (const Row& row : rows) {
+        std::size_t i = 0;
+        row.visit([&](const char*, const auto& v) { cols[i++].append(v); });
+    }
+    py::dict out;
+    for (std::size_t i = 0; i < names.size(); ++i) out[py::str(names[i])] = cols[i];
+    return out;
+}
+
+static void add_trace(py::dict& out, const SolveTrace<T>& trace) {
+    out["trace_events"] = rows_to_dict(trace.events);
+    out["trace_ssn"]    = rows_to_dict(trace.ssn);
+    out["trace_pmm"]    = rows_to_dict(trace.pmm);
+}
+
+// The profile's column names, in the order add_profile() writes them.
+static std::vector<std::string> profile_columns() {
+    std::vector<std::string> names;
+    SolveProfile{}.visit([&](const char* name, const auto&) { names.emplace_back(name); });
+    return names;
+}
+
+/*-----------------------------------------------------------------------
 parse_sif: parse a SIF/MPS file and return problem data as numpy arrays.
 
 Returned dict keys:
@@ -125,6 +161,10 @@ Returns dict:
   schur_chol_fact   – direct-solver Cholesky factorizations of the Schur complement
   direct_smw_count  – direct-mode Newton systems solved through an SMW update (included in smw_count)
   direct_smw_reject – of those, updates rejected by the residual check and refactorized
+  ssn_tol_achieved, linesearch_fail, krylov_fail – as in Solution
+  fact_<reason>, smw_update, ..., t_<phase> – the factorization log and run-time split
+                      (profile_columns(); see solve_profile.hpp)
+  trace_events, trace_ssn, trace_pmm – with trace=True: one row per event / SSN / PMM iteration
   x                 – primal solution vector (original, unscaled units)
   y1, y2, z         – multipliers for Ax = b, Bx = w and the box constraints on x,
                       in the same original, unscaled units as x
@@ -134,12 +174,15 @@ py::dict solve_from_sif(const std::string& filename,
                         long long max_iter = 1'000'000'000LL,
                         double time_limit  = 600.0,
                         bool direct        = false,
-                        bool direct_smw    = true) {
+                        bool direct_smw    = true,
+                        bool trace         = false) {
     int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
-    int direct_smw_count, direct_smw_reject;
-    double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved;
+    int direct_smw_count, direct_smw_reject, linesearch_fail, krylov_fail;
+    double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved, ssn_tol_achieved;
     std::string system;
     Vec x_sol, y1_sol, y2_sol, z_sol;
+    SolveProfile profile;
+    SolveTrace<T> trace_data;
     {
         py::gil_scoped_release release;
         MpsFormatParser<T>   parser;
@@ -151,7 +194,13 @@ py::dict solve_from_sif(const std::string& filename,
         KSP_QP<T>  solver(prob);
         solver.direct_solve = direct;
         solver.direct_smw   = direct_smw;
+        solver.trace.enabled = trace;
         Solution<T> sol = solver.solve();
+        profile          = solver.profile;
+        trace_data       = std::move(solver.trace);
+        ssn_tol_achieved = (double)sol.ssn_tol_achieved;
+        linesearch_fail  = sol.linesearch_fail;
+        krylov_fail      = sol.krylov_fail;
         system           = system_label(solver.direct_solve || solver.pcg_failed,
                                         solver.kkt_ldlt_fact, solver.schur_chol_fact);
         kkt_ldlt_fact    = solver.kkt_ldlt_fact;
@@ -192,6 +241,11 @@ py::dict solve_from_sif(const std::string& filename,
     out["schur_chol_fact"]  = schur_chol_fact;
     out["direct_smw_count"]  = direct_smw_count;
     out["direct_smw_reject"] = direct_smw_reject;
+    out["ssn_tol_achieved"] = ssn_tol_achieved;
+    out["linesearch_fail"]  = linesearch_fail;
+    out["krylov_fail"]      = krylov_fail;
+    add_profile(out, profile);
+    if (trace) add_trace(out, trace_data);
     out["x"]                = eigen_vec_to_array(x_sol);
     out["y1"]               = eigen_vec_to_array(y1_sol);
     out["y2"]               = eigen_vec_to_array(y2_sol);
@@ -262,22 +316,25 @@ py::dict solve_from_data(const py::dict& pd_dict,
                          std::string trace_path = "",
                          double rho_init = -1.0,
                          bool direct = false,
-                         bool direct_smw = true) {
+                         bool direct_smw = true,
+                         bool trace = false) {
     KSPQPdata<T> pd = dict_to_kspqp(pd_dict); // reads Python objects
 
     int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
-    int direct_smw_count, direct_smw_reject;
-    double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved;
+    int direct_smw_count, direct_smw_reject, linesearch_fail, krylov_fail;
+    double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved, ssn_tol_achieved;
     std::string system;
     Vec x_sol, y1_sol, y2_sol, z_sol;
+    SolveProfile profile;
+    SolveTrace<T> trace_data;
     {
         py::gil_scoped_release release;
         // Diagnostic-only: a non-empty trace_path writes a per-PMM- and per-SSN-iteration
         // CSV trace (active-set sizes, ssn_opt, mu/rho) to that file. Default "": silent.
-        bool trace = !trace_path.empty();
+        bool write_trace_path = !trace_path.empty();
         Problem<T>  prob(pd, (T)tol, (int)max_iter, time_limit,
-                         trace ? PrintWhen::ALWAYS : PrintWhen::NEVER,
-                         trace ? PrintWhat::SSN    : PrintWhat::NONE);
+                         write_trace_path ? PrintWhen::ALWAYS : PrintWhen::NEVER,
+                         write_trace_path ? PrintWhat::SSN    : PrintWhat::NONE);
         KSP_QP<T>  solver(prob);
         // Diagnostic-only: override rho's initial value (default -1 keeps rho_limit). rho is
         // not in the termination checks or objective_value(), so this changes only the
@@ -285,8 +342,9 @@ py::dict solve_from_data(const py::dict& pd_dict,
         if (rho_init > 0.0) solver.rho = (T)rho_init;
         solver.direct_solve = direct;
         solver.direct_smw   = direct_smw;
+        solver.trace.enabled = trace;
         std::ofstream trace_file;
-        if (trace) {
+        if (write_trace_path) {
             trace_file.open(trace_path);
             trace_file << "pmm_iter,ssn_iter,n_active_W,n_active_K,ssn_opt,mu,rho,ssn_res\n";
             solver.report_ = [&trace_file](const IterationRecord<T>& r) {
@@ -296,7 +354,12 @@ py::dict solve_from_data(const py::dict& pd_dict,
             };
         }
         Solution<T> sol = solver.solve();
-        if (trace) trace_file.close();
+        if (write_trace_path) trace_file.close();
+        profile          = solver.profile;
+        trace_data       = std::move(solver.trace);
+        ssn_tol_achieved = (double)sol.ssn_tol_achieved;
+        linesearch_fail  = sol.linesearch_fail;
+        krylov_fail      = sol.krylov_fail;
         system           = system_label(solver.direct_solve || solver.pcg_failed,
                                         solver.kkt_ldlt_fact, solver.schur_chol_fact);
         kkt_ldlt_fact    = solver.kkt_ldlt_fact;
@@ -337,6 +400,11 @@ py::dict solve_from_data(const py::dict& pd_dict,
     out["schur_chol_fact"]  = schur_chol_fact;
     out["direct_smw_count"]  = direct_smw_count;
     out["direct_smw_reject"] = direct_smw_reject;
+    out["ssn_tol_achieved"] = ssn_tol_achieved;
+    out["linesearch_fail"]  = linesearch_fail;
+    out["krylov_fail"]      = krylov_fail;
+    add_profile(out, profile);
+    if (trace) add_trace(out, trace_data);
     out["x"]                = eigen_vec_to_array(x_sol);
     out["y1"]               = eigen_vec_to_array(y1_sol);
     out["y2"]               = eigen_vec_to_array(y2_sol);
@@ -364,11 +432,13 @@ The sparse matrices are in CSC format (data / indices / indptr / shape).)");
           py::arg("time_limit") = 600.0,
           py::arg("direct")     = false,
           py::arg("direct_smw") = true,
+          py::arg("trace")      = false,
           R"(Parse a SIF/MPS file and solve it with the KSP-QP solver.
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
 krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact,
-direct_smw_count, direct_smw_reject, x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
+direct_smw_count, direct_smw_reject, ssn_tol_achieved, linesearch_fail, krylov_fail, the profile
+columns (profile_columns()), x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
 original, unscaled units, so they can be checked against the problem data as given).
 status == 0  → optimal solution found
 status <  0  → infeasibility detected
@@ -383,7 +453,15 @@ direct_smw: default True; only used with direct=True. When True, an SSN iteratio
 sets differ little from the last factorization's is solved through a Sherman-Morrison-Woodbury
 update of that factorization instead of refactorizing; direct_smw_count counts those, and
 direct_smw_reject the ones whose residual check failed and were refactorized. When False, every
-change is refactorized.)");
+change is refactorized.
+
+Profile (experimental; see include/solve_profile.hpp): fact_<reason> counts the factorizations by
+why they were done (they add up to fact), smw_update/smw_reuse/pcg_fail the SMW updates, snapshot
+reuses and PCG failures, and t_setup ... t_pmm_other the run time by phase (they add up to run_time).
+
+trace: default False. When True, the dict also has trace_events, trace_ssn and trace_pmm, each a
+dict of equal-length lists (pandas.DataFrame(r["trace_ssn"])): one row per factorization / SMW
+update / PCG failure, per SSN iteration and per PMM iteration.)");
 
     m.def("solve_from_data", &solve_from_data,
           py::arg("pd"),
@@ -394,14 +472,16 @@ change is refactorized.)");
           py::arg("rho_init") = -1.0,
           py::arg("direct") = false,
           py::arg("direct_smw") = true,
+          py::arg("trace") = false,
           R"(Solve with KSP-QP using already-parsed problem data (dict from parse_sif).
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
 krylov_iter, fact, smw_count, pmm_tol_achieved, system, kkt_ldlt_fact, schur_chol_fact,
-direct_smw_count, direct_smw_reject, x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
+direct_smw_count, direct_smw_reject, ssn_tol_achieved, linesearch_fail, krylov_fail, the profile
+columns (profile_columns()), x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
 original, unscaled units, so they can be checked against the problem data as given).
 
-direct, direct_smw: experimental; same meaning as in solve_from_sif.
+direct, direct_smw, trace: experimental; same meaning as in solve_from_sif.
 
 trace_path: diagnostic-only, default "" (no tracing, matches prior behavior exactly). When
 set, writes a per-PMM-iteration and per-SSN-inner-iteration CSV trace to that path with columns
@@ -418,4 +498,8 @@ at its ceiling from PMM iteration 0). Does not appear in any outer termination c
 objective_value(), only in update_PMM_parameters()'s own schedule and SSN's H_diag/gradient,
 so it cannot corrupt what "converged" means -- only the search dynamics. Sentinel -1
 (default) leaves rho at its usual start, an exact no-op.)");
+
+    m.def("profile_columns", &profile_columns,
+          R"(Names of the profile keys solve_from_sif/solve_from_data return, in a fixed order
+(factorization counts by reason, then the t_* run-time phases); for CSV headers.)");
 }

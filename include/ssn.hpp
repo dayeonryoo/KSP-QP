@@ -12,28 +12,10 @@
 #include "schur_operator.hpp"
 #include "schur_preconditioner.hpp"
 #include "schur_smw_update.hpp"
+#include "solve_profile.hpp"
 
-// TIMER: master switch; 0 (off) by default. Set via -DSSN_ENABLE_TIMERS=1 to print per-step
-// timings of solve_ssn(); 0 compiles the timers out.
-#ifndef SSN_ENABLE_TIMERS
-#define SSN_ENABLE_TIMERS 0
-#endif
-
-#if SSN_ENABLE_TIMERS
-#include <chrono>
-#include <cstdio>
-
-// TIMER: RAII scoped timer; accumulates elapsed wall-clock seconds into `acc` on scope exit.
-struct SsnScopedTimer {
-    std::chrono::steady_clock::time_point t0;
-    double& acc;
-    explicit SsnScopedTimer(double& acc_) : t0(std::chrono::steady_clock::now()), acc(acc_) {}
-    ~SsnScopedTimer() { acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
-};
-#define SSN_TIMER_BLOCK(acc) SsnScopedTimer _ssn_scoped_timer(acc)
-#else
-#define SSN_TIMER_BLOCK(acc) do {} while (0)
-#endif
+// Adds the wall-clock seconds spent in the enclosing scope to `acc` (always on; see solve_profile.hpp).
+#define SSN_TIMER_BLOCK(acc) ScopedTimer _ssn_scoped_timer(acc)
 
 
 // ----- exact_line_search: testable function, independent of SSN class -----
@@ -154,28 +136,34 @@ public:
     int linesearch_fail = 0, krylov_fail = 0;
     bool krylov_converged = true;
 
-#if SSN_ENABLE_TIMERS
-    // TIMER: wall-clock seconds per SSN-loop phase for the current SSN iteration in solve_ssn();
-    // reset at the top of each iteration and printed to stderr at the end of that same iteration.
-    double timer_prep           = 0.0; // preparing SSN linear system
-    double timer_linear_solve   = 0.0; // solve_using_cg() + iterative refinement + recovering dy2
-    double timer_prec_setup     = 0.0; // subset of timer_linear_solve: preconditioner setData()/compute()
-    double timer_prec_assembly  = 0.0; // subset of timer_prec_setup: SchurPreconditioner sparse matrix assembly (P_hat / G*E*G_tr)
-    double timer_prec_analyze   = 0.0; // subset of timer_prec_setup: SchurPreconditioner::analyzePattern()
-    double timer_prec_factorize = 0.0; // subset of timer_prec_setup: SchurPreconditioner::factorize()
-    double timer_krylov_solve   = 0.0; // subset of timer_linear_solve: cg.solve()/solveWithGuess()
-    double timer_ldlt_analyze   = 0.0; // subset of timer_linear_solve: solve_using_ldlt()'s ldlt_.analyzePattern()
-    double timer_ldlt_factorize = 0.0; // subset of timer_linear_solve: solve_using_ldlt()'s ldlt_.factorize()
-    double timer_ldlt_solve     = 0.0; // subset of timer_linear_solve: solve_using_ldlt()'s ldlt_.solve()
-    double timer_chol_assembly  = 0.0; // subset of timer_linear_solve: solve_using_chol()'s assembly of S
-    double timer_chol_analyze   = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->analyzePattern()
-    double timer_chol_factorize = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->factorize()
-    double timer_chol_solve     = 0.0; // subset of timer_linear_solve: solve_using_chol()'s chol_->solve()
-    double timer_direct_smw_setup = 0.0; // subset of timer_linear_solve: solve_direct()'s SMW update setup
-    double timer_direct_smw_solve = 0.0; // subset of timer_linear_solve: solve_direct()'s solves through the SMW update
-    double timer_linesearch     = 0.0; // exact_linesearch
-    double timer_state_update   = 0.0; // x, y2 update + termination check
-#endif
+    // Factorization log and run-time split (experimental; see solve_profile.hpp). profile_ holds this
+    // SSN's totals over all solve_ssn() calls; trace_, when set and enabled, receives one row per
+    // linear-solver event and per SSN iteration. pmm_index_ (1-based) labels those rows; KSP_QP sets it.
+    SolveProfile profile_;
+    SolveTrace<T>* trace_ = nullptr;
+    int pmm_index_ = 0;
+
+    // Per-SSN-iteration state behind the log, reset by begin_iteration().
+    struct IterTimes {           // seconds, as in SolvePhases
+        double prep = 0.0, linear_solve = 0.0, fact = 0.0, analyze = 0.0, lowrank = 0.0, krylov = 0.0,
+               prec_apply = 0.0, prec_apply_smw = 0.0, direct_solve = 0.0, refine = 0.0,
+               linesearch = 0.0, update = 0.0;
+    };
+    struct IterState {
+        int index = 0;           // of this SSN iteration, counted over the whole run (1-based)
+        bool k_changed = false, w_changed = false, mu_changed = false, rho_changed = false; // see prepare_newton_system()
+        int flips_K = -1, flips_W = -1;
+        int setup = -1;          // first factorize / SMW update / reuse of the iteration (a LinAction), -1 if none
+        FactReason reason = FactReason::Other;
+        int rank = -1;
+        int facts = 0, smw = 0, krylov = 0, krylov_refine = 0;
+        double pcg_err = std::numeric_limits<double>::quiet_NaN();
+        bool ls_steepest = false;
+    };
+    IterTimes it_;
+    IterState it_state_;
+    bool in_refinement_ = false;                              // Krylov iterations count as refinement's
+    FactReason direct_pending_reason_ = FactReason::Count;    // reason of the next direct factorization (Count: none)
 
     // Krylov (conjugate gradient) parameters
     T krylov_tol = 1e-12; // Eigen's error convention: ||rhs - S*dy||_2 / ||rhs||_2.
@@ -409,6 +397,17 @@ public:
     LineSearchResult line_search_with_steepest_descent_fallback(T ssn_tol);
     void update_iterate(T tau, int ssn_iter_count);
     std::optional<TerminationStatus> check_ssn_termination(T ssn_tol, int& stagnation, T& prev_tol_achieved);
+
+    // Factorization log and run-time split (see profile_ / trace_ above).
+    static FactReason prec_fact_reason(const typename SchurPreconditioner<T>::BuildInfo& b);
+    LinEvent<T> make_event(LinTarget target, LinAction action) const;
+    void record_event(const LinEvent<T>& e);
+    void record_prec_build(int new_facts);
+    void record_pcg_fail(PcgFailKind kind, int iters, double err);
+    void record_direct_fact(bool ldlt, bool analyzed, double t_assembly, double t_analyze, double t_factorize);
+    FactReason consume_direct_reason();
+    void begin_iteration(int ssn_index);
+    void end_iteration(SsnLsOutcome outcome, T tau, T ssn_tol);
 };
 
 #include "ssn.tpp"

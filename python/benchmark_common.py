@@ -417,6 +417,12 @@ def replace_rows(path: Path, new_rows: list[dict], key: list[str], fieldnames: l
     _write_csv(path, out, fieldnames)
 
 
+def trace_rows(columns: dict, lead: dict) -> list[dict]:
+    """A KSP-QP trace table from the binding (dict of equal-length lists) as CSV rows, each led by `lead`."""
+    names = list(columns)
+    return [{**lead, **dict(zip(names, values))} for values in zip(*(columns[n] for n in names))]
+
+
 def load_solver_tables(paths: dict, key: list[str], how: str = "inner") -> pd.DataFrame:
     """Join per-solver result files on `key` into one frame, in the order of `paths` ({solver: path}).
 
