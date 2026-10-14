@@ -468,13 +468,14 @@ python3 benchmark_mm.py
 Runs the full Maros-Meszaros test set. Writes one result file per solver:
 `results/mm_kspqp.csv`, `results/mm_qpalm.csv`, `results/mm_osqp.csv`.
 
-Each solver writes only its own file, with the problem dimensions (`n` variables, `m` equality rows,
-`l` inequality rows), its setup/solve times and the run's provenance (run id,
+Each solver writes only its own file, with the problem size (`n` variables, `m` equality rows,
+`l` inequality rows, and `nnz_Q`, `nnz_A`, `nnz_B`, the nonzero values of Q's lower triangle, A and
+B), its setup/solve times and the run's provenance (run id,
 timestamp, host, CPU, git revision or solver version, tolerance, time limit). A rerun replaces the
 rows of the problems it solved and keeps the others, so KSP-QP can be rerun after every change while
 the QPALM and OSQP results are kept. The files share the column names of the former combined
-`comparison_mm.csv` (`ssn_*`, `qpalm_*`, `osqp_*`), and joining them on `name`, `n`, `m`, `l` gives
-that table plus the dimensions (`benchmark_common.load_solver_tables`).
+`comparison_mm.csv` (`ssn_*`, `qpalm_*`, `osqp_*`), and joining them on `name` and the size columns
+gives that table plus the problem size (`benchmark_common.load_solver_tables`).
 
 ```
 --root DIR             override project root (default: parent of script)
