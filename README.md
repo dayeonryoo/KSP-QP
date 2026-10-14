@@ -455,16 +455,35 @@ cd python
 python3 benchmark_mm.py
 ```
 
-Runs the full Maros-Meszaros test set. Writes `results/comparison_mm.csv` plus Dolan-Moré
-performance profiles (`results/performance_profile_mm*.pdf/.png`, by time and by iteration count).
+Runs the full Maros-Meszaros test set. Writes one result file per solver —
+`results/mm_kspqp.csv`, `results/mm_qpalm.csv`, `results/mm_osqp.csv` — plus Dolan-Moré
+performance profiles (`results/performance_profile_mm*.pdf/.png`, by time, by iteration count and
+by inner iteration count).
+
+Each solver writes only its own file, with its setup/solve times and the run's provenance (run id,
+timestamp, host, CPU, git revision or solver version, tolerance, time limit). A rerun replaces the
+rows of the problems it solved and keeps the others, so KSP-QP can be rerun after every change while
+the QPALM and OSQP results are kept. The files share the column names of the former combined
+`comparison_mm.csv` (`ssn_*`, `qpalm_*`, `osqp_*`), and joining them on `name` gives that table
+(`benchmark_common.load_solver_tables`). The profiles compare the problems present in every file.
 
 ```
 --root DIR             override project root (default: parent of script)
 --tol 1e-6             primal-dual tolerance
 --time-limit 60        per-problem time limit in seconds
 --solver {ksp-qp,qpalm,osqp} [...]   which solvers to run (default: all three)
---out PREFIX           output file prefix (default: comparison_mm)
+--problems NAME [...]  run only these problems (default: all)
+--out PREFIX           output file prefix (e.g. 1015 -> results/1015_mm_kspqp.csv)
+--kspqp-csv/--qpalm-csv/--osqp-csv FILE   another run's result file to use in the profiles
+                       (default: this prefix's own files, where they exist)
 --cooldown 0           seconds to sleep between problems (avoids CPU throttling)
+```
+
+For example, to rerun KSP-QP only and compare it against QPALM/OSQP results kept from an earlier run:
+
+```bash
+python3 benchmark_mm.py --solver ksp-qp --out 1015 \
+    --qpalm-csv ../results/1003_mm_qpalm.csv --osqp-csv ../results/1003_mm_osqp.csv
 ```
 
 ### Netlib LP benchmark
@@ -476,7 +495,8 @@ python3 benchmark_netlib.py
 
 Runs the full Netlib LP test set (`data/netlib-main/feasible/`, 114 instances). Writes
 `results/comparison_netlib.csv` plus Dolan-Moré performance profiles
-(`results/performance_profile_netlib*.pdf/.png`). Same flags as `benchmark_mm.py`.
+(`results/performance_profile_netlib*.pdf/.png`). Same flags as `benchmark_mm.py`, except
+`--problems` and `--*-csv`: this benchmark still writes one combined file for all solvers.
 
 ### Netlib infeasible LP benchmark
 
@@ -529,7 +549,8 @@ Produces three tables — `poisson_control`, `poisson_state`, `convdiff_both` �
 
 ```bash
 cd python
-python3 benchmark_mpc.py --out 0926          # -> results/0926_mpc_sweep.csv
+python3 benchmark_mpc.py --out 0926          # -> results/0926_mpc_kspqp.csv, results/0926_mpc_qpalm.csv
+python3 benchmark_mpc.py --solver ksp-qp --out 0926   # rerun KSP-QP only; 0926_mpc_qpalm.csv is kept
 ```
 
 Benchmarks KSP-QP against QPALM on the platoon linear-MPC QP built by `mpc_generator.py` — a
@@ -539,8 +560,12 @@ inequality rows) whose constraint matrix is banded with at most 6 nonzeros per r
 The problem has **two** size axes and they are not interchangeable, so the sweep is a grid
 rather than a curve: `M` (vehicle count) grows the band *width* and the dense `2M × 2M` DARE
 terminal cost block, while `N` (horizon) grows the band *length* at fixed bandwidth. Sweeping
-one at a time through the corner of the `(M, N)` plane is misleading. Output is long format —
-one row per (instance × solver × repeat) — in `results/<prefix>_mpc_sweep.csv`.
+one at a time through the corner of the `(M, N)` plane is misleading. Output is one file per
+solver, in long format — one row per (instance × repeat) — in `results/<prefix>_mpc_kspqp.csv` and
+`results/<prefix>_mpc_qpalm.csv`. Rerunning a configuration `(M, N, loop mode)` replaces that
+configuration's rows in the files of the solvers run and keeps every other row. Rows of the two
+files pair up on `(M, N, loop_mode, step, rep)`; with `--loop-mode shared` every run solves the same
+instances, which the `xbar_norm` column confirms.
 
 ```
 --root DIR             override project root (default: parent of script)

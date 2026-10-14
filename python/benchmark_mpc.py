@@ -36,11 +36,18 @@ Trajectory design: two loop modes via --loop-mode:
 
 Outputs
 -------
-  results/{--out prefix}_mpc_sweep.csv
-  long format: one row per (instance x solver x repeat)
+  results/{--out prefix}_mpc_kspqp.csv, results/{--out prefix}_mpc_qpalm.csv
+  one file per solver, long format: one row per (instance x repeat)
+
+  Each solver only writes its own file. Rerunning a configuration (M, N, loop mode) replaces
+  that configuration's rows in the files of the solvers run and keeps every other row, so
+  KSP-QP can be rerun after every change while QPALM's results are kept. Rows of the two
+  files pair up on (M, N, loop_mode, step, rep); in the "shared" loop mode every run solves
+  the same instances (same reference trajectory), which xbar_norm confirms.
 
 === HOW TO RUN ===
-  python3 benchmark_mpc.py --out 0926              # -> results/0926_mpc_sweep.csv
+  python3 benchmark_mpc.py --out 0926              # -> results/0926_mpc_{kspqp,qpalm}.csv
+  python3 benchmark_mpc.py --solver ksp-qp --out 0926   # rerun KSP-QP only, keep 0926_mpc_qpalm.csv
   python3 benchmark_mpc.py --M 20 50 --N 200 400 --T 4 --reps 3
   python3 benchmark_mpc.py --solver ksp-qp --time-limit 60
   python3 benchmark_mpc.py --solver ksp-qp --direct   # direct solver instead of PCG
@@ -48,15 +55,10 @@ Outputs
 """
 
 import sys
-import csv
 import time
-import uuid
-import socket
 import argparse
 import platform
-import subprocess
 import multiprocessing as mp
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -80,11 +82,14 @@ from benchmark_common import (
     kspqp_to_qpalm,
     QPALM_SOLVED,
     _run_isolated,
-    _write_csv,
+    provenance,
+    check_header,
+    replace_rows,
 )
 import mpc_generator as mg
 
-SCHEMA_VERSION = 2          # bump on any CSV_FIELDS change; old CSVs are not appendable
+SCHEMA_VERSION = 3          # bump on any CSV_FIELDS or file-layout change; old CSVs are not appendable
+                            # (3: one file per solver)
 
 # Sweep grid. The cross product is filtered by MAX_NZ, which drops only the
 # top-right corner (large M *and* large N simultaneously).
@@ -97,6 +102,7 @@ DEFAULT_REPS = 4            # timed repeats per instance; repeat 0 is discarded
 DEFAULT_TOL = 1e-6
 
 SOLVERS = ["ksp-qp", "qpalm"]
+SOLVER_FILES = {"ksp-qp": "kspqp", "qpalm": "qpalm"}   # results/{prefix}mpc_<tag>.csv
 
 
 def sweep_configs(M_list=None, N_list=None, max_nz: int = MAX_NZ):
@@ -209,7 +215,8 @@ def generate_trajectory(M: int, N: int, T: int) -> list:
 # Rollout worker: one subprocess per (M, N) config, since small MPC QPs solve in
 # milliseconds and per-step spawning would dominate; crashes/OOM are still isolated
 # per config. Both solvers run in the same worker so their order can alternate per
-# repeat, avoiding thermal-drift and P-/E-core bias toward whichever runs first.
+# repeat, avoiding thermal-drift and P-/E-core bias toward whichever runs first. That
+# only applies when both are run together; a solver rerun alone is timed on its own.
 # ---------------------------------------------------------------------------
 
 def _set_high_qos():
@@ -269,12 +276,14 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
 
 
 # ---------------------------------------------------------------------------
-# CSV -- long format, one row per (instance, solver, repeat).
+# CSV -- one file per solver, long format, one row per (instance, repeat).
 #
-# schema_version separates this from older wide CSVs (all solvers on one row), which
-# are incompatible; _write_csv's extrasaction="ignore" silently drops keys missing
-# from CSV_FIELDS.
+# schema_version separates this from older layouts (all solvers on one row, or in one
+# file), which are incompatible; extrasaction="ignore" silently drops keys missing from
+# CSV_FIELDS. A rerun replaces whole configurations (CONFIG_KEY) in a solver's file.
 # ---------------------------------------------------------------------------
+
+CONFIG_KEY = ["M", "N", "loop_mode"]
 
 CSV_FIELDS = [
     # provenance
@@ -293,25 +302,10 @@ CSV_FIELDS = [
 
 
 def _provenance() -> dict:
-    def _sh(cmd):
-        try:
-            return subprocess.check_output(cmd, shell=True, text=True,
-                                           stderr=subprocess.DEVNULL).strip()
-        except Exception:
-            return ""
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": uuid.uuid4().hex[:12],
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "host": socket.gethostname(),
-        "cpu": _sh("sysctl -n machdep.cpu.brand_string") or platform.processor(),
-        "git_sha": _sh("git rev-parse --short HEAD"),
-        "qpalm_version": getattr(qpalm, "__version__", "?"),
-        "osqp_version": getattr(osqp, "__version__", "?"),
-    }
+    return {"schema_version": SCHEMA_VERSION, **provenance()}
 
 
-def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, rows, csv_path,
+def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
                prov, cooldown=0.0, loop_mode="shared", direct=False) -> None:
     sysm = mg.platoon_system(M)
     pdd0 = mg.generate_mpc_qp(sysm, N, sysm.xbar0)
@@ -334,12 +328,14 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, rows, csv_path
                          max_iter, solvers, direct))
     if "error" in out:
         print(f"    ERROR - {out['error']}", flush=True)
-        rows.append({**meta, "solver": "ERROR", "status": -99, "solved": 0})
-        _write_csv(csv_path, rows, CSV_FIELDS)
+        for s in solvers:
+            replace_rows(csv_paths[s], [{**meta, "solver": s, "status": -99, "solved": 0}],
+                         CONFIG_KEY, CSV_FIELDS)
         return
 
-    for r in out["rows"]:
-        rows.append({**meta, **r})
+    for s in solvers:
+        replace_rows(csv_paths[s], [{**meta, **r} for r in out["rows"] if r["solver"] == s],
+                     CONFIG_KEY, CSV_FIELDS)
 
     # Timed repeats: discard repeat 0 (allocator / page-fault warm-up), report the
     # minimum of the rest -- the least scheduler-contaminated estimate for a
@@ -352,7 +348,6 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, rows, csv_path
         print(f"    {s:8s} solved={solved}/{n_inst}  best={best * 1000:9.1f}ms  "
               f"median={float(np.median(ts)) * 1000:9.1f}ms", flush=True)
 
-    _write_csv(csv_path, rows, CSV_FIELDS)
     if cooldown:
         time.sleep(cooldown)
 
@@ -396,20 +391,15 @@ def main() -> None:
     max_iter = 10_000_000_000
     solvers = [s for s in SOLVERS if s in set(args.solver)]
     name_prefix = f"{args.out}_" if args.out else ""
-    csv_path = result_dir / f"{name_prefix}mpc_sweep.csv"
+    csv_paths = {s: result_dir / f"{name_prefix}mpc_{SOLVER_FILES[s]}.csv" for s in solvers}
 
-    # Never append across schema versions -- that is how the archived CSVs ended up
+    # Never mix schema versions in one file -- that is how the archived CSVs ended up
     # with columns that no longer exist.
-    if csv_path.exists():
-        with open(csv_path, newline="") as fh:
-            head = next(csv.reader(fh), [])
-        if head != CSV_FIELDS:
-            sys.exit(f"{csv_path} has an incompatible schema (expected schema_version "
-                     f"{SCHEMA_VERSION}). Move it aside or pass --out <prefix>.")
+    for p in csv_paths.values():
+        check_header(p, CSV_FIELDS)
 
     configs = sweep_configs(args.M, args.N, args.max_nz)
     prov = _provenance()
-    rows: list[dict] = []
 
     print(f"run_id={prov['run_id']}  git={prov['git_sha']}  {len(configs)} configurations  "
           f"tol={args.tol:g}  solvers={','.join(solvers)}  "
@@ -417,9 +407,9 @@ def main() -> None:
     for i, (M, N) in enumerate(configs, 1):
         print(f"\n[{i}/{len(configs)}]")
         run_config(M, N, args.T, args.reps, args.tol, args.time_limit, max_iter,
-                   solvers, rows, csv_path, prov, args.cooldown, args.loop_mode, args.direct)
+                   solvers, csv_paths, prov, args.cooldown, args.loop_mode, args.direct)
 
-    print(f"\nResults written to: {csv_path}")
+    print("\nResults written to: " + ", ".join(str(p) for p in csv_paths.values()))
 
 
 if __name__ == "__main__":
