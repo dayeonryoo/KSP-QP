@@ -45,6 +45,9 @@ Outputs
   files pair up on (M, N, loop_mode, step, rep); in the "shared" loop mode every run solves
   the same instances (same reference trajectory), which xbar_norm confirms.
 
+  After the instance columns, the files use benchmark_mm.py's column names (ssn_*, pmm_iter, ...
+  for KSP-QP, qpalm_* for QPALM) and record their run's provenance. A line is printed per solve.
+
 === HOW TO RUN ===
   python3 benchmark_mpc.py --out 0926              # -> results/0926_mpc_{kspqp,qpalm}.csv
   python3 benchmark_mpc.py --solver ksp-qp --out 0926   # rerun KSP-QP only, keep 0926_mpc_qpalm.csv
@@ -87,9 +90,6 @@ from benchmark_common import (
 )
 import mpc_generator as mg
 
-SCHEMA_VERSION = 3          # bump on any CSV_FIELDS or file-layout change; old CSVs are not appendable
-                            # (3: one file per solver)
-
 # Sweep grid. The cross product is filtered by MAX_NZ, which drops only the
 # top-right corner (large M *and* large N simultaneously).
 DEFAULT_M = [5, 10, 20, 50, 100, 200, 300]
@@ -102,6 +102,7 @@ DEFAULT_TOL = 1e-6
 
 SOLVERS = ["ksp-qp", "qpalm"]
 SOLVER_FILES = {"ksp-qp": "kspqp", "qpalm": "qpalm"}   # results/{prefix}mpc_<tag>.csv
+PREFIX = {"ksp-qp": "ssn", "qpalm": "qpalm"}           # column prefix, as in benchmark_mm.py
 
 
 def sweep_configs(M_list=None, N_list=None, max_nz: int = MAX_NZ):
@@ -142,15 +143,15 @@ def _solve_qpalm_x(qpalm_data: tuple, tol: float, time_limit: float, obj_const: 
     solver.solve()
     info = solver.info
     result = {
-        "status": int(info.status_val),
-        "solved": int(info.status_val == QPALM_SOLVED),
-        "obj_val": float(info.objective) + obj_const,
-        "setup_time": float(getattr(info, "setup_time", float("nan"))),
-        "solve_time": float(getattr(info, "solve_time", float("nan"))),
-        "run_time": float(info.run_time),
-        "outer_iter": int(info.iter_out),
-        "inner_iter": int(info.iter),
-        "tol_achieved": max(float(info.pri_res_norm), float(info.dua_res_norm)),
+        "qpalm_status": int(info.status_val),
+        "qpalm_solved": int(info.status_val == QPALM_SOLVED),
+        "qpalm_time": float(info.run_time),
+        "qpalm_setup_time": float(getattr(info, "setup_time", float("nan"))),
+        "qpalm_solve_time": float(getattr(info, "solve_time", float("nan"))),
+        "qpalm_iter": int(info.iter_out),
+        "qpalm_inner_iter": int(info.iter),
+        "qpalm_obj": float(info.objective) + obj_const,
+        "qpalm_tol_achieved": max(float(info.pri_res_norm), float(info.dua_res_norm)),
     }
     return result, np.asarray(solver.solution.x, dtype=np.float64)
 
@@ -168,18 +169,18 @@ def _solve_osqp_x(qpalm_data: tuple, tol: float, time_limit: float):
 def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int):
     r = ksp_qp_bind.solve_from_data(pdd, tol, max_iter, time_limit)
     result = {
-        "status": int(r["status"]),
-        "solved": int(r["status"] == 0),
-        "obj_val": float(r["obj_val"]),
-        "setup_time": float(r["setup_time"]),
-        "solve_time": float(r["solve_time"]),
-        "run_time": float(r["run_time"]),
-        "outer_iter": int(r["pmm_iter"]),
-        "inner_iter": int(r["ssn_iter"]),
+        "ssn_status": int(r["status"]),
+        "ssn_solved": int(r["status"] == 0),
+        "ssn_time": float(r["run_time"]),
+        "ssn_setup_time": float(r["setup_time"]),
+        "ssn_solve_time": float(r["solve_time"]),
+        "pmm_iter": int(r["pmm_iter"]),
+        "ssn_iter": int(r["ssn_iter"]),
         "krylov_iter": int(r["krylov_iter"]),
         "fact": int(r["fact"]),
         "smw_count": int(r["smw_count"]),
-        "tol_achieved": float(r["pmm_tol_achieved"]),
+        "ssn_obj": float(r["obj_val"]),
+        "pmm_tol_achieved": float(r["pmm_tol_achieved"]),
     }
     return result, np.asarray(r["x"], dtype=np.float64)
 
@@ -190,6 +191,21 @@ def _solve_one(solver_name, pdd, tol, time_limit, max_iter):
     if solver_name == "qpalm":
         return _solve_qpalm_x(kspqp_to_qpalm(pdd), tol, time_limit, pdd.get("obj_const", 0.0))
     raise ValueError(f"Unknown solver_name: {solver_name}")
+
+
+def _log_solve(solver_name: str, t: int, rep: int, r: dict) -> None:
+    """One line per solve, as benchmark_mm.py prints."""
+    if solver_name == "ksp-qp":
+        status = "OPTIMAL" if r["ssn_solved"] else f"status={r['ssn_status']}"
+        print(f"    step {t} rep {rep}  KSP-QP : {status:12s}  t = {r['ssn_time'] * 1000:.2f} ms  "
+              f"pmm={r['pmm_iter']} ssn={r['ssn_iter']} krylov={r['krylov_iter']} "
+              f"fact={r['fact']} smw={r['smw_count']}  "
+              f"tol={r['pmm_tol_achieved']:.2e}  obj = {r['ssn_obj']:.6g}", flush=True)
+    else:
+        status = "OPTIMAL" if r["qpalm_solved"] else f"status={r['qpalm_status']}"
+        print(f"    step {t} rep {rep}  QPALM  : {status:12s}  t = {r['qpalm_time'] * 1000:.2f} ms  "
+              f"outer={r['qpalm_iter']} inner={r['qpalm_inner_iter']}  "
+              f"tol={r['qpalm_tol_achieved']:.2e}  obj = {r['qpalm_obj']:.6g}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +248,7 @@ def _set_high_qos():
 
 def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_iter,
                     solvers, conn):
-    rows = []
+    rows = {s: [] for s in solvers}
     try:
         _set_high_qos()
         sysm = mg.platoon_system(M)
@@ -255,13 +271,13 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
                     t0 = time.perf_counter()
                     result, x = _solve_one(solver_name, pdd, tol, time_limit, max_iter)
                     wall = time.perf_counter() - t0
+                    _log_solve(solver_name, t, rep, result)
 
-                    rows.append({
-                        "M": M, "N": N, "step": t, "rep": rep,
-                        "solver": solver_name,
+                    rows[solver_name].append({
+                        "step": t, "rep": rep,
                         "xbar_norm": float(np.linalg.norm(xbar)),
-                        "wall_time": wall,
-                        **{k: v for k, v in result.items()},
+                        f"{PREFIX[solver_name]}_wall_time": wall,
+                        **result,
                     })
 
                     if loop_mode == "own" and rep == reps - 1 and t < T - 1:
@@ -274,47 +290,52 @@ def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_
 
 
 # ---------------------------------------------------------------------------
-# CSV -- one file per solver, long format, one row per (instance, repeat).
-#
-# schema_version separates this from older layouts (all solvers on one row, or in one
-# file), which are incompatible; extrasaction="ignore" silently drops keys missing from
-# CSV_FIELDS. A rerun replaces whole configurations (CONFIG_KEY) in a solver's file.
+# CSV -- one file per solver, long format, one row per (instance, repeat), with
+# benchmark_mm.py's column names after the instance columns. extrasaction="ignore"
+# silently drops keys missing from FIELDS. A rerun replaces whole configurations
+# (CONFIG_KEY) in a solver's file.
 # ---------------------------------------------------------------------------
 
 CONFIG_KEY = ["M", "N", "loop_mode"]
 
-CSV_FIELDS = [
-    # provenance
-    "schema_version", "run_id", "timestamp", "host", "cpu", "git_sha",
-    "qpalm_version", "osqp_version",
-    # instance
-    "M", "N", "n_x", "n_u", "n_z", "m_eq", "l_ineq", "nnz_Q", "nnz_A",
-    "loop_mode", "T", "step", "xbar_norm",
-    # configuration
-    "solver", "tol_requested", "time_limit", "rep",
-    # results (as reported by each solver, in ITS OWN residual convention)
-    "status", "solved", "obj_val", "tol_achieved",
-    "setup_time", "solve_time", "run_time", "wall_time",
-    "outer_iter", "inner_iter", "krylov_iter", "fact", "smw_count",
-]
+INSTANCE = ["M", "N", "loop_mode", "step", "rep", "T",
+            "n_x", "n_u", "n_z", "m_eq", "l_ineq", "nnz_Q", "nnz_A", "xbar_norm"]
 
+# Results as reported by each solver, in ITS OWN residual convention.
+FIELDS = {
+    "ksp-qp": [*INSTANCE,
+               "ssn_solved", "ssn_status", "pmm_iter", "ssn_iter", "krylov_iter", "fact", "smw_count",
+               "ssn_obj", "pmm_tol_achieved", "ssn_time", "ssn_setup_time", "ssn_solve_time",
+               "ssn_wall_time", "ssn_tol", "ssn_time_limit",
+               "ssn_run_id", "ssn_timestamp", "ssn_host", "ssn_cpu", "ssn_git_sha"],
+    "qpalm":  [*INSTANCE,
+               "qpalm_solved", "qpalm_status", "qpalm_iter", "qpalm_inner_iter",
+               "qpalm_obj", "qpalm_tol_achieved", "qpalm_time", "qpalm_setup_time", "qpalm_solve_time",
+               "qpalm_wall_time", "qpalm_tol", "qpalm_time_limit",
+               "qpalm_run_id", "qpalm_timestamp", "qpalm_host", "qpalm_cpu", "qpalm_version"],
+}
 
-def _provenance() -> dict:
-    return {"schema_version": SCHEMA_VERSION, **provenance()}
+# Written for each solver of a configuration whose worker failed, as in benchmark_mm.py.
+ERROR_ROW = {
+    "ksp-qp": dict(ssn_status=-99, ssn_solved=0, ssn_time=np.inf, ssn_wall_time=np.inf,
+                   pmm_iter=np.inf, ssn_iter=np.inf, krylov_iter=np.inf, fact=np.inf, smw_count=np.inf,
+                   ssn_obj=np.nan, pmm_tol_achieved=np.nan, ssn_setup_time=np.nan, ssn_solve_time=np.nan),
+    "qpalm":  dict(qpalm_status=-99, qpalm_solved=0, qpalm_time=np.inf, qpalm_wall_time=np.inf,
+                   qpalm_iter=np.inf, qpalm_inner_iter=np.inf,
+                   qpalm_obj=np.nan, qpalm_tol_achieved=np.nan, qpalm_setup_time=np.nan, qpalm_solve_time=np.nan),
+}
 
 
 def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
-               prov, cooldown=0.0, loop_mode="shared") -> None:
+               run_cols, cooldown=0.0, loop_mode="shared") -> None:
     sysm = mg.platoon_system(M)
     pdd0 = mg.generate_mpc_qp(sysm, N, sysm.xbar0)
     n_z = int(pdd0["n"])
     meta = {
-        **prov,
         "M": M, "N": N, "n_x": sysm.n_x, "n_u": sysm.n_u,
         "n_z": n_z, "m_eq": int(pdd0["m"]), "l_ineq": int(pdd0["l"]),
         "nnz_Q": int(pdd0["Q_data"].size), "nnz_A": int(pdd0["A_data"].size),
         "loop_mode": loop_mode, "T": T,
-        "tol_requested": tol, "time_limit": time_limit,
     }
     print(f"  M={M} N={N} n_z={n_z} nnz_Q={meta['nnz_Q']} nnz_A={meta['nnz_A']} "
           f"T={T} reps={reps} loop_mode={loop_mode}", flush=True)
@@ -327,21 +348,22 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
     if "error" in out:
         print(f"    ERROR - {out['error']}", flush=True)
         for s in solvers:
-            replace_rows(csv_paths[s], [{**meta, "solver": s, "status": -99, "solved": 0}],
-                         CONFIG_KEY, CSV_FIELDS)
+            replace_rows(csv_paths[s], [{**meta, **run_cols[s], **ERROR_ROW[s]}],
+                         CONFIG_KEY, FIELDS[s])
         return
 
     for s in solvers:
-        replace_rows(csv_paths[s], [{**meta, **r} for r in out["rows"] if r["solver"] == s],
-                     CONFIG_KEY, CSV_FIELDS)
+        replace_rows(csv_paths[s], [{**meta, **run_cols[s], **r} for r in out["rows"][s]],
+                     CONFIG_KEY, FIELDS[s])
 
     # Timed repeats: discard repeat 0 (allocator / page-fault warm-up), report the
     # minimum of the rest -- the least scheduler-contaminated estimate for a
     # deterministic single-threaded kernel.
     for s in solvers:
-        ts = [r["run_time"] for r in out["rows"] if r["solver"] == s and r["rep"] > 0]
-        solved = sum(r["solved"] for r in out["rows"] if r["solver"] == s and r["rep"] == 0)
-        n_inst = sum(1 for r in out["rows"] if r["solver"] == s and r["rep"] == 0)
+        p = PREFIX[s]
+        ts = [r[f"{p}_time"] for r in out["rows"][s] if r["rep"] > 0]
+        solved = sum(r[f"{p}_solved"] for r in out["rows"][s] if r["rep"] == 0)
+        n_inst = sum(1 for r in out["rows"][s] if r["rep"] == 0)
         best = min(ts) if ts else float("nan")
         print(f"    {s:8s} solved={solved}/{n_inst}  best={best * 1000:9.1f}ms  "
               f"median={float(np.median(ts)) * 1000:9.1f}ms", flush=True)
@@ -388,20 +410,31 @@ def main() -> None:
     name_prefix = f"{args.out}_" if args.out else ""
     csv_paths = {s: result_dir / f"{name_prefix}mpc_{SOLVER_FILES[s]}.csv" for s in solvers}
 
-    # Never mix schema versions in one file -- that is how the archived CSVs ended up
+    # Never mix layouts in one file -- that is how the archived CSVs ended up
     # with columns that no longer exist.
-    for p in csv_paths.values():
-        check_header(p, CSV_FIELDS)
+    for s, p in csv_paths.items():
+        check_header(p, FIELDS[s])
 
     configs = sweep_configs(args.M, args.N, args.max_nz)
-    prov = _provenance()
+
+    # Provenance recorded on every row this run writes, per solver.
+    prov = provenance()
+    run_cols = {
+        "ksp-qp": {"ssn_tol": args.tol, "ssn_time_limit": args.time_limit,
+                   "ssn_run_id": prov["run_id"], "ssn_timestamp": prov["timestamp"],
+                   "ssn_host": prov["host"], "ssn_cpu": prov["cpu"], "ssn_git_sha": prov["git_sha"]},
+        "qpalm":  {"qpalm_tol": args.tol, "qpalm_time_limit": args.time_limit,
+                   "qpalm_run_id": prov["run_id"], "qpalm_timestamp": prov["timestamp"],
+                   "qpalm_host": prov["host"], "qpalm_cpu": prov["cpu"],
+                   "qpalm_version": prov["qpalm_version"]},
+    }
 
     print(f"run_id={prov['run_id']}  git={prov['git_sha']}  {len(configs)} configurations  "
           f"tol={args.tol:g}  solvers={','.join(solvers)}")
     for i, (M, N) in enumerate(configs, 1):
         print(f"\n[{i}/{len(configs)}]")
         run_config(M, N, args.T, args.reps, args.tol, args.time_limit, max_iter,
-                   solvers, csv_paths, prov, args.cooldown, args.loop_mode)
+                   solvers, csv_paths, run_cols, args.cooldown, args.loop_mode)
 
     print("\nResults written to: " + ", ".join(str(p) for p in csv_paths.values()))
 

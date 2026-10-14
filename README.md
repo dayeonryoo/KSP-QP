@@ -535,7 +535,9 @@ solver, in long format — one row per (instance × repeat) — in `results/<pre
 `results/<prefix>_mpc_qpalm.csv`. Rerunning a configuration `(M, N, loop mode)` replaces that
 configuration's rows in the files of the solvers run and keeps every other row. Rows of the two
 files pair up on `(M, N, loop_mode, step, rep)`; with `--loop-mode shared` every run solves the same
-instances, which the `xbar_norm` column confirms.
+instances, which the `xbar_norm` column confirms. After the instance columns, the files use the
+column names of `benchmark_mm.py` (`ssn_*`, `pmm_iter`, … for KSP-QP, `qpalm_*` for QPALM),
+including the run's provenance, and a line is printed per solve.
 
 ```
 --root DIR             override project root (default: parent of script)
