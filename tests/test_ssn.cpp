@@ -299,6 +299,24 @@ TEST(SSN, ChooseSchurLdltPrefersSchurForSparseWideActiveSet) {
   EXPECT_FALSE(ns.choose_schur_ldlt(G, active_K));
 }
 
+TEST(SSN, ChooseSchurLdltPrefersSchurForFewRowsAndManySparseColumns) {
+  // 10 rows, 50k active K columns with 5 nonzeros each. Uncapped, the |S| estimate grows with the
+  // column count (~1e6) and the ratio is ~6e-5 -> LDLT; capped at s^2 = 100, it is ~6e3 -> Schur.
+  const int s = 10, N = 50000;
+  SsnFixture f(SpMat(0, N), SpMat(0, N));
+  SSN<double> ns = f.Make();
+
+  std::vector<Eigen::Triplet<double>> trips;
+  for (int k = 0; k < N; ++k)
+    for (int j = 0; j < 5; ++j) trips.emplace_back((k + 2 * j) % s, k, 1.0);
+  SpMat G(s, N);
+  G.setFromTriplets(trips.begin(), trips.end());
+  G.makeCompressed();
+  const BoolArr active_K = BoolArr::Constant(N, true);
+
+  EXPECT_FALSE(ns.choose_schur_ldlt(G, active_K));
+}
+
 TEST(SSN, ChooseSchurLdltHandlesZeroRowsAndZeroActiveColumnsWithoutNaN) {
   // s = G.rows() = 0 and t = active_K.count() = 0 simultaneously
   // but `if (S_nnz <= 0) return true;` always short-circuits before s/(t+s) computation.

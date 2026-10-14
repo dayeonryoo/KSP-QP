@@ -94,7 +94,7 @@ bool SSN<T>::choose_schur_ldlt(const SpMat& G, const BoolArr& active_K) {
     Compare the estimated total work required to factorize the KKT matrix K and the Schur complement S.
     Ratio = (s / (s+t)) * (|K|^2 / |S|^2), where s = G.rows() and t = n_act_K.
     |K| = nnz in the KKT matrix [-H_act_K, G_act_K^T; G_act_K, (1/mu)I] (active_K columns only).
-    |S| is overestimated via the densest active_K column and the pigeonhole principle.
+    |S| is overestimated via the densest active_K column and the pigeonhole principle, capped at s^2.
     Returns true (prefer LDLT on K) when ratio < kSchurLdltRatioThreshold.
     The direct solver passes an all-true mask, since the exact K and S contain every column.
     */
@@ -129,6 +129,7 @@ bool SSN<T>::choose_schur_ldlt(const SpMat& G, const BoolArr& active_K) {
                    - (long long) o_k * o_k
                    + o_k;
     }
+    S_nnz = std::min<long long>(S_nnz, (long long)s * s); // S is s x s.
 
     if (S_nnz <= 0) return true;
 
