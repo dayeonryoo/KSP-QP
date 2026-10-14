@@ -7,14 +7,12 @@ Netlib instances with the Kennington family blended in.
 Outputs
 -------
   results/comparison_netlib.csv                    - per-problem timing, iteration counts, and status
-  results/performance_profile_netlib.pdf/png       - Dolan-Moré performance profile (run time)
-  results/performance_profile_netlib_iters.pdf/png - Dolan-Moré performance profile (iterations)
 
 === HOW TO RUN FROM SCRATCH ===
 
 Step 1 - Install Python dependencies
 -------------------------------------
-  pip install qpalm osqp numpy scipy matplotlib pandas
+  pip install qpalm osqp numpy scipy pandas
 
 Step 2 - Build the KSP-QP Python binding
 ------------------------------------------
@@ -77,9 +75,6 @@ from benchmark_common import (
     OSQP_SOLVED,
     _write_csv,
     _load_existing_rows,
-    plot_performance_profile,
-    plot_performance_profile_iters,
-    plot_performance_profile_inner_iters,
 )
 
 # ---------------------------------------------------------------------------
@@ -193,7 +188,6 @@ def main() -> None:
     if not problems:
         sys.exit(f"No .mps files found in {data_dir}")
     suffix = "netlib"
-    label  = "Netlib LPs"
 
     tol        = args.tol
     time_limit = args.time_limit
@@ -312,15 +306,6 @@ def main() -> None:
 
     print(f"\nResults written to: {csv_path}")
 
-    # ---- Performance profiles -------------------------------------------
-    out_prefix = result_dir / f"{prefix}performance_profile_{suffix}"
-    plot_performance_profile(csv_path, out_prefix, label, tol=tol, time_limit=time_limit, solvers=solvers)
-
-    out_prefix_iters = result_dir / f"{prefix}performance_profile_{suffix}_iters"
-    plot_performance_profile_iters(csv_path, out_prefix_iters, label, tol=tol, time_limit=time_limit, solvers=solvers)
-
-    out_prefix_inner = result_dir / f"{prefix}performance_profile_{suffix}_inner_iters"
-    plot_performance_profile_inner_iters(csv_path, out_prefix_inner, label, tol=tol, time_limit=time_limit, solvers=solvers)
 
 
 if __name__ == "__main__":

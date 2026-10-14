@@ -83,7 +83,7 @@ venv/
 python/ksp_qp_bind*.so
 
 ############################################
-# Benchmark output (CSVs, performance profiles)
+# Benchmark output (CSVs)
 #
 # Regenerate with python/benchmark_*.py or the C++ drivers' --name all sweeps.
 # Note that data/ is deliberately NOT ignored: the Maros-Meszaros and Netlib
