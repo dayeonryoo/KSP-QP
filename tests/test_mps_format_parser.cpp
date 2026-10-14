@@ -686,6 +686,32 @@ TEST(MpsFormatParserParse, DuplicateQuadobjDiagonalEntriesAreSummed) {
   EXPECT_NEAR(model.Q.coeff(0, 0), 7.0, kTight);  // 4.0 + 3.0
 }
 
+// Zero entries, given or from duplicates summing to zero, are not stored in A or Q.
+TEST(MpsFormatParserParse, ZeroEntriesAreNotStored) {
+  std::string content;
+  content += "ROWS\n";
+  content += MpsLine({{2, "N"}, {5, "COST"}}) + "\n";
+  content += MpsLine({{2, "G"}, {5, "C1"}}) + "\n";
+  content += MpsLine({{2, "G"}, {5, "C2"}}) + "\n";
+  content += "COLUMNS\n";
+  content += MpsLine({{5, "X1"}, {15, "C1"}, {25, "0.0"}, {40, "C2"}, {50, "1.0"}}) + "\n";
+  content += MpsLine({{5, "X2"}, {15, "C1"}, {25, "2.0"}, {40, "C2"}, {50, "3.0"}}) + "\n";
+  content += MpsLine({{5, "X2"}, {15, "C2"}, {25, "-3.0"}}) + "\n";  // sums to zero
+  content += "QUADOBJ\n";
+  content += MpsLine({{5, "X1"}, {15, "X1"}, {25, "4.0"}}) + "\n";
+  content += MpsLine({{5, "X1"}, {15, "X2"}, {25, "0.0"}}) + "\n";
+  content += "ENDATA\n";
+
+  MpsFormatParser<double> parser;
+  auto model = parser.parse(WriteTempMps(content));
+  EXPECT_EQ(model.num_cols, 2);
+  EXPECT_EQ(model.A.nonZeros(), 2);
+  EXPECT_NEAR(model.A.coeff(1, 0), 1.0, kTight);
+  EXPECT_NEAR(model.A.coeff(0, 1), 2.0, kTight);
+  EXPECT_EQ(model.Q.nonZeros(), 1);
+  EXPECT_NEAR(model.Q.coeff(0, 0), 4.0, kTight);
+}
+
 // ===================== parse(): error paths =====================
 
 TEST(MpsFormatParserParse, MissingFileThrows) {
