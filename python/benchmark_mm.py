@@ -4,12 +4,13 @@ Benchmark KSP-QP vs QPALM vs OSQP on the Maros-Meszaros QP test set.
 Outputs
 -------
   results/mm_kspqp.csv, results/mm_qpalm.csv, results/mm_osqp.csv
-                                               - one file per solver: per-problem timing, iteration
-                                                 counts, status, and the run's provenance
+                                               - one file per solver: per-problem dimensions (n, m, l),
+                                                 timing, iteration counts, status, and the run's provenance
 
   Each solver only writes its own file, and a rerun replaces the rows of the problems it solved
   while keeping the others. KSP-QP can therefore be rerun after every change while the QPALM and
-  OSQP results are kept. Joining the files on "name" gives the former combined comparison table.
+  OSQP results are kept. Joining the files on "name", "n", "m", "l" gives the former combined
+  comparison table plus the dimensions.
 
 === HOW TO RUN FROM SCRATCH ===
 
@@ -236,18 +237,21 @@ QPS = {
 # ---------------------------------------------------------------------------
 SOLVER_FILES = {"ksp-qp": "kspqp", "qpalm": "qpalm", "osqp": "osqp"}
 
+# Problem dimensions, in every file: variables, equality rows (A), inequality rows (B).
+DIMS = ["n", "m", "l"]
+
 FIELDS = {
-    "ksp-qp": ["name",
+    "ksp-qp": ["name", *DIMS,
                "ssn_solved", "ssn_status", "pmm_iter", "ssn_iter", "krylov_iter", "fact", "smw_count",
                "ssn_obj", "pmm_tol_achieved", "ssn_time", "ssn_setup_time", "ssn_solve_time",
                "ssn_tol", "ssn_time_limit",
                "ssn_run_id", "ssn_timestamp", "ssn_host", "ssn_cpu", "ssn_git_sha"],
-    "qpalm":  ["name",
+    "qpalm":  ["name", *DIMS,
                "qpalm_solved", "qpalm_status", "qpalm_iter", "qpalm_inner_iter",
                "qpalm_obj", "qpalm_tol_achieved", "qpalm_time", "qpalm_setup_time", "qpalm_solve_time",
                "qpalm_tol", "qpalm_time_limit", "qpalm_eps_inf",
                "qpalm_run_id", "qpalm_timestamp", "qpalm_host", "qpalm_cpu", "qpalm_version"],
-    "osqp":   ["name",
+    "osqp":   ["name", *DIMS,
                "osqp_solved", "osqp_status", "osqp_iter",
                "osqp_obj", "osqp_tol_achieved", "osqp_time", "osqp_setup_time", "osqp_solve_time",
                "osqp_tol", "osqp_time_limit", "osqp_eps_inf",
@@ -399,11 +403,13 @@ def main() -> None:
             print(f"[{idx:3d}/{n_problems}] SKIP (file not found): {name}")
             continue
 
-        print(f"\n[{idx:3d}/{n_problems}]  {name}")
+        pd_data = ksp_qp_bind.parse_sif(sif_path)
+        dims = {k: pd_data[k] for k in DIMS}
+        print(f"\n[{idx:3d}/{n_problems}]  {name}  n={dims['n']} m={dims['m']} l={dims['l']}")
 
         # ---- KSP-QP ------------------------------------------------
         if "ksp-qp" in solvers:
-            row: dict = {"name": name}
+            row: dict = {"name": name, **dims}
             ssn_out = _run_isolated(_worker_ssn_mm, (sif_path, tol, time_limit, max_iter))
             if "error" in ssn_out:
                 print(f"  KSP-QP : ERROR — {ssn_out['error']}")
@@ -435,7 +441,7 @@ def main() -> None:
 
         # ---- QPALM --------------------------------------------------
         if "qpalm" in solvers:
-            row = {"name": name}
+            row = {"name": name, **dims}
             qpalm_out = _run_isolated(_worker_qpalm_mm, (sif_path, tol, time_limit, eps_inf))
             if "error" in qpalm_out:
                 print(f"  QPALM   : ERROR — {qpalm_out['error']}")
@@ -462,7 +468,7 @@ def main() -> None:
 
         # ---- OSQP ---------------------------------------------------
         if "osqp" in solvers:
-            row = {"name": name}
+            row = {"name": name, **dims}
             osqp_out = _run_isolated(_worker_osqp_mm, (sif_path, tol, time_limit, eps_inf))
             if "error" in osqp_out:
                 print(f"  OSQP    : ERROR — {osqp_out['error']}")
