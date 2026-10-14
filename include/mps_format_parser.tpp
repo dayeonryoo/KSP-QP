@@ -12,7 +12,8 @@
 //  - RHS/RANGES/BOUNDS set names only determine a line's token layout; they are not
 //    checked across lines, so a second set applies on top of the first.
 //  - Duplicate (row, col) entries in COLUMNS or QUADOBJ are summed. QUADOBJ is stored
-//    lower-triangular: (i, j) with i < j is swapped to (j, i).
+//    lower-triangular: (i, j) with i < j is swapped to (j, i). Zero entries, given or
+//    summed, are not stored.
 //  - Fixed vs. free format is decided once per file, from the first value-bearing line:
 //    fixed unless its fixed-column and whitespace readings disagree. A line whose tokens
 //    overflow the fixed fields is read free-format regardless (fixed_fields_would_truncate()).
@@ -602,14 +603,14 @@ void MpsFormatParser<T>::build_sparse_matrices() {
     model_.A.setFromTriplets(A_triplets_.begin(), A_triplets_.end(),
         [](T a, T b) { return a + b; } // Sum duplicates.
     );
-    model_.A.makeCompressed();
+    model_.A.prune(T(0)); // Drop explicit zeros; leaves A compressed.
 
     if (model_.is_qp) {
         model_.Q.resize(model_.num_cols, model_.num_cols);
         model_.Q.setFromTriplets(Q_triplets_.begin(), Q_triplets_.end(),
             [](T a, T b) { return a + b; } // Sum duplicates.
         );
-        model_.Q.makeCompressed();
+        model_.Q.prune(T(0));
     }
 }
 
