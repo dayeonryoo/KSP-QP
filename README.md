@@ -600,6 +600,25 @@ cd python
 python3 validate_mpc_generator.py [--max-M N]
 ```
 
+### Per-iteration gap with QPALM (experimental)
+
+`analyze_profile.py` joins a KSP-QP result file with a QPALM one (MM or MPC, possibly from different
+runs) and reports, for each problem or (M, N) configuration solved by both:
+- the run time and iterations of each solver;
+- each solver's solve time per inner iteration and their ratio;
+- KSP-QP's time per SSN iteration by phase, with its factorizations and SMW updates per SSN
+  iteration.
+
+Over all of them, it reports the geometric means of the ratios, KSP-QP's time by phase and its
+factorizations by reason. With `--trace-prefix`, it also gives the factorization time by reason. See
+["Profiling and refactorization log"](#profiling-and-refactorization-log-experimental).
+
+```bash
+python3 analyze_profile.py mm  --kspqp ../results/1015_mm_kspqp.csv --qpalm ../results/1003_mm_qpalm.csv
+python3 analyze_profile.py mpc --kspqp ../results/1015_mpc_kspqp.csv --qpalm ../results/1015_mpc_qpalm.csv \
+    --trace-prefix ../results/1015_mpc_kspqp_trace --out ../results/1015_mpc_gap.csv
+```
+
 ---
 
 ## Tests
@@ -785,6 +804,7 @@ KSP-QP/
 │   ├── benchmark_infeas.py             # Netlib infeasible-set detection benchmark
 │   ├── benchmark_l2pde.py              # L2 PDE-constrained benchmark vs QPALM/OSQP
 │   ├── benchmark_mpc.py                # platoon MPC benchmark vs QPALM
+│   ├── analyze_profile.py              # per-iteration gap vs QPALM from the MM/MPC result files
 │   ├── tests/                          # unittest suite for the Python generators
 │   └── CMakeLists.txt                  # Python binding build config
 ├── data/
