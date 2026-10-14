@@ -1391,6 +1391,34 @@ TEST(DirectSmw, ReturningToTheSnapshotsActiveSetsReusesItsFactorization) {
   }
 }
 
+TEST(DirectSmw, FlipOfAColumnEmptyInTheSnapshotsGIsSolvedExactlyOnBothBases) {
+  // Column 2 is only in B row 1, which stays inactive, so it is empty in G = A = [1, 1, 0]: flipping its
+  // active_K changes H(2) but not S (rank 0). Cholesky on S reuses its factorization as is. LDLT factorized
+  // K = [-H, G^T; G, (1/mu) I], whose -H block still holds the old H(2), so it must not be reused as is
+  // (refinement through it would not converge); the system is solved through S^{-1} instead.
+  const SpMat A = DenseToSparse((Eigen::MatrixXd(1, 3) << 1.0, 1.0, 0.0).finished());
+  const SpMat B = DenseToSparse((Eigen::MatrixXd(2, 3) << 1.0, 0.0, 0.0, 0.0, 0.0, 1.0).finished());
+  for (const bool use_ldlt : {false, true}) {
+    SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
+    SsnFixture f(A, B);
+    SSN<double> ns = f.Make();
+    SetUpDirectModeDefaultState(ns);
+    PinDirectSystem(ns, use_ldlt);
+
+    DirectStep(ns, {false, true, true}, {false, false});
+    ExpectNewtonSystemSolved(ns);
+    ASSERT_EQ(ns.fact, 1);
+
+    DirectStep(ns, {false, true, false}, {false, false});  // column 2 leaves active_K
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.direct_smw_reject, 0);
+    EXPECT_EQ(ns.direct_smw_.last_rank(), 0);
+    EXPECT_EQ(ns.direct_smw_count, use_ldlt ? 1 : 0);
+    EXPECT_EQ(ns.direct_smw_.reuse_count(), use_ldlt ? 0 : 1);
+  }
+}
+
 TEST(DirectSmw, UpdateFailingTheResidualCheckIsRefactorizedAndStillSolved) {
   for (const bool use_ldlt : {false, true}) {
     SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");

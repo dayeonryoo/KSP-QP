@@ -49,8 +49,9 @@ public:
     using BaseSolve = std::function<void(const Vec& v, Vec& out)>;
 
     enum class Outcome {
-        Updated,        // S_new^{-1} is now available through solve().
-        ReusedSnapshot, // Rank 0: S_new equals the snapshot's S_old, so the caller's factorization is exact as is.
+        Updated,        // S_new^{-1} is now available through solve() (possibly a rank-0 update; see try_setup()).
+        ReusedSnapshot, // Rank 0 and the caller's factorization is exact as is: S_new equals the snapshot's S_old
+                        // and, for an LDLT base (a factorization of K), H equals the snapshot's H on every column.
         Rejected,       // See last_reject_reason(); the caller must refactorize.
     };
 
@@ -70,7 +71,7 @@ public:
     };
     static constexpr int kNumRejectReasons = 11;
 
-    static constexpr int kMaxRank       = 50; // setup() rejects h + p + q > this; rank 0 reuses the snapshot.
+    static constexpr int kMaxRank       = 50; // setup() rejects h + p + q > this; rank 0 reuses the snapshot (see try_setup()).
     static constexpr int kMaxFailStreak = 5;  // record_failure() calls in a row that suppress updates.
 
     // ------ Snapshot of the last full factorization ------
@@ -169,14 +170,16 @@ public:
         if (q_ > 0)
             Lambda_.tail(q_).noalias() -= V_plus_.transpose() * u_base_;
 
-        // lambda = S_Lambda^{-1} Lambda through the equilibrated factorization D S_Lambda D.
-        lambda_ = eq_scale_.cwiseProduct(Lambda_);
-        lambda_ = lu_.solve(lambda_);
-        lambda_ = eq_scale_.cwiseProduct(lambda_);
-
+        // lambda = S_Lambda^{-1} Lambda through the equilibrated factorization D S_Lambda D, then
         // z_base = u_base - Y_all lambda; retained rows come from z_base, added rows from lambda's tail.
+        // A rank-0 update (see try_setup()) has no capacitance matrix, and S_new^{-1} = S_old^{-1}.
         z_base_ = u_base_;
-        z_base_.noalias() -= Y_all_ * lambda_;
+        if (h_ + p_ + q_ > 0) {
+            lambda_ = eq_scale_.cwiseProduct(Lambda_);
+            lambda_ = lu_.solve(lambda_);
+            lambda_ = eq_scale_.cwiseProduct(lambda_);
+            z_base_.noalias() -= Y_all_ * lambda_;
+        }
 
         out.resize(s_new_);
         out.head(M_rows_) = z_base_.head(M_rows_);
@@ -257,7 +260,15 @@ private:
             classify(H_diag, active_W);
             last_rank_ = h_ + p_ + q_;
             if (last_rank_ > kMaxRank) return reject(RejectReason::RankExceedsThreshold);
-            if (last_rank_ == 0) return Outcome::ReusedSnapshot; // S_new == S_old exactly
+            if (last_rank_ == 0) {
+                // S_new == S_old exactly. An LDLT base factorizes K, whose -H block also covers the columns
+                // empty in G_old that classify() leaves out, so it is reused as is only if H is unchanged on
+                // every column. Otherwise solve through S_old^{-1} as a rank-0 update: dy is exact, and the
+                // caller recovers dx with the current H.
+                if (!base_is_ldlt || H_diag == H_old_) return Outcome::ReusedSnapshot;
+                finalize();
+                return Outcome::Updated;
+            }
 
             // Phases 3-5: capacitance blocks, Y_all = S_old^{-1} V_all, and the capacitance factorization.
             build_capacitance_setup(H_diag, B_rm, mu);

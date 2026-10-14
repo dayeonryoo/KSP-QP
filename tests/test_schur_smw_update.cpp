@@ -323,19 +323,39 @@ TEST(SchurSmwUpdateRank, ReturnToTheSnapshotReusesItAndDeactivates) {
 TEST(SchurSmwUpdateRank, ChangedColumnThatIsEmptyInTheSnapshotDoesNotCount) {
   // Column 2 is nonzero only in B row 0, which is not in the snapshot's G. Changing H(2) leaves S unchanged
   // (rank 0); adding row 0 at the same time needs only the added row (rank 1), with H_new(2) in W_+.
+  // With Cholesky on S the base factorization is S_old itself and is reused as is. LDLT factorizes
+  // K_old = [-H_old, G^T; G, (1/mu) I], whose -H block still holds H_old(2), so the base is used through
+  // S_old^{-1} instead, as a rank-0 update (its solve is checked against the exact S_new).
+  for (bool ldlt : {false, true}) {
+    SCOPED_TRACE(ldlt ? "LDLT on K" : "Cholesky on S");
+    Fixture g;
+    g.p.A(0, 2) = 0.0;
+    Smw smw;
+    const BoolArr W1 = ToBoolArr({false, true, false});
+    BaseFactorization base = g.Snapshot(smw, ToBoolArr({true, true, true, true}), W1, ldlt);
+    const BoolArr K2 = ToBoolArr({true, true, false, true});
+
+    EXPECT_EQ(g.UpdateAndCheck(smw, base, K2, W1, ldlt), ldlt ? Outcome::Updated : Outcome::ReusedSnapshot);
+    EXPECT_EQ(smw.last_rank(), 0);
+    EXPECT_EQ(smw.active(), ldlt);
+    EXPECT_TRUE(SchurSmwUpdateTestPeer::changed_cols(smw).empty());
+
+    EXPECT_EQ(g.UpdateAndCheck(smw, base, K2, ToBoolArr({true, true, false}), ldlt), Outcome::Updated);
+    EXPECT_EQ(smw.last_rank(), 1);
+    EXPECT_EQ(smw.last_p(), 0);
+  }
+}
+
+TEST(SchurSmwUpdateRank, LdltBaseWithUnchangedHStillReusesTheSnapshot) {
+  // Back to the snapshot's active sets: H equals H_old on every column, so K_old is exact and is reused.
   Fixture g;
-  g.p.A(0, 2) = 0.0;
   Smw smw;
+  const BoolArr K1 = ToBoolArr({true, true, true, true});
   const BoolArr W1 = ToBoolArr({false, true, false});
-  BaseFactorization base = g.Snapshot(smw, ToBoolArr({true, true, true, true}), W1, false);
-  const BoolArr K2 = ToBoolArr({true, true, false, true});
-
-  EXPECT_EQ(g.UpdateAndCheck(smw, base, K2, W1, false), Outcome::ReusedSnapshot);
-  EXPECT_TRUE(SchurSmwUpdateTestPeer::changed_cols(smw).empty());
-
-  EXPECT_EQ(g.UpdateAndCheck(smw, base, K2, ToBoolArr({true, true, false}), false), Outcome::Updated);
-  EXPECT_EQ(smw.last_rank(), 1);
-  EXPECT_EQ(smw.last_p(), 0);
+  BaseFactorization base = g.Snapshot(smw, K1, W1, /*ldlt=*/true);
+  EXPECT_EQ(g.UpdateAndCheck(smw, base, ToBoolArr({true, false, true, true}), W1, true), Outcome::Updated);
+  EXPECT_EQ(g.UpdateAndCheck(smw, base, K1, W1, true), Outcome::ReusedSnapshot);
+  EXPECT_FALSE(smw.active());
 }
 
 TEST(SchurSmwUpdateRank, RankFiftyIsAcceptedAndFiftyOneRejected) {
