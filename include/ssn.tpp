@@ -185,7 +185,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     };
 
     // Run PCG. Returns false (and counts a krylov_fail) on preconditioner failure or on
-    // non-convergence with error > 1e-10; an error <= 1e-10 at max_iter is accepted.
+    // non-convergence with error > 1e-10.
     auto attempt_solve = [&](Vec& dy_out) -> bool {
         if (cg.preconditioner().info() != Eigen::Success) {
             std::cout << "[PCG] CG failed due to preconditioner failure.\n";
@@ -207,7 +207,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
 
         T err = cg.error();
         if (cg.info() != Eigen::Success) {
-            if (err > T(1e-10)) { // Acceptable error threshold for PCG failure.
+            if (!(err <= T(1e-10))) { // Acceptable error threshold for PCG failure.
                 krylov_fail++;
                 return false;
             }

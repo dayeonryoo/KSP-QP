@@ -1704,6 +1704,32 @@ TEST(SolveUsingCg, PcgFailureFallsBackToTheKktSystemWhenTheThresholdPrefersIt) {
   ExpectKktResidualSmall(sol, A, H_diag, r1, r2, ns.mu);
 }
 
+// A NaN right-hand side makes CG's error NaN, which is not <= 1e-10: a failure like any other,
+// counted and (with no SMW to retry) handed to the direct solver instead of returning a NaN dy.
+TEST(SolveUsingCg, NanErrorCountsAsAKrylovFailure) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  ns.mu = 2.0;
+  ns.rho = 1.0;
+  ns.active_W = ToBoolArr({false, false});
+
+  const SpMat G = DefaultA();
+  const SpMat G_tr = SpMat(G.transpose());
+  Vec H_diag(3);
+  H_diag << 2.0, 3.0, 4.0;
+  const BoolArr active_K = ToBoolArr({true, false, true});
+  Vec r1(3), r2(1);
+  r1 << 1.0, std::nan(""), 0.5;
+  r2 << 0.5;
+
+  ns.solve_using_cg(G, G_tr, H_diag, H_diag.cwiseInverse(), active_K, r1, r2, ns.mu,
+                    ns.krylov_tol, ns.krylov_max_in_iter, /*update_prec=*/true,
+                    /*prec_pattern_changed=*/true, /*schur_use_ldlt=*/false);
+
+  EXPECT_EQ(ns.krylov_fail, 1);
+  EXPECT_TRUE(ns.pcg_failed);
+}
+
 // ===================== cross-path agreement =====================
 // For fixed (G, H_diag, active_K, r1, r2, mu, rho), seven routes solve the same KKT system
 // K[dx;dy]=[r1;r2]: PCG+Cholesky, PCG+LDLT, PCG+SMW (from a Cholesky or an LDLT snapshot), the
