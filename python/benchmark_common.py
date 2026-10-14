@@ -351,7 +351,8 @@ def _load_existing_rows(path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def provenance() -> dict:
-    """Identifies a benchmark run: id, UTC start time, host, CPU, git revision, solver versions."""
+    """Identifies a benchmark run: id, UTC start time, host, CPU, git revision (-dirty if uncommitted
+    changes), solver versions."""
     def _sh(cmd: list[str]) -> str:
         try:
             return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
@@ -362,7 +363,7 @@ def provenance() -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "host": socket.gethostname(),
         "cpu": _sh(["sysctl", "-n", "machdep.cpu.brand_string"]) or platform.processor(),
-        "git_sha": _sh(["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"]),
+        "git_sha": _sh(["git", "-C", str(Path(__file__).parent), "describe", "--always", "--dirty"]),
         "qpalm_version": getattr(qpalm, "__version__", "?"),
         "osqp_version": getattr(osqp, "__version__", "?"),
     }
