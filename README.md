@@ -28,7 +28,7 @@ where `Q` is a symmetric positive semi-definite matrix (set `Q = 0` for LPs).
 
 ### Python bindings (optional)
 - Python 3.9+
-- `pip install numpy scipy matplotlib pandas`
+- `pip install numpy scipy pandas`
 - `pip install qpalm osqp` (only needed for the comparison benchmark)
 
 ---
@@ -362,8 +362,8 @@ Reference objectives for the feasible set are not hardcoded — they ship with t
 disagree with the long-standing published Netlib optima on a handful of problems (E226 and
 CRE-A among them), so treat either source with care.
 
-For a QPALM/OSQP comparison with performance profiles, use `python/benchmark_netlib.py` and
-`python/benchmark_infeas.py` instead (see below).
+For a QPALM/OSQP comparison, use `python/benchmark_netlib.py` and `python/benchmark_infeas.py`
+instead (see below).
 
 ### `ksp_qp_maros_meszaros` — Maros-Meszaros QPs (`src/maros_meszaros.cpp`)
 
@@ -378,7 +378,7 @@ reference objectives, appending a row to `<root>/results/pcg_mm.csv` (override w
 a long sweep from being distorted by CPU thermal throttling.
 
 For comparing against QPALM/OSQP rather than just checking against reference objectives, use
-the Python benchmark instead (see below) — that's what produces performance profiles.
+the Python benchmark instead (see below).
 
 ### PDE-constrained QPs — generated in Python
 
@@ -422,7 +422,7 @@ by `benchmark_l2pde.py`, come out divided by `h²`.
 
 The Python benchmark scripts compare **KSP-QP vs QPALM vs OSQP** and live in `python/`.
 Build the Python binding first (see "Building" above), then `pip install qpalm osqp numpy scipy
-matplotlib pandas`.
+pandas`.
 
 ### Maros-Meszaros QP benchmark
 
@@ -431,17 +431,15 @@ cd python
 python3 benchmark_mm.py
 ```
 
-Runs the full Maros-Meszaros test set. Writes one result file per solver —
-`results/mm_kspqp.csv`, `results/mm_qpalm.csv`, `results/mm_osqp.csv` — plus Dolan-Moré
-performance profiles (`results/performance_profile_mm*.pdf/.png`, by time, by iteration count and
-by inner iteration count).
+Runs the full Maros-Meszaros test set. Writes one result file per solver:
+`results/mm_kspqp.csv`, `results/mm_qpalm.csv`, `results/mm_osqp.csv`.
 
 Each solver writes only its own file, with its setup/solve times and the run's provenance (run id,
 timestamp, host, CPU, git revision or solver version, tolerance, time limit). A rerun replaces the
 rows of the problems it solved and keeps the others, so KSP-QP can be rerun after every change while
 the QPALM and OSQP results are kept. The files share the column names of the former combined
 `comparison_mm.csv` (`ssn_*`, `qpalm_*`, `osqp_*`), and joining them on `name` gives that table
-(`benchmark_common.load_solver_tables`). The profiles compare the problems present in every file.
+(`benchmark_common.load_solver_tables`).
 
 ```
 --root DIR             override project root (default: parent of script)
@@ -450,16 +448,13 @@ the QPALM and OSQP results are kept. The files share the column names of the for
 --solver {ksp-qp,qpalm,osqp} [...]   which solvers to run (default: all three)
 --problems NAME [...]  run only these problems (default: all)
 --out PREFIX           output file prefix (e.g. 1015 -> results/1015_mm_kspqp.csv)
---kspqp-csv/--qpalm-csv/--osqp-csv FILE   another run's result file to use in the profiles
-                       (default: this prefix's own files, where they exist)
 --cooldown 0           seconds to sleep between problems (avoids CPU throttling)
 ```
 
-For example, to rerun KSP-QP only and compare it against QPALM/OSQP results kept from an earlier run:
+For example, to rerun KSP-QP only, keeping this prefix's QPALM and OSQP files:
 
 ```bash
-python3 benchmark_mm.py --solver ksp-qp --out 1015 \
-    --qpalm-csv ../results/1003_mm_qpalm.csv --osqp-csv ../results/1003_mm_osqp.csv
+python3 benchmark_mm.py --solver ksp-qp --out 1015
 ```
 
 ### Netlib LP benchmark
@@ -470,9 +465,8 @@ python3 benchmark_netlib.py
 ```
 
 Runs the full Netlib LP test set (`data/netlib-main/feasible/`, 114 instances). Writes
-`results/comparison_netlib.csv` plus Dolan-Moré performance profiles
-(`results/performance_profile_netlib*.pdf/.png`). Same flags as `benchmark_mm.py`, except
-`--problems` and `--*-csv`: this benchmark still writes one combined file for all solvers.
+`results/comparison_netlib.csv`. Same flags as `benchmark_mm.py`, except `--problems`: this
+benchmark still writes one combined file for all solvers.
 
 ### Netlib infeasible LP benchmark
 

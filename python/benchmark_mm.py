@@ -6,9 +6,6 @@ Outputs
   results/mm_kspqp.csv, results/mm_qpalm.csv, results/mm_osqp.csv
                                                - one file per solver: per-problem timing, iteration
                                                  counts, status, and the run's provenance
-  results/performance_profile_mm.pdf/png       - Dolan-Moré performance profile (run time)
-  results/performance_profile_mm_iters.pdf/png - Dolan-Moré performance profile (iterations)
-  results/performance_profile_mm_inner_iters.pdf/png - Dolan-Moré performance profile (inner iterations)
 
   Each solver only writes its own file, and a rerun replaces the rows of the problems it solved
   while keeping the others. KSP-QP can therefore be rerun after every change while the QPALM and
@@ -18,7 +15,7 @@ Outputs
 
 Step 1 - Install Python dependencies
 -------------------------------------
-  pip install qpalm osqp numpy scipy matplotlib pandas
+  pip install qpalm osqp numpy scipy pandas
 
 Step 2 - Build the KSP-QP Python binding
 ------------------------------------------
@@ -45,14 +42,9 @@ Settings: tol = 1e-6, time limit = 60 s, max iterations = infinity.
         --tol:        to change the solver tolerance (default: 1e-6).
         --time-limit: to change the solver time limit in seconds (default: 60).
         --cooldown:   to change the cooldown time in seconds between solver runs (default: 0).
-        --kspqp-csv, --qpalm-csv, --osqp-csv:
-                      result files of other runs to compare against in the performance profiles,
-                      e.g. a KSP-QP-only run against an earlier QPALM run (default: this prefix's
-                      files, where they exist).
 
-  Example: rerun KSP-QP only, against QPALM/OSQP results kept from an earlier run:
-    python3 benchmark_mm.py --solver ksp-qp --out 1015 \\
-        --qpalm-csv ../results/1003_mm_qpalm.csv --osqp-csv ../results/1003_mm_osqp.csv
+  Example: rerun KSP-QP only; this prefix's QPALM and OSQP files are kept:
+    python3 benchmark_mm.py --solver ksp-qp --out 1015
 """
 
 import sys
@@ -91,10 +83,6 @@ from benchmark_common import (
     provenance,
     check_header,
     replace_rows,
-    load_solver_tables,
-    plot_performance_profile,
-    plot_performance_profile_iters,
-    plot_performance_profile_inner_iters,
 )
 
 # ---------------------------------------------------------------------------
@@ -338,12 +326,6 @@ def main() -> None:
         "--problems", nargs="+", default=None, metavar="NAME",
         help="Run only these problems (default: all). Their rows are replaced; the others are kept.",
     )
-    for s, tag in SOLVER_FILES.items():
-        parser.add_argument(
-            f"--{tag}-csv", default="", metavar="FILE",
-            help=f"{s} result file to use in the performance profiles instead of this prefix's "
-                 f"mm_{tag}.csv (e.g. from an earlier run)",
-        )
     cert = parser.add_mutually_exclusive_group()
     cert.add_argument(
         "--inf-tol-factor", type=float, default=INF_TOL_FACTOR, dest="inf_tol_factor",
@@ -504,33 +486,6 @@ def main() -> None:
 
     print("\nResults written to: " + ", ".join(str(paths[s]) for s in SOLVER_FILES if s in solvers))
 
-    # ---- Performance profiles -------------------------------------------
-    # Every solver with a result file: the one given by --<solver>-csv, else this prefix's own.
-    # Only the problems present in all of them are compared.
-    explicit = {s: getattr(args, f"{tag}_csv") for s, tag in SOLVER_FILES.items()}
-    profile_paths = {}
-    for s in SOLVER_FILES:
-        p = Path(explicit[s]) if explicit[s] else paths[s]
-        if p.exists():
-            profile_paths[s] = p
-        elif explicit[s]:
-            sys.exit(f"--{SOLVER_FILES[s]}-csv: file not found: {p}")
-    if not profile_paths:
-        return
-    df = load_solver_tables(profile_paths, ["name"])
-    print("Performance profiles over " + f"{len(df)} problems from: "
-          + ", ".join(f"{s}={p}" for s, p in profile_paths.items()))
-    profile_solvers = set(profile_paths)
-
-    label = "Maros-Meszaros QPs"
-    out_prefix = result_dir / f"{prefix}performance_profile_mm"
-    plot_performance_profile(df, out_prefix, label, tol=tol, time_limit=time_limit, solvers=profile_solvers)
-
-    out_prefix_iters = result_dir / f"{prefix}performance_profile_mm_iters"
-    plot_performance_profile_iters(df, out_prefix_iters, label, tol=tol, time_limit=time_limit, solvers=profile_solvers)
-
-    out_prefix_inner = result_dir / f"{prefix}performance_profile_mm_inner_iters"
-    plot_performance_profile_inner_iters(df, out_prefix_inner, label, tol=tol, time_limit=time_limit, solvers=profile_solvers)
 
 
 if __name__ == "__main__":
