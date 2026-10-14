@@ -617,6 +617,28 @@ python3 analyze_profile.py mpc --kspqp ../results/1015_mpc_kspqp.csv --qpalm ../
     --trace-prefix ../results/1015_mpc_kspqp_trace --out ../results/1015_mpc_gap.csv
 ```
 
+### Performance summary (experimental)
+
+`analyze_performance.py` summarizes KSP-QP against QPALM from the MM and MPC result files of one
+run (`--prefix`) and KSP-QP's traces:
+- MM: the problems each solver solves, with KSP-QP's failures classed as cost-bound or
+  iteration-bound; run time and iterations against QPALM, split as solve time = inner iterations ×
+  time per inner iteration, overall and by problem class (diagonal Q, lifted, and the lifted Q*
+  problems built from Netlib LPs); the time per inner iteration against problem size; KSP-QP's
+  phases, factorizations by reason and SMW updates; what-if bounds on the run-time ratio; the PMM and
+  SSN behaviour; and the accuracy of the objective values.
+- MPC: robustness and timing noise over the repeats; run-time ratios over the (M, N) grid; power-law
+  fits of iterations, time per inner iteration and run time in M and N; phases, factorizations and
+  what-if bounds.
+
+The class of an MM problem comes from the trace, so without `--trace` files MM is not split by class.
+
+```bash
+python3 analyze_performance.py --prefix ../results/1014_baseline/1014
+python3 analyze_performance.py --prefix ../results/1015 --qpalm-prefix ../results/1003 --sets mm \
+    --out ../results/1015_perf   # also writes mm_problems.csv and mpc_configs.csv
+```
+
 ---
 
 ## Tests
@@ -803,6 +825,7 @@ KSP-QP/
 │   ├── benchmark_l2pde.py              # L2 PDE-constrained benchmark vs QPALM/OSQP
 │   ├── benchmark_mpc.py                # platoon MPC benchmark vs QPALM
 │   ├── analyze_profile.py              # per-iteration gap vs QPALM from the MM/MPC result files
+│   ├── analyze_performance.py          # performance summary vs QPALM from the MM/MPC result files
 │   ├── tests/                          # unittest suite for the Python generators
 │   └── CMakeLists.txt                  # Python binding build config
 ├── data/
