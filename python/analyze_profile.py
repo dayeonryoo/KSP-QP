@@ -33,6 +33,12 @@ SSN_PHASES = ["t_prep", "t_fact", "t_lowrank", "t_krylov", "t_direct_solve", "t_
               "t_update", "t_ssn_other"]
 PHASES = ["t_setup", *SSN_PHASES, "t_pmm_other"]
 
+# benchmark_mm.py's / benchmark_mpc.py's column names -> the common names below.
+KSPQP_NAMES = {"ssn_solved": "solved", "ssn_time": "run_time", "ssn_setup_time": "setup_time",
+               "ssn_solve_time": "solve_time", "pmm_iter": "outer_iter", "ssn_iter": "inner_iter"}
+QPALM_NAMES = {"qpalm_solved": "solved", "qpalm_time": "run_time", "qpalm_setup_time": "setup_time",
+               "qpalm_solve_time": "solve_time", "qpalm_iter": "outer_iter", "qpalm_inner_iter": "inner_iter"}
+
 
 def _fact_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c.startswith("fact_") and c != "fact_analyzed"]
@@ -52,8 +58,7 @@ def _geomean(x: pd.Series) -> float:
 def load_mm(kspqp: Path, qpalm: Path) -> tuple[pd.DataFrame, None]:
     k = pd.read_csv(kspqp)
     if "ssn_status" in k.columns:   # benchmark_mm.py's mm_kspqp.csv
-        k = k.rename(columns={"ssn_solved": "solved", "ssn_time": "run_time", "ssn_setup_time": "setup_time",
-                              "ssn_solve_time": "solve_time", "pmm_iter": "outer_iter", "ssn_iter": "inner_iter"})
+        k = k.rename(columns=KSPQP_NAMES)
     elif "opt_status" in k.columns:  # a C++ driver CSV
         k = k.assign(solved=(k["opt_status"] == 0).astype(int))
         k = k.rename(columns={"pmm_iter": "outer_iter", "ssn_iter": "inner_iter"})
@@ -61,9 +66,7 @@ def load_mm(kspqp: Path, qpalm: Path) -> tuple[pd.DataFrame, None]:
         sys.exit(f"{kspqp}: not a KSP-QP result file")
     if "t_fact" not in k.columns:
         sys.exit(f"{kspqp}: no profile columns (t_*, fact_*); written before the factorization log was added?")
-    q = pd.read_csv(qpalm).rename(columns={
-        "qpalm_solved": "solved", "qpalm_time": "run_time", "qpalm_setup_time": "setup_time",
-        "qpalm_solve_time": "solve_time", "qpalm_iter": "outer_iter", "qpalm_inner_iter": "inner_iter"})
+    q = pd.read_csv(qpalm).rename(columns=QPALM_NAMES)
     keep_q = ["name", "solved", "run_time", "setup_time", "solve_time", "outer_iter", "inner_iter"]
     return k.merge(q[keep_q], on="name", suffixes=("_k", "_q")), None
 
@@ -80,8 +83,11 @@ def _fastest_timed_repeat(df: pd.DataFrame, key: list[str]) -> pd.DataFrame:
 def load_mpc(kspqp: Path, qpalm: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Per (M, N, loop mode): sums over the steps both solved; also the KSP-QP repeats used (for the trace)."""
     instance = ["M", "N", "loop_mode", "step"]
-    k = _fastest_timed_repeat(pd.read_csv(kspqp), instance)
-    q = _fastest_timed_repeat(pd.read_csv(qpalm), instance)
+    k = pd.read_csv(kspqp)
+    if "ssn_time" not in k.columns:
+        sys.exit(f"{kspqp}: not a benchmark_mpc.py KSP-QP result file, or written before it used MM's column names")
+    k = _fastest_timed_repeat(k.rename(columns=KSPQP_NAMES), instance)
+    q = _fastest_timed_repeat(pd.read_csv(qpalm).rename(columns=QPALM_NAMES), instance)
     if "t_fact" not in k.columns:
         sys.exit(f"{kspqp}: no profile columns (t_*, fact_*); written before the factorization log was added?")
     keep_q = [*instance, "xbar_norm", "solved", "run_time", "setup_time", "solve_time", "outer_iter", "inner_iter"]
