@@ -3,9 +3,16 @@ Benchmark KSP-QP vs QPALM vs OSQP on the Maros-Meszaros QP test set.
 
 Outputs
 -------
-  results/comparison_mm.csv                    - per-problem timing, iteration counts, and status
+  results/mm_kspqp.csv, results/mm_qpalm.csv, results/mm_osqp.csv
+                                               - one file per solver: per-problem timing, iteration
+                                                 counts, status, and the run's provenance
   results/performance_profile_mm.pdf/png       - Dolan-Moré performance profile (run time)
   results/performance_profile_mm_iters.pdf/png - Dolan-Moré performance profile (iterations)
+  results/performance_profile_mm_inner_iters.pdf/png - Dolan-Moré performance profile (inner iterations)
+
+  Each solver only writes its own file, and a rerun replaces the rows of the problems it solved
+  while keeping the others. KSP-QP can therefore be rerun after every change while the QPALM and
+  OSQP results are kept. Joining the files on "name" gives the former combined comparison table.
 
 === HOW TO RUN FROM SCRATCH ===
 
@@ -32,11 +39,20 @@ Step 3 - Run the benchmark
 
 Settings: tol = 1e-6, time limit = 60 s, max iterations = infinity.
         --root:       to change the output directory (default: results/).
-        --out:        to change the output file prefix (default: comparison_mm).
+        --out:        to set an output file prefix (e.g. '0508' → '0508_mm_kspqp.csv'; default: none).
         --solver:     to select which solvers to run among ksp-qp, qpalm, osqp (default: all three).
+        --problems:   to run only the named problems (default: all).
         --tol:        to change the solver tolerance (default: 1e-6).
         --time-limit: to change the solver time limit in seconds (default: 60).
         --cooldown:   to change the cooldown time in seconds between solver runs (default: 0).
+        --kspqp-csv, --qpalm-csv, --osqp-csv:
+                      result files of other runs to compare against in the performance profiles,
+                      e.g. a KSP-QP-only run against an earlier QPALM run (default: this prefix's
+                      files, where they exist).
+
+  Example: rerun KSP-QP only, against QPALM/OSQP results kept from an earlier run:
+    python3 benchmark_mm.py --solver ksp-qp --out 1015 \\
+        --qpalm-csv ../results/1003_mm_qpalm.csv --osqp-csv ../results/1003_mm_osqp.csv
 """
 
 import sys
@@ -72,8 +88,10 @@ from benchmark_common import (
     INF_TOL_FACTOR,
     QPALM_SOLVED,
     OSQP_SOLVED,
-    _write_csv,
-    _load_existing_rows,
+    provenance,
+    check_header,
+    replace_rows,
+    load_solver_tables,
     plot_performance_profile,
     plot_performance_profile_iters,
     plot_performance_profile_inner_iters,
@@ -224,6 +242,31 @@ QPS = {
 }
 
 # ---------------------------------------------------------------------------
+# Per-solver result files. The column names are those of the former combined
+# comparison_mm.csv (ssn_* for KSP-QP, qpalm_*, osqp_*), so joining the files on
+# "name" gives the same wide table; each file also records its run's provenance.
+# ---------------------------------------------------------------------------
+SOLVER_FILES = {"ksp-qp": "kspqp", "qpalm": "qpalm", "osqp": "osqp"}
+
+FIELDS = {
+    "ksp-qp": ["name",
+               "ssn_solved", "ssn_status", "pmm_iter", "ssn_iter", "krylov_iter", "fact", "smw_count",
+               "ssn_obj", "pmm_tol_achieved", "ssn_time", "ssn_setup_time", "ssn_solve_time",
+               "ssn_tol", "ssn_time_limit",
+               "ssn_run_id", "ssn_timestamp", "ssn_host", "ssn_cpu", "ssn_git_sha"],
+    "qpalm":  ["name",
+               "qpalm_solved", "qpalm_status", "qpalm_iter", "qpalm_inner_iter",
+               "qpalm_obj", "qpalm_tol_achieved", "qpalm_time", "qpalm_setup_time", "qpalm_solve_time",
+               "qpalm_tol", "qpalm_time_limit", "qpalm_eps_inf",
+               "qpalm_run_id", "qpalm_timestamp", "qpalm_host", "qpalm_cpu", "qpalm_version"],
+    "osqp":   ["name",
+               "osqp_solved", "osqp_status", "osqp_iter",
+               "osqp_obj", "osqp_tol_achieved", "osqp_time", "osqp_setup_time", "osqp_solve_time",
+               "osqp_tol", "osqp_time_limit", "osqp_eps_inf",
+               "osqp_run_id", "osqp_timestamp", "osqp_host", "osqp_cpu", "osqp_version"],
+}
+
+# ---------------------------------------------------------------------------
 # Subprocess worker functions (each spawned in a fresh process for clean RSS)
 # ---------------------------------------------------------------------------
 
@@ -280,7 +323,7 @@ def main() -> None:
         "--time-limit", type=float, default=60.0, help="Per-problem time limit in seconds (default: 60)"
     )
     parser.add_argument(
-        "--out", default="", help="Prefix for output filenames (e.g. '0508' → '0508_comparison_mm.csv')"
+        "--out", default="", help="Prefix for output filenames (e.g. '0508' → '0508_mm_kspqp.csv')"
     )
     parser.add_argument(
         "--solver", nargs="+", default=["ksp-qp", "qpalm", "osqp"],
@@ -291,6 +334,16 @@ def main() -> None:
         "--cooldown", type=float, default=0.0,
         help="Seconds to sleep between problems to prevent CPU throttling (default: 0)",
     )
+    parser.add_argument(
+        "--problems", nargs="+", default=None, metavar="NAME",
+        help="Run only these problems (default: all). Their rows are replaced; the others are kept.",
+    )
+    for s, tag in SOLVER_FILES.items():
+        parser.add_argument(
+            f"--{tag}-csv", default="", metavar="FILE",
+            help=f"{s} result file to use in the performance profiles instead of this prefix's "
+                 f"mm_{tag}.csv (e.g. from an earlier run)",
+        )
     cert = parser.add_mutually_exclusive_group()
     cert.add_argument(
         "--inf-tol-factor", type=float, default=INF_TOL_FACTOR, dest="inf_tol_factor",
@@ -323,47 +376,67 @@ def main() -> None:
              else f"{eps_inf:g} ({args.inf_tol_factor:g} * tol, matching KSP-QP)"))
 
     prefix = f"{args.out}_" if args.out else ""
-    csv_path = result_dir / f"{prefix}comparison_mm.csv"
-    fieldnames = [
-        "name",
-        "ssn_solved",   "ssn_status",   "pmm_iter", "ssn_iter",
-        "krylov_iter",  "fact",         "smw_count",
-        "ssn_obj",   "pmm_tol_achieved",   "ssn_time",
-        "qpalm_solved", "qpalm_status", "qpalm_iter", "qpalm_inner_iter", "qpalm_obj", "qpalm_tol_achieved", "qpalm_time",
-        "osqp_solved",  "osqp_status",  "osqp_iter",                      "osqp_obj",  "osqp_tol_achieved",  "osqp_time",
-    ]
+    paths = {s: result_dir / f"{prefix}mm_{tag}.csv" for s, tag in SOLVER_FILES.items()}
+    for s in solvers:
+        check_header(paths[s], FIELDS[s])
 
-    n_problems = len(QPS)
-    rows: list[dict] = _load_existing_rows(csv_path)
+    if args.problems:
+        unknown = sorted(set(args.problems) - set(QPS))
+        if unknown:
+            sys.exit(f"Unknown problem name(s): {', '.join(unknown)}")
+    names = [n for n in QPS if not args.problems or n in args.problems]
 
-    def _flush() -> None:
-        """Rewrite the CSV from `rows` — called right after every solver finishes."""
-        _write_csv(csv_path, rows, fieldnames)
+    # Provenance recorded on every row this run writes, per solver.
+    prov = provenance()
+    run_cols = {
+        "ksp-qp": {"ssn_tol": tol, "ssn_time_limit": time_limit,
+                   "ssn_run_id": prov["run_id"], "ssn_timestamp": prov["timestamp"],
+                   "ssn_host": prov["host"], "ssn_cpu": prov["cpu"], "ssn_git_sha": prov["git_sha"]},
+        "qpalm":  {"qpalm_tol": tol, "qpalm_time_limit": time_limit,
+                   "qpalm_eps_inf": "" if eps_inf is None else eps_inf,
+                   "qpalm_run_id": prov["run_id"], "qpalm_timestamp": prov["timestamp"],
+                   "qpalm_host": prov["host"], "qpalm_cpu": prov["cpu"],
+                   "qpalm_version": prov["qpalm_version"]},
+        "osqp":   {"osqp_tol": tol, "osqp_time_limit": time_limit,
+                   "osqp_eps_inf": "" if eps_inf is None else eps_inf,
+                   "osqp_run_id": prov["run_id"], "osqp_timestamp": prov["timestamp"],
+                   "osqp_host": prov["host"], "osqp_cpu": prov["cpu"],
+                   "osqp_version": prov["osqp_version"]},
+    }
 
-    for idx, (name, _ref_obj) in enumerate(QPS.items(), 1):
+    def _record(solver: str, row: dict) -> None:
+        """Write this problem's row into the solver's file, replacing an earlier one."""
+        replace_rows(paths[solver], [{**row, **run_cols[solver]}], ["name"], FIELDS[solver])
+        if cooldown > 0:
+            time.sleep(cooldown)
+
+    n_problems = len(names)
+    for idx, name in enumerate(names, 1):
         sif_path = str(data_dir / f"{name}.SIF")
         if not os.path.exists(sif_path):
             print(f"[{idx:3d}/{n_problems}] SKIP (file not found): {name}")
             continue
 
         print(f"\n[{idx:3d}/{n_problems}]  {name}")
-        row: dict = {"name": name}
-        rows.append(row)
 
         # ---- KSP-QP ------------------------------------------------
         if "ksp-qp" in solvers:
+            row: dict = {"name": name}
             ssn_out = _run_isolated(_worker_ssn_mm, (sif_path, tol, time_limit, max_iter))
             if "error" in ssn_out:
                 print(f"  KSP-QP : ERROR — {ssn_out['error']}")
                 row.update(ssn_status=-99, ssn_solved=0, ssn_time=np.inf,
                            pmm_iter=np.inf, ssn_iter=np.inf,
                            krylov_iter=np.inf, fact=np.inf, smw_count=np.inf,
-                           ssn_obj=np.nan, pmm_tol_achieved=np.nan)
+                           ssn_obj=np.nan, pmm_tol_achieved=np.nan,
+                           ssn_setup_time=np.nan, ssn_solve_time=np.nan)
             else:
                 r = ssn_out["res"]
                 row["ssn_status"]       = r["status"]
                 row["ssn_solved"]       = int(r["status"] == 0)
                 row["ssn_time"]         = r["run_time"]
+                row["ssn_setup_time"]   = r["setup_time"]
+                row["ssn_solve_time"]   = r["solve_time"]
                 row["pmm_iter"]         = r["pmm_iter"]
                 row["ssn_iter"]         = r["ssn_iter"]
                 row["krylov_iter"]      = r["krylov_iter"]
@@ -376,23 +449,25 @@ def main() -> None:
                       f"pmm={r['pmm_iter']} ssn={r['ssn_iter']} "
                       f"krylov={r['krylov_iter']} fact={r['fact']} smw={r['smw_count']}  "
                       f"tol={r['pmm_tol_achieved']:.2e}  obj = {r['obj_val']:.6g}")
-            _flush()
-            if cooldown > 0:
-                time.sleep(cooldown)
+            _record("ksp-qp", row)
 
         # ---- QPALM --------------------------------------------------
         if "qpalm" in solvers:
+            row = {"name": name}
             qpalm_out = _run_isolated(_worker_qpalm_mm, (sif_path, tol, time_limit, eps_inf))
             if "error" in qpalm_out:
                 print(f"  QPALM   : ERROR — {qpalm_out['error']}")
                 row.update(qpalm_status=-99, qpalm_solved=0, qpalm_time=np.inf,
                            qpalm_iter=np.inf, qpalm_inner_iter=np.inf,
-                           qpalm_obj=np.nan, qpalm_tol_achieved=np.nan)
+                           qpalm_obj=np.nan, qpalm_tol_achieved=np.nan,
+                           qpalm_setup_time=np.nan, qpalm_solve_time=np.nan)
             else:
                 r = qpalm_out["res"]
                 row["qpalm_status"]        = r["status"]
                 row["qpalm_solved"]        = int(r["status"] == QPALM_SOLVED)
                 row["qpalm_time"]          = r["run_time"]
+                row["qpalm_setup_time"]    = r["setup_time"]
+                row["qpalm_solve_time"]    = r["solve_time"]
                 row["qpalm_iter"]          = r["outer_iter"]
                 row["qpalm_inner_iter"]    = r["inner_iter"]
                 row["qpalm_obj"]           = r["obj_val"]
@@ -401,44 +476,61 @@ def main() -> None:
                 print(f"  QPALM   : {status_str:12s}  t = {r['run_time']:.3f} s  "
                       f"outer={r['outer_iter']} inner={r['inner_iter']}  "
                       f"tol={r['tol_achieved']:.2e}  obj = {r['obj_val']:.6g}")
-            _flush()
-            if cooldown > 0:
-                time.sleep(cooldown)
+            _record("qpalm", row)
 
         # ---- OSQP ---------------------------------------------------
         if "osqp" in solvers:
+            row = {"name": name}
             osqp_out = _run_isolated(_worker_osqp_mm, (sif_path, tol, time_limit, eps_inf))
             if "error" in osqp_out:
                 print(f"  OSQP    : ERROR — {osqp_out['error']}")
                 row.update(osqp_status=-99, osqp_solved=0, osqp_time=np.inf, osqp_iter=np.inf,
-                           osqp_obj=np.nan, osqp_tol_achieved=np.nan)
+                           osqp_obj=np.nan, osqp_tol_achieved=np.nan,
+                           osqp_setup_time=np.nan, osqp_solve_time=np.nan)
             else:
                 r = osqp_out["res"]
                 row["osqp_status"]       = r["status"]
                 row["osqp_solved"]       = int(r["status"] == OSQP_SOLVED)
                 row["osqp_time"]         = r["run_time"]
+                row["osqp_setup_time"]   = r["setup_time"]
+                row["osqp_solve_time"]   = r["solve_time"]
                 row["osqp_iter"]         = r["outer_iter"]
                 row["osqp_obj"]          = r["obj_val"]
                 row["osqp_tol_achieved"] = r["tol_achieved"]
                 status_str = "OPTIMAL" if r["status"] == OSQP_SOLVED else f"status={r['status']}"
                 print(f"  OSQP    : {status_str:12s}  t = {r['run_time']:.3f} s  "
                       f"iter = {r['outer_iter']}  tol={r['tol_achieved']:.2e}  obj = {r['obj_val']:.6g}")
-            _flush()
-            if cooldown > 0:
-                time.sleep(cooldown)
+            _record("osqp", row)
 
-    print(f"\nResults written to: {csv_path}")
+    print("\nResults written to: " + ", ".join(str(paths[s]) for s in SOLVER_FILES if s in solvers))
 
     # ---- Performance profiles -------------------------------------------
+    # Every solver with a result file: the one given by --<solver>-csv, else this prefix's own.
+    # Only the problems present in all of them are compared.
+    explicit = {s: getattr(args, f"{tag}_csv") for s, tag in SOLVER_FILES.items()}
+    profile_paths = {}
+    for s in SOLVER_FILES:
+        p = Path(explicit[s]) if explicit[s] else paths[s]
+        if p.exists():
+            profile_paths[s] = p
+        elif explicit[s]:
+            sys.exit(f"--{SOLVER_FILES[s]}-csv: file not found: {p}")
+    if not profile_paths:
+        return
+    df = load_solver_tables(profile_paths, ["name"])
+    print("Performance profiles over " + f"{len(df)} problems from: "
+          + ", ".join(f"{s}={p}" for s, p in profile_paths.items()))
+    profile_solvers = set(profile_paths)
+
     label = "Maros-Meszaros QPs"
     out_prefix = result_dir / f"{prefix}performance_profile_mm"
-    plot_performance_profile(csv_path, out_prefix, label, tol=tol, time_limit=time_limit, solvers=solvers)
+    plot_performance_profile(df, out_prefix, label, tol=tol, time_limit=time_limit, solvers=profile_solvers)
 
     out_prefix_iters = result_dir / f"{prefix}performance_profile_mm_iters"
-    plot_performance_profile_iters(csv_path, out_prefix_iters, label, tol=tol, time_limit=time_limit, solvers=solvers)
+    plot_performance_profile_iters(df, out_prefix_iters, label, tol=tol, time_limit=time_limit, solvers=profile_solvers)
 
     out_prefix_inner = result_dir / f"{prefix}performance_profile_mm_inner_iters"
-    plot_performance_profile_inner_iters(csv_path, out_prefix_inner, label, tol=tol, time_limit=time_limit, solvers=solvers)
+    plot_performance_profile_inner_iters(df, out_prefix_inner, label, tol=tol, time_limit=time_limit, solvers=profile_solvers)
 
 
 if __name__ == "__main__":

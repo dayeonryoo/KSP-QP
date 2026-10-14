@@ -1,19 +1,27 @@
 """
-Shared helpers for benchmark_*.py scripts (benchmark_mm.py, benchmark_netlib.py,
-benchmark_infeas.py, benchmark_l2pde.py):
+Shared helpers for benchmark_*.py scripts (benchmark_mm.py, benchmark_mpc.py,
+benchmark_netlib.py, benchmark_infeas.py, benchmark_l2pde.py):
 
   - QPALM / OSQP imports (with install hints) and status constants
   - KSPQPdata -> QPALM/OSQP conversion and solver wrappers
   - crash-tolerant subprocess isolation
   - the per-problem three-solver runner used by the PDE benchmark
-  - CSV read/write helpers
+  - CSV read/write helpers, including the per-solver result files of benchmark_mm.py and
+    benchmark_mpc.py (one file per solver, rows replaced by key on a rerun) and their join
+  - run provenance (run id, time, host, git revision, solver versions)
   - Dolan-Moré performance-profile computation and plotting
 """
 
+import os
 import sys
 import csv
 import time
+import uuid
+import socket
+import platform
+import subprocess
 import multiprocessing as mp
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -149,6 +157,8 @@ def run_qpalm(qpalm_data: tuple, tol: float, time_limit: float, obj_const: float
         # QPALM's Data has no constant-term field; it only ever reports 0.5 x'Qx + q'x,
         # so obj_const is added back explicitly to compare against KSP-QP's obj_val.
         "obj_val":      float(info.objective) + obj_const,
+        "setup_time":   float(info.setup_time),
+        "solve_time":   float(info.solve_time),
         "run_time":     float(info.run_time),
         "outer_iter":   int(info.iter_out),
         "inner_iter":   int(info.iter),
@@ -188,6 +198,8 @@ def run_osqp(qpalm_data: tuple, tol: float, time_limit: float, obj_const: float 
         "status":       int(info.status_val),
         # OSQP's setup() has no constant-term argument so obj_const is added back explicitly.
         "obj_val":      float(info.obj_val) + obj_const,
+        "setup_time":   float(info.setup_time),
+        "solve_time":   float(info.solve_time),
         "run_time":     float(info.run_time),
         "outer_iter":   int(info.iter),
         "inner_iter":   0,
@@ -313,11 +325,17 @@ def run_solvers(result: dict, worker_args: tuple,
 # ---------------------------------------------------------------------------
 
 def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
-    """Rewrite the whole CSV from `rows`. Called after every solver finishes."""
-    with open(path, "w", newline="") as fh:
+    """Rewrite the whole CSV from `rows`. Called after every solver finishes.
+
+    Written to a temporary file and moved into place, so a crash mid-write leaves the old file intact.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+    os.replace(tmp, path)
 
 
 def _load_existing_rows(path: Path) -> list[dict]:
@@ -326,6 +344,95 @@ def _load_existing_rows(path: Path) -> list[dict]:
         return []
     with open(path, newline="") as fh:
         return list(csv.DictReader(fh))
+
+
+# ---------------------------------------------------------------------------
+# Per-solver result files (benchmark_mm.py, benchmark_mpc.py)
+#
+# Each solver writes its own CSV, so QPALM's results can be kept while KSP-QP is rerun.
+# A rerun replaces the rows of the problems/instances it solved and keeps every other row;
+# load_solver_tables() joins the files back on their key.
+# ---------------------------------------------------------------------------
+
+def provenance() -> dict:
+    """Identifies a benchmark run: id, UTC start time, host, CPU, git revision, solver versions."""
+    def _sh(cmd: list[str]) -> str:
+        try:
+            return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            return ""
+    return {
+        "run_id": uuid.uuid4().hex[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "cpu": _sh(["sysctl", "-n", "machdep.cpu.brand_string"]) or platform.processor(),
+        "git_sha": _sh(["git", "-C", str(Path(__file__).parent), "rev-parse", "--short", "HEAD"]),
+        "qpalm_version": getattr(qpalm, "__version__", "?"),
+        "osqp_version": getattr(osqp, "__version__", "?"),
+    }
+
+
+def check_header(path: Path, fieldnames: list[str]) -> None:
+    """Exit if `path` exists with a header other than `fieldnames`; files of another schema are never mixed."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with open(path, newline="") as fh:
+        head = next(csv.reader(fh), [])
+    if head != fieldnames:
+        sys.exit(f"{path} has a different header than this script writes. "
+                 f"Move it aside or pass --out <prefix>.")
+
+
+def replace_rows(path: Path, new_rows: list[dict], key: list[str], fieldnames: list[str]) -> None:
+    """Write `new_rows` into the CSV at `path`, replacing every existing row whose `key` matches one of theirs.
+
+    The replacement goes where the first replaced row was, so the file keeps its order; rows with a
+    new key are appended. A key may cover several rows (e.g. every step and repeat of an MPC
+    configuration), and all of them are replaced together. Keys are compared as strings, since rows
+    read back from the file are strings.
+    """
+    path = Path(path)
+    check_header(path, fieldnames)
+    existing = _load_existing_rows(path)
+
+    def k(row: dict) -> tuple:
+        return tuple(str(row.get(f, "")) for f in key)
+
+    groups: dict[tuple, list[dict]] = {}
+    for r in new_rows:
+        groups.setdefault(k(r), []).append(r)
+
+    out, written = [], set()
+    for r in existing:
+        rk = k(r)
+        if rk not in groups:
+            out.append(r)
+        elif rk not in written:
+            out.extend(groups[rk])
+            written.add(rk)
+    for rk, rows in groups.items():
+        if rk not in written:
+            out.extend(rows)
+    _write_csv(path, out, fieldnames)
+
+
+def load_solver_tables(paths: dict, key: list[str], how: str = "inner") -> pd.DataFrame:
+    """Join per-solver result files on `key` into one frame, in the order of `paths` ({solver: path}).
+
+    how="inner" keeps the problems every file has (what a performance profile compares); "outer"
+    keeps all. Non-key columns present in more than one file get a "_<solver>" suffix.
+    """
+    frames = {s: pd.read_csv(p) for s, p in paths.items()}
+    counts: dict[str, int] = {}
+    for df in frames.values():
+        for c in df.columns:
+            counts[c] = counts.get(c, 0) + 1
+    merged = None
+    for s, df in frames.items():
+        df = df.rename(columns={c: f"{c}_{s}" for c in df.columns if c not in key and counts[c] > 1})
+        merged = df if merged is None else merged.merge(df, on=key, how=how)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -377,11 +484,12 @@ def _fmt_limit(time_limit: float) -> str:
     return f"{time_limit:g} s"
 
 
-def _plot_profile(csv_path: Path, out_prefix: Path, label: str, metric_label: str,
+def _plot_profile(csv_path, out_prefix: Path, label: str, metric_label: str,
                   meta: list[tuple], tau_vals: np.ndarray,
                   tol: float, time_limit: float, solvers: set | None) -> None:
     """Shared body of plot_performance_profile / _iters / _inner_iters.
 
+    csv_path: a combined comparison CSV, or a DataFrame (e.g. from load_solver_tables()).
     meta: list of (solver_key, solved_col, value_col, display_name, color, linestyle).
     """
     if solvers is None:
@@ -390,7 +498,7 @@ def _plot_profile(csv_path: Path, out_prefix: Path, label: str, metric_label: st
     if not active:
         return
 
-    df = pd.read_csv(csv_path)
+    df = csv_path if isinstance(csv_path, pd.DataFrame) else pd.read_csv(csv_path)
     n_total = len(df)
 
     values_list, plot_entries = [], []
