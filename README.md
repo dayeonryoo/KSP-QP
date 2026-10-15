@@ -639,6 +639,22 @@ python3 analyze_performance.py --prefix ../results/1015 --qpalm-prefix ../result
     --out ../results/1015_perf   # also writes mm_problems.csv and mpc_configs.csv
 ```
 
+### Comparing two KSP-QP runs (experimental)
+
+`compare_runs.py` compares two KSP-QP runs, A and B, from their MM and MPC result files and traces:
+PCG against the direct solver (`--direct`), or a run before and after a change. It reports the
+problems only one run solves; B / A for run time, PMM and SSN iterations and time per SSN iteration,
+by problem class and size; the run time over the problems on which both take the same iterations
+(the cost of the same steps); the time per factorization and its symbolic analysis; and the inner
+solves stopped at the iteration limit. On MPC it also compares the identical-step prefix, the PMM
+iterations before the runs first differ, and flags solves whose own run time disagrees with the
+benchmark's wall time.
+
+```bash
+python3 compare_runs.py --a ../results/1014_baseline/1014 --b ../results/1014_direct/1014_direct \
+    --labels pcg direct --qpalm-prefix ../results/1014_baseline/1014
+```
+
 ---
 
 ## Tests
@@ -826,6 +842,7 @@ KSP-QP/
 │   ├── benchmark_mpc.py                # platoon MPC benchmark vs QPALM
 │   ├── analyze_profile.py              # per-iteration gap vs QPALM from the MM/MPC result files
 │   ├── analyze_performance.py          # performance summary vs QPALM from the MM/MPC result files
+│   ├── compare_runs.py                 # two KSP-QP runs compared (e.g. PCG vs direct) from their result files
 │   ├── tests/                          # unittest suite for the Python generators
 │   └── CMakeLists.txt                  # Python binding build config
 ├── data/
