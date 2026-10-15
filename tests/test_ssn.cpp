@@ -2894,7 +2894,7 @@ TEST(SolveSsn, DirectModeConvergesToStrictlyInteriorMinimizerWithNoEqualityOrIne
   EXPECT_EQ(ns.krylov_iter, 0);
 }
 
-// ===================== kept preconditioner factorization (refactor_after) =====================
+// ===================== kept preconditioner factorization (refactor_ratio) =====================
 
 // A PCG failure through a kept (stale) preconditioner refactorizes it and retries, instead of handing
 // the rest of the run to the direct solver.
@@ -2906,7 +2906,7 @@ TEST(SolveUsingCg, PcgFailureThroughAKeptPreconditionerRetriesWithAFreshFactoriz
   SolveTrace<double> trace;
   trace.enabled = true;
   ns.trace_ = &trace;
-  ns.cg.preconditioner().set_refactor_after(2);
+  ns.cg.preconditioner().set_refactor_ratio(4.0);  // (2, 1) -> (4, 2) below has ratio 2 * 2
   ns.active_W = ToBoolArr({true, false});
 
   const SpMat G = DenseToSparse((Eigen::MatrixXd(2, 3) << 1.0, 1.0, 1.0, 1.0, 0.0, 0.0).finished());
@@ -2940,11 +2940,11 @@ TEST(SolveUsingCg, PcgFailureThroughAKeptPreconditionerRetriesWithAFreshFactoriz
   ASSERT_EQ(trace.events.size(), 4u);
   EXPECT_EQ(trace.events[0].action, LinAction::Factorize);
   EXPECT_EQ(trace.events[1].action, LinAction::MuRhoKeep);
-  EXPECT_EQ(trace.events[1].stale, 1);
+  EXPECT_EQ(trace.events[1].stale_ratio, 4.0);
   EXPECT_EQ(trace.events[2].action, LinAction::PcgFail);
-  EXPECT_EQ(trace.events[2].stale, 1);
+  EXPECT_EQ(trace.events[2].stale_ratio, 4.0);
   EXPECT_EQ(trace.events[3].action, LinAction::Factorize);
   EXPECT_EQ(trace.events[3].reason, FactReason::PcgFailure);
-  EXPECT_EQ(trace.events[3].stale, 0);
+  EXPECT_EQ(trace.events[3].stale_ratio, 1.0);
   ExpectKktResidualSmall(sol, G, H2, r1, r2, /*mu=*/4.0, 1e-8);
 }

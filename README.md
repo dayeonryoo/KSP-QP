@@ -294,11 +294,12 @@ After `solve()`, `kkt_ldlt_fact` / `schur_chol_fact` count the direct solver's f
 update instead (included in `Solution::smw_count`), and `direct_smw_reject` the updates that the
 residual check rejected. The SMW updates are not used in the fallback after a PCG failure.
 
-`refactor_after` (default `1`; experimental, PCG only) lets the preconditioner keep its factorization
+`refactor_ratio` (default `1`; experimental, PCG only) lets the preconditioner keep its factorization
 across μ/ρ changes. SMW updates for active-set changes continue on top of it, built at the
-factorization's own μ and ρ, and it is refactorized at the `refactor_after`-th μ/ρ change since its
-last factorization (`1`: at every change). A PCG failure through a preconditioner kept this way is
-retried with a fresh factorization. The drivers and the MM/MPC benchmarks take it as `--refactor-after K`.
+factorization's own μ_f and ρ_f, and it is refactorized once max(μ/μ_f, μ_f/μ) · max(ρ/ρ_f, ρ_f/ρ)
+exceeds `refactor_ratio` (`1`: at every change). That product bounds the condition number of the kept
+preconditioner relative to a fresh one. A PCG failure through a preconditioner kept this way is
+retried with a fresh factorization. The drivers and the MM/MPC benchmarks take it as `--refactor-ratio R`.
 
 ### Termination status codes
 
@@ -364,7 +365,7 @@ to point at your clone from elsewhere. No editing or rebuilding is needed just t
 ```bash
 ./build/ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all] \
                       [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] \
-                      [--refactor-after K] [--out FILE] [--trace PREFIX] [--cooldown S] [--ref FILE]
+                      [--refactor-ratio R] [--out FILE] [--trace PREFIX] [--cooldown S] [--ref FILE]
 ```
 
 `--set` picks the problem set and, with it, the default input directory, default problem, and
@@ -384,8 +385,8 @@ Pass `--name all` to sweep the set, appending a row per problem to
 (override with `--out`). `--direct` runs the experimental direct mode
 (see ["Linear solver"](#linear-solver-for-the-ssn-newton-systems)) and writes `direct_*.csv`
 instead; `--no-direct-smw` additionally turns its SMW updates off (`direct_nosmw_*.csv`).
-`--refactor-after K` sets `refactor_after` (see the same section); with K > 1 the default CSV is
-`pcg_ra<K>_*.csv`. A CSV or trace file written with another header is refused rather than appended to.
+`--refactor-ratio R` sets `refactor_ratio` (see the same section); with R > 1 the default CSV is
+`pcg_rr<R>_*.csv`. A CSV or trace file written with another header is refused rather than appended to.
 The sweep is the directory listing, so adding or removing an `.mps` file is all it takes to
 change the set — the same convention `python/benchmark_netlib.py` uses.
 
@@ -408,7 +409,7 @@ instead (see below).
 
 ```bash
 ./build/ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] \
-                              [--direct [--no-direct-smw]] [--refactor-after K] [--out FILE] [--trace PREFIX] \
+                              [--direct [--no-direct-smw]] [--refactor-ratio R] [--out FILE] [--trace PREFIX] \
                               [--cooldown S]
 ```
 
@@ -417,8 +418,8 @@ solution summary. Pass `--name all` to sweep the full Maros-Meszaros set against
 reference objectives, appending a row to `<root>/results/pcg_mm.csv` (override with
 `--out`) for each — `--cooldown` (default 3s) sleeps between problems in this mode, which keeps
 a long sweep from being distorted by CPU thermal throttling. `--direct`, `--no-direct-smw` and
-`--refactor-after` work as for `ksp_qp_netlib` (default CSVs `results/direct_mm.csv` /
-`results/direct_nosmw_mm.csv` / `results/pcg_ra<K>_mm.csv`),
+`--refactor-ratio` work as for `ksp_qp_netlib` (default CSVs `results/direct_mm.csv` /
+`results/direct_nosmw_mm.csv` / `results/pcg_rr<R>_mm.csv`),
 and so do the profile columns and `--trace PREFIX`. A single-problem run also prints the profile.
 
 For comparing against QPALM/OSQP rather than just checking against reference objectives, use
@@ -734,7 +735,7 @@ drivers' CSVs, as keys of the Python solve functions' dict, and in `mm_kspqp.csv
   - `fact_analyzed`: the factorizations that included a symbolic analysis.
   - `smw_update` (= `smw_count`): the Newton systems solved through an SMW update instead.
   - `smw_reuse`: the systems solved with the last factorization as is.
-  - `mu_rho_keep`: the μ/ρ changes absorbed by keeping the preconditioner's factorization (`refactor_after` > 1).
+  - `mu_rho_keep`: the μ/ρ changes absorbed by keeping the preconditioner's factorization (`refactor_ratio` > 1).
   - `pcg_fail` (= `krylov_fail`).
   - `krylov_refine`: the Krylov iterations spent in iterative refinement.
   - `ls_steepest`: the steepest-descent line-search retries.
@@ -743,7 +744,7 @@ drivers' CSVs, as keys of the Python solve functions' dict, and in `mm_kspqp.csv
 | reason | why the factorization was done |
 |---|---|
 | `initial` | first factorization of the run (direct mode: of the direct solver) |
-| `mu_rho` | mu and/or rho changed since the last factorization (the preconditioner with `refactor_after` = K: the K-th change) |
+| `mu_rho` | mu and/or rho changed since the last factorization (the preconditioner: once its ratio exceeds `refactor_ratio`) |
 | `rank` | the active sets moved too far from the last factorization's for an SMW update (rank > 50) |
 | `singular` | the SMW capacitance matrix was (near-)singular |
 | `pcg_fail` | PCG failed through an SMW-updated or kept (stale in mu/rho) preconditioner, so it was rebuilt in full and retried |
@@ -785,7 +786,7 @@ The last four columns are informational parts of these phases:
   - its PMM and SSN iteration;
   - `target` (`prec` | `direct`), `action`, `reason`, `method` (`chol` | `ldlt`);
   - the SMW rank and its parts h/p/q;
-  - `stale`: the μ/ρ changes the preconditioner's factorization lags behind after the event;
+  - `stale_ratio`: the ratio of the preconditioner factorization's μ/ρ to the current ones after the event (1: current);
   - mu and rho, and whether mu, rho or the active sets changed;
   - the time spent;
   - for a PCG failure, its kind, iterations and error.

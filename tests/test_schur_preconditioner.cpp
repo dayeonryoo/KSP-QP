@@ -3038,7 +3038,7 @@ TEST(RandomizedCholLdltConsistency, FiftyColumnRandomSystemCholeskyAndLdltAgree)
   }
 }
 
-// ===================== kept (stale) factorization across mu/rho changes (refactor_after) =====================
+// ===================== kept (stale) factorization across mu/rho changes (refactor_ratio) =====================
 
 namespace {
 
@@ -3071,7 +3071,7 @@ struct KeepRig {
   bool use_ldlt = false;
   Prec prec;
 
-  explicit KeepRig(int refactor_after, bool ldlt = false) : use_ldlt(ldlt) { prec.set_refactor_after(refactor_after); }
+  explicit KeepRig(double refactor_ratio, bool ldlt = false) : use_ldlt(ldlt) { prec.set_refactor_ratio(refactor_ratio); }
 
   void Step(const std::vector<bool>& k, const std::vector<bool>& w, double mu, double rho) {
     const bool changed = first || k != k_cur || w != w_cur;
@@ -3097,11 +3097,11 @@ struct KeepRig {
 
 }  // namespace
 
-TEST(KeptFactorization, RefactorAfterOneRefactorizesOnEveryPenaltyChange) {
+TEST(KeptFactorization, RefactorRatioOneRefactorizesOnEveryPenaltyChange) {
   // The default: no change is ever kept, and every result is the exact P at the current mu/rho.
   for (const bool ldlt : {false, true}) {
     SCOPED_TRACE(ldlt ? "ldlt" : "chol");
-    KeepRig r(/*refactor_after=*/1, ldlt);
+    KeepRig r(/*refactor_ratio=*/1.0, ldlt);
     struct S { std::vector<bool> k, w; double mu, rho; int fact; };
     const std::vector<S> script = {
         {{true, true, true}, {false, false}, 5, 3, 1},
@@ -3116,32 +3116,34 @@ TEST(KeptFactorization, RefactorAfterOneRefactorizesOnEveryPenaltyChange) {
       r.Step(s.k, s.w, s.mu, s.rho);
       EXPECT_EQ(r.prec.fact_count(), s.fact);
       EXPECT_FALSE(r.prec.last_build().kept_stale);
-      EXPECT_EQ(r.prec.stale_count(), 0);
+      EXPECT_EQ(r.prec.stale_ratio(), 1.0);
+      EXPECT_EQ(r.prec.last_build().stale_ratio, 1.0);
       EXPECT_FALSE(r.prec.is_stale());
       EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(s.mu, s.rho), kTol));
     }
   }
 }
 
-TEST(KeptFactorization, RefactorizesAtTheKthPenaltyChange) {
+TEST(KeptFactorization, RefactorizesOnceTheRatioExceedsTheThreshold) {
+  // mu doubles at every change: at R = 4 the factorization is kept at ratios 2 and 4, redone at 8.
   for (const bool ldlt : {false, true}) {
     SCOPED_TRACE(ldlt ? "ldlt" : "chol");
-    KeepRig r(/*refactor_after=*/3, ldlt);
+    KeepRig r(/*refactor_ratio=*/4.0, ldlt);
     const std::vector<bool> k = {true, true, false}, w = {true, false};
     r.Step(k, w, 5, 3);
     ASSERT_EQ(r.prec.fact_count(), 1);
 
     double mu = 5, mu_fact = 5;
     const int want_fact[] = {1, 1, 2, 2, 2, 3};
-    const int want_stale[] = {1, 2, 0, 1, 2, 0};
+    const double want_ratio[] = {2, 4, 1, 2, 4, 1};
     for (int i = 0; i < 6; ++i) {
       mu *= 2;
       r.Step(k, w, mu, 3);
       EXPECT_EQ(r.prec.fact_count(), want_fact[i]) << "change " << i + 1;
-      EXPECT_EQ(r.prec.stale_count(), want_stale[i]) << "change " << i + 1;
-      EXPECT_EQ(r.prec.last_build().stale, want_stale[i]);
+      EXPECT_EQ(r.prec.stale_ratio(), want_ratio[i]) << "change " << i + 1;
+      EXPECT_EQ(r.prec.last_build().stale_ratio, want_ratio[i]);
       EXPECT_TRUE(r.prec.last_build().mu_changed);
-      if (want_stale[i] > 0) {
+      if (want_ratio[i] > 1) {
         EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::KeptStale);
         EXPECT_TRUE(r.prec.last_build().kept_stale);
         EXPECT_TRUE(r.prec.is_stale());
@@ -3160,10 +3162,35 @@ TEST(KeptFactorization, RefactorizesAtTheKthPenaltyChange) {
   }
 }
 
+TEST(KeptFactorization, RatioIsTheProductOfTheMuAndRhoRatiosInEitherDirection) {
+  const std::vector<bool> k = {true, true, false}, w = {true, false};
+  {
+    // mu and rho both doubled: 2 * 2 = 4, kept at R = 4; then mu at 2.2 times its factorization's: 4.4.
+    KeepRig r(/*refactor_ratio=*/4.0);
+    r.Step(k, w, 5, 3);
+    r.Step(k, w, 10, 6);
+    EXPECT_EQ(r.prec.fact_count(), 1);
+    EXPECT_EQ(r.prec.stale_ratio(), 4.0);
+    r.Step(k, w, 11, 6);
+    EXPECT_EQ(r.prec.fact_count(), 2);
+    EXPECT_EQ(r.prec.stale_ratio(), 1.0);
+  }
+  {
+    // A decrease counts like an increase: mu halved is 2, kept at R = 2; mu divided by 2.5 is not.
+    KeepRig r(/*refactor_ratio=*/2.0);
+    r.Step(k, w, 5, 3);
+    r.Step(k, w, 2.5, 3);
+    EXPECT_EQ(r.prec.fact_count(), 1);
+    EXPECT_EQ(r.prec.stale_ratio(), 2.0);
+    r.Step(k, w, 2, 3);
+    EXPECT_EQ(r.prec.fact_count(), 2);
+  }
+}
+
 TEST(KeptFactorization, MuShiftAfterAKeepStartsFromTheFactorizationsMu) {
   // Cholesky's mu-only refactorization shifts the stored diagonal; it must shift from the mu in the
   // stored values (5), not from the mu the kept factorization last served (10).
-  KeepRig r(/*refactor_after=*/2);
+  KeepRig r(/*refactor_ratio=*/2.0);
   const std::vector<bool> k = {true, true, false}, w = {true, false};
   r.Step(k, w, 5, 3);
   r.Step(k, w, 10, 3);
@@ -3178,7 +3205,7 @@ TEST(KeptFactorization, RhoPatchAfterAKeepStartsFromTheFactorizationsRho) {
   // (20, 6) must still rebuild (Cholesky) or patch (LDLT) the rho-dependent entries.
   for (const bool ldlt : {false, true}) {
     SCOPED_TRACE(ldlt ? "ldlt" : "chol");
-    KeepRig r(/*refactor_after=*/2, ldlt);
+    KeepRig r(/*refactor_ratio=*/4.0, ldlt);
     const std::vector<bool> k = {true, true, false}, w = {true, false};
     r.Step(k, w, 5, 3);
     r.Step(k, w, 10, 6);
@@ -3194,7 +3221,7 @@ TEST(KeptFactorization, SmwOnAKeptFactorizationUsesItsPenalties) {
   // P(new active sets) at the factorization's (mu, rho) = (5, 3), not at the current (10, 6).
   for (const bool ldlt : {false, true}) {
     SCOPED_TRACE(ldlt ? "ldlt" : "chol");
-    KeepRig r(/*refactor_after=*/2, ldlt);
+    KeepRig r(/*refactor_ratio=*/4.0, ldlt);
     r.Step({true, false, true}, {false, false}, 5, 3);
     r.Step({true, true, true}, {true, false}, 10, 6);
 
@@ -3202,7 +3229,7 @@ TEST(KeptFactorization, SmwOnAKeptFactorizationUsesItsPenalties) {
     EXPECT_EQ(r.prec.fact_count(), 1);
     EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::SmwUpdated);
     EXPECT_TRUE(r.prec.last_build().kept_stale);
-    EXPECT_EQ(r.prec.last_build().stale, 1);
+    EXPECT_EQ(r.prec.last_build().stale_ratio, 4.0);
     EXPECT_TRUE(r.prec.last_build().mu_changed);
     EXPECT_TRUE(r.prec.last_build().rho_changed);
     EXPECT_EQ(r.prec.last_build().p, 1);
@@ -3210,7 +3237,7 @@ TEST(KeptFactorization, SmwOnAKeptFactorizationUsesItsPenalties) {
     EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(5, 3), kTol));
     EXPECT_FALSE(r.Applied().isApprox(r.DensePInverse(10, 6), 1e-3));
 
-    // The next change refactorizes in full at the current penalties.
+    // The next change takes the ratio to 8 and refactorizes in full at the current penalties.
     r.Step({true, true, true}, {true, false}, 20, 6);
     EXPECT_EQ(r.prec.fact_count(), 2);
     EXPECT_FALSE(r.prec.used_smw());
@@ -3235,7 +3262,7 @@ TEST(KeptFactorization, SmwOnAKeptFactorizationStaysPositiveDefinite) {
   for (const bool ldlt : {false, true}) {
     SCOPED_TRACE(ldlt ? "ldlt" : "chol");
     Prec prec;
-    prec.set_refactor_after(2);
+    prec.set_refactor_ratio(4.0);  // the change below has ratio 2 * 2
     prec.arm(G1, G1_tr, H1, active_K, active_W1, B_rm, 10.0, 1.0, true, true, ldlt);
     prec.compute(0);
     prec.arm(G2, G2_tr, H2, active_K, active_W2, B_rm, 20.0, 2.0, true, true, ldlt);
@@ -3269,7 +3296,7 @@ TEST(KeptFactorization, KeptChangeWithARankExceedingDeltaRefactorizesWithoutCoun
   const SpMat G2 = DenseToSparse(G2_dense), G2_tr = DenseToSparse(G2_dense.transpose());
 
   Prec prec;
-  prec.set_refactor_after(3);
+  prec.set_refactor_ratio(4.0);
   prec.arm(G1, G1_tr, H_diag, active_K, active_W1, B_rm, 5.0, 3.0, true, true, false);
   prec.compute(0);
   prec.arm(G2, G2_tr, H_diag, active_K, active_W2, B_rm, 10.0, 3.0, true, true, false);
@@ -3279,13 +3306,13 @@ TEST(KeptFactorization, KeptChangeWithARankExceedingDeltaRefactorizesWithoutCoun
   EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankExceedsThreshold);
   EXPECT_EQ(prec.last_build().action, Prec::BuildAction::Factorized);
   EXPECT_FALSE(prec.last_build().kept_stale);
-  EXPECT_EQ(prec.last_build().stale, 0);
-  EXPECT_EQ(prec.stale_count(), 0);
+  EXPECT_EQ(prec.last_build().stale_ratio, 1.0);
+  EXPECT_EQ(prec.stale_ratio(), 1.0);
   EXPECT_FALSE(prec.is_stale());
 }
 
 TEST(KeptFactorization, PcgFailureThroughAKeptFactorizationIsRetriedFresh) {
-  KeepRig r(/*refactor_after=*/2);
+  KeepRig r(/*refactor_ratio=*/2.0);
   const std::vector<bool> k = {true, true, false}, w = {true, false};
   r.Step(k, w, 5, 3);
   r.Step(k, w, 10, 3);
@@ -3304,27 +3331,27 @@ TEST(KeptFactorization, PcgFailureThroughAKeptFactorizationIsRetriedFresh) {
   EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(10, 3), kTol));
 }
 
-TEST(KeptFactorization, ReturningToTheFactorizationsPenaltiesResetsTheCount) {
-  // x2 then x0.5: back at the factorization's own (mu, rho), it is exact again, so the count restarts.
-  KeepRig r(/*refactor_after=*/2);
+TEST(KeptFactorization, ReturningToTheFactorizationsPenaltiesMakesItCurrentAgain) {
+  // x2 then x0.5: back at the factorization's own (mu, rho), its ratio is 1 again.
+  KeepRig r(/*refactor_ratio=*/2.0);
   const std::vector<bool> k = {true, true, false}, w = {true, false};
   r.Step(k, w, 5, 3);
   r.Step(k, w, 10, 3);
-  EXPECT_EQ(r.prec.stale_count(), 1);
+  EXPECT_EQ(r.prec.stale_ratio(), 2.0);
   r.Step(k, w, 5, 3);
-  EXPECT_EQ(r.prec.stale_count(), 0);
+  EXPECT_EQ(r.prec.stale_ratio(), 1.0);
   EXPECT_FALSE(r.prec.is_stale());
   EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::KeptStale);
   EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(5, 3), kTol));
   r.Step(k, w, 10, 3);
-  EXPECT_EQ(r.prec.stale_count(), 1);
+  EXPECT_EQ(r.prec.stale_ratio(), 2.0);
   EXPECT_EQ(r.prec.fact_count(), 1);
 }
 
 TEST(KeptFactorization, MethodSwitchIsNeverKept) {
   // A switch to LDLT with no active-set change: keeping the Cholesky factorization would leave
   // solve() without an LDLT solver, so the change is refactorized with the new method.
-  KeepRig r(/*refactor_after=*/3);
+  KeepRig r(/*refactor_ratio=*/4.0);
   const std::vector<bool> k = {true, true, false}, w = {true, false};
   r.Step(k, w, 5, 3);
   r.use_ldlt = true;

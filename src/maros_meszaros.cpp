@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -28,7 +29,7 @@ using Triplet = Eigen::Triplet<T>;
 int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
-            "Usage: ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--refactor-after K] [--out FILE] [--trace PREFIX] [--cooldown S]\n"
+            "Usage: ksp_qp_maros_meszaros [--root DIR] [--in DIR] [--name PROBLEM|all] [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--refactor-ratio R] [--out FILE] [--trace PREFIX] [--cooldown S]\n"
             "  Solves one Maros-Meszaros QP from ROOT/IN/PROBLEM.SIF, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in and --out are resolved relative to this (default: ./)\n"
             "  --in DIR         directory containing the .SIF files, relative to --root (default: data/maros_meszaros/)\n"
@@ -41,12 +42,13 @@ int main(int argc, char** argv) {
             "                   complement (Cholesky) exactly, reusing the last factorization through SMW\n"
             "                   low-rank updates while the active sets change little\n"
             "  --no-direct-smw  with --direct: refactorize on every active-set change instead\n"
-            "  --refactor-after K\n"
+            "  --refactor-ratio R\n"
             "                   experimental, PCG: keep the preconditioner's factorization across mu/rho\n"
-            "                   changes and refactorize at the K-th since the last (default 1: every change)\n"
+            "                   changes until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R\n"
+            "                   (default 1: refactorize at every change)\n"
             "  --out FILE       (--name all only) output CSV path, relative to --root\n"
-            "                   (default: results/pcg_mm.csv, or results/pcg_ra<K>_mm.csv with\n"
-            "                   --refactor-after K > 1, results/direct_mm.csv with --direct,\n"
+            "                   (default: results/pcg_mm.csv, or results/pcg_rr<R>_mm.csv with\n"
+            "                   --refactor-ratio R > 1, results/direct_mm.csv with --direct,\n"
             "                   results/direct_nosmw_mm.csv with --direct --no-direct-smw)\n"
             "  --trace PREFIX   also write PREFIX_events.csv (every factorization, SMW update and PCG\n"
             "                   failure, with its reason), PREFIX_ssn.csv and PREFIX_pmm.csv (one row per\n"
@@ -69,13 +71,13 @@ int main(int argc, char** argv) {
     bool direct_smw = !cli::has_flag(argc, argv, "--no-direct-smw");
     if (!direct_smw && !direct)
         std::cerr << "WARNING: --no-direct-smw has no effect without --direct\n";
-    const int refactor_after = cli::get_int(argc, argv, "--refactor-after", 1);
-    if (refactor_after < 1) {
-        std::cerr << "ERROR: --refactor-after must be at least 1\n";
+    const double refactor_ratio = cli::get_double(argc, argv, "--refactor-ratio", 1.0);
+    if (!(refactor_ratio >= 1.0)) {
+        std::cerr << "ERROR: --refactor-ratio must be at least 1\n";
         return 1;
     }
-    if (refactor_after > 1 && direct)
-        std::cerr << "WARNING: --refactor-after has no effect with --direct\n";
+    if (refactor_ratio > 1.0 && direct)
+        std::cerr << "WARNING: --refactor-ratio has no effect with --direct\n";
     const std::string trace_arg = cli::get_str(argc, argv, "--trace", "");
     const std::string trace_prefix = trace_arg.empty() ? "" : root + trace_arg;
 
@@ -226,8 +228,10 @@ int main(int argc, char** argv) {
         PrintWhat what = PrintWhat::TUNING;
         int cooldown_sec = cli::get_int(argc, argv, "--cooldown", 3);
 
-        std::string pcg_out = refactor_after > 1 ? "results/pcg_ra" + std::to_string(refactor_after) + "_mm.csv"
-                                                 : "results/pcg_mm.csv";
+        std::ostringstream ratio_tag;
+        ratio_tag << refactor_ratio; // 2 -> "2", 1.5 -> "1.5"
+        std::string pcg_out = refactor_ratio > 1.0 ? "results/pcg_rr" + ratio_tag.str() + "_mm.csv"
+                                                   : "results/pcg_mm.csv";
         std::string default_out = !direct    ? pcg_out
                                 : direct_smw ? "results/direct_mm.csv"
                                              : "results/direct_nosmw_mm.csv";
@@ -259,7 +263,7 @@ int main(int argc, char** argv) {
                 KSP_QP<T> solver(prob);
                 solver.direct_solve = direct;
                 solver.direct_smw = direct_smw;
-                solver.refactor_after = refactor_after;
+                solver.refactor_ratio = refactor_ratio;
                 solver.trace.enabled = !trace_prefix.empty();
 
                 // Solve the QP
@@ -327,7 +331,7 @@ int main(int argc, char** argv) {
     KSP_QP<T> solver(prob);
     solver.direct_solve = direct;
     solver.direct_smw = direct_smw;
-    solver.refactor_after = refactor_after;
+    solver.refactor_ratio = refactor_ratio;
     solver.trace.enabled = !trace_prefix.empty();
 
     // Solve:

@@ -30,7 +30,7 @@ struct ScopedTimer {
 // capacitance matrix); the event's mu/rho/k/w change flags keep the others.
 enum class FactReason : int {
     Initial,             // first factorization of the run (direct mode: of the direct solver)
-    MuRho,               // mu and/or rho changed since the last factorization (prec: the refactor_after-th change)
+    MuRho,               // mu and/or rho changed since the last factorization (prec: by more than refactor_ratio)
     RankExceeded,        // the active sets moved too far from the last factorization's for an SMW update (rank > 50)
     SingularCapacitance, // the SMW capacitance matrix was (near-)singular or non-finite
     PcgFailure,          // PCG failed through an SMW-updated or stale preconditioner: rebuilt in full and retried
@@ -70,7 +70,7 @@ enum class LinAction : int {
     SmwUpdate, // low-rank update of the last factorization
     SmwReuse,  // the last factorization reused as is (active sets back to its own)
     PcgFail,   // a PCG solve failed (see PcgFailKind)
-    MuRhoKeep, // mu/rho changed; the preconditioner's factorization was kept (KSP_QP::refactor_after)
+    MuRhoKeep, // mu/rho changed; the preconditioner's factorization was kept (KSP_QP::refactor_ratio)
 };
 enum class PcgFailKind : int { None, PrecFailed, NoConvergence, BadAlloc };
 
@@ -206,7 +206,7 @@ struct LinEvent {
     bool ldlt = false;                     // LDLT (on P_hat or K) rather than Cholesky (on P or S)
     bool analyzed = false;                 // Factorize: included a symbolic analysis
     int rank = -1, h = -1, p = -1, q = -1; // SMW delta against the last factorization (-1: not classified)
-    int stale = 0;                         // prec: mu/rho changes its factorization lags behind, after the event
+    T stale_ratio = T(1);                  // prec: its factorization's mu/rho ratio to the current, after the event
     T mu = T(0), rho = T(0);
     bool mu_changed = false, rho_changed = false; // since the last factorization or update (prec), or SSN iteration
     bool k_changed = false, w_changed = false;    // active sets changed since the previous SSN iteration
@@ -229,7 +229,7 @@ struct LinEvent {
         f("h", h);
         f("p", p);
         f("q", q);
-        f("stale", stale);
+        f("stale_ratio", double(stale_ratio));
         f("mu", double(mu));
         f("rho", double(rho));
         f("mu_changed", int(mu_changed));

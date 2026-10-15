@@ -1221,7 +1221,7 @@ void SSN<T>::record_prec_build(int new_facts) {
     e.h = b.h;
     e.p = b.p;
     e.q = b.q;
-    e.stale = b.stale;
+    e.stale_ratio = b.stale_ratio;
     e.mu_changed = b.mu_changed;   // since the preconditioner's last factorization or update
     e.rho_changed = b.rho_changed;
     e.t_assembly = b.t_assembly;
@@ -1235,7 +1235,7 @@ template <typename T>
 void SSN<T>::record_pcg_fail(PcgFailKind kind, int iters, double err) {
     LinEvent<T> e = make_event(LinTarget::Prec, LinAction::PcgFail);
     e.ldlt = schur_use_ldlt;
-    e.stale = cg.preconditioner().stale_count();
+    e.stale_ratio = cg.preconditioner().stale_ratio();
     e.pcg_fail = kind;
     e.pcg_iters = iters;
     e.pcg_err = err;

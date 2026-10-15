@@ -176,7 +176,7 @@ py::dict solve_from_sif(const std::string& filename,
                         bool direct        = false,
                         bool direct_smw    = true,
                         bool trace         = false,
-                        int refactor_after = 1) {
+                        double refactor_ratio = 1.0) {
     int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
     int direct_smw_count, direct_smw_reject, linesearch_fail, krylov_fail;
     double obj_val, setup_time, solve_time, run_time, pmm_tol_achieved, ssn_tol_achieved;
@@ -195,7 +195,7 @@ py::dict solve_from_sif(const std::string& filename,
         KSP_QP<T>  solver(prob);
         solver.direct_solve = direct;
         solver.direct_smw   = direct_smw;
-        solver.refactor_after = refactor_after;
+        solver.refactor_ratio = (T)refactor_ratio;
         solver.trace.enabled = trace;
         Solution<T> sol = solver.solve();
         profile          = solver.profile;
@@ -320,7 +320,7 @@ py::dict solve_from_data(const py::dict& pd_dict,
                          bool direct = false,
                          bool direct_smw = true,
                          bool trace = false,
-                         int refactor_after = 1) {
+                         double refactor_ratio = 1.0) {
     KSPQPdata<T> pd = dict_to_kspqp(pd_dict); // reads Python objects
 
     int opt, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, kkt_ldlt_fact, schur_chol_fact;
@@ -345,7 +345,7 @@ py::dict solve_from_data(const py::dict& pd_dict,
         if (rho_init > 0.0) solver.rho = (T)rho_init;
         solver.direct_solve = direct;
         solver.direct_smw   = direct_smw;
-        solver.refactor_after = refactor_after;
+        solver.refactor_ratio = (T)refactor_ratio;
         solver.trace.enabled = trace;
         std::ofstream trace_file;
         if (write_trace_path) {
@@ -437,7 +437,7 @@ The sparse matrices are in CSC format (data / indices / indptr / shape).)");
           py::arg("direct")     = false,
           py::arg("direct_smw") = true,
           py::arg("trace")      = false,
-          py::arg("refactor_after") = 1,
+          py::arg("refactor_ratio") = 1.0,
           R"(Parse a SIF/MPS file and solve it with the KSP-QP solver.
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
@@ -460,9 +460,9 @@ update of that factorization instead of refactorizing; direct_smw_count counts t
 direct_smw_reject the ones whose residual check failed and were refactorized. When False, every
 change is refactorized.
 
-refactor_after: experimental, default 1; PCG only. The preconditioner keeps its factorization across
-mu/rho changes, with SMW updates on top of it, and refactorizes at the refactor_after-th change since
-its last factorization (1: at every change).
+refactor_ratio: experimental, default 1; PCG only. The preconditioner keeps its factorization across
+mu/rho changes, with SMW updates on top of it, until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho)
+against its factorization's mu_f, rho_f exceeds refactor_ratio, then refactorizes (1: at every change).
 
 Profile (experimental; see include/solve_profile.hpp): fact_<reason> counts the factorizations by
 why they were done (they add up to fact), smw_update/smw_reuse/mu_rho_keep/pcg_fail the SMW updates,
@@ -483,7 +483,7 @@ update / kept factorization / PCG failure, per SSN iteration and per PMM iterati
           py::arg("direct") = false,
           py::arg("direct_smw") = true,
           py::arg("trace") = false,
-          py::arg("refactor_after") = 1,
+          py::arg("refactor_ratio") = 1.0,
           R"(Solve with KSP-QP using already-parsed problem data (dict from parse_sif).
 
 Returns a dict with keys: status, obj_val, setup_time, solve_time, run_time, pmm_iter, ssn_iter,
@@ -492,7 +492,7 @@ direct_smw_count, direct_smw_reject, ssn_tol_achieved, linesearch_fail, krylov_f
 columns (profile_columns()), x, y1, y2, z (x and the multipliers y1/y2/z are returned in the
 original, unscaled units, so they can be checked against the problem data as given).
 
-direct, direct_smw, trace, refactor_after: experimental; same meaning as in solve_from_sif.
+direct, direct_smw, trace, refactor_ratio: experimental; same meaning as in solve_from_sif.
 
 trace_path: diagnostic-only, default "" (no tracing, matches prior behavior exactly). When
 set, writes a per-PMM-iteration and per-SSN-inner-iteration CSV trace to that path with columns

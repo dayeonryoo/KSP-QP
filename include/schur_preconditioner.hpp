@@ -46,13 +46,13 @@
 //                     as pattern_dirty_, not set on a mu/rho-only change.
 //   mu_/rho_ vs mu_at_last_fact_/rho_at_last_fact_ : on active_K entries H_diag(i) = Q_diag(i) +
 //                     1/rho, so mu and rho touch disjoint parts of P/P_hat. compute() calls build()
-//                     on either change unless it keeps the factorization (refactor_after_), and
+//                     on either change unless it keeps the factorization (refactor_ratio_), and
 //                     build() patches from the stored mu_fact_/rho_fact_ without the dirty flags:
 //                       mu-only  : both variants overwrite the (1/mu)I block in place, O(s).
 //                       rho-only : chol must rebuild G E G^T (E = 1/H_diag is inside the product);
 //                                  ldlt patches -H_act on P_hat's diagonal in place, O(n_act).
-//   refactor_after_ / stale_count_ : the factorization is kept across mu/rho changes and redone at
-//                     the refactor_after_-th change since it (1: at every change).
+//   refactor_ratio_ : the factorization is kept across mu/rho changes while stale_ratio(), the
+//                     ratio of its mu/rho to the current ones, stays <= refactor_ratio_ (1: never kept).
 //   use_ldlt_ / use_ldlt_at_last_fact_ : Cholesky vs LDLT, from SSN::schur_use_ldlt via arm(); a
 //                     switch forces prec_pattern_changed.
 //   skip_smw_ / use_smw_ / has_snapshot_ / smw_fail_streak_ : SMW control (see try_build_smw()).
@@ -84,9 +84,10 @@ public:
     // Sets the number of equality-constraint (A) rows once from data. 
     void set_num_equality_rows(int M) { M_rows_ = M; }
 
-    // Refactorize at the k-th mu/rho change since the last factorization (1: at every change).
-    void set_refactor_after(int k) { refactor_after_ = std::max(1, k); }
-    int stale_count() const { return stale_count_; } // mu/rho changes kept since the last factorization
+    // Refactorize once stale_ratio() exceeds r (1: at every mu/rho change).
+    void set_refactor_ratio(T r) { refactor_ratio_ = std::max(T(1), r); }
+    // max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) for the factorization's mu_f, rho_f (1: current).
+    T stale_ratio() const { return initialized_ ? ratio(mu_, mu_fact_) * ratio(rho_, rho_fact_) : T(1); }
     bool is_stale() const { return initialized_ && (mu_ != mu_fact_ || rho_ != rho_fact_); }
 
     void set_data(const SpMat& G, const SpMat& G_tr, const Vec& H_diag,
@@ -159,15 +160,12 @@ public:
         const bool rho_changed = initialized_ && (rho_ != rho_at_last_fact_);
         const bool changed = mu_changed || rho_changed;
 
-        // Keep the factorization across a mu/rho change unless it is the refactor_after_-th since it;
-        // back at the factorization's own mu/rho, it is exact again.
-        const bool exact_again = changed && mu_ == mu_fact_ && rho_ == rho_fact_;
-        const bool keep = changed && (exact_again || stale_count_ + 1 < refactor_after_)
+        // Keep the factorization across a mu/rho change while its ratio to the new mu/rho is <= refactor_ratio_.
+        const bool keep = changed && refactor_ratio_ > T(1) && stale_ratio() <= refactor_ratio_
                           && info_ == Eigen::Success && !skip_smw_ && !smw_suppressed()
                           && use_ldlt_ == use_ldlt_at_last_fact_;
         stale_ok_ = !changed || keep;
         if (keep) {
-            stale_count_ = exact_again ? 0 : stale_count_ + 1;
             mu_at_last_fact_  = mu_;
             rho_at_last_fact_ = rho_;
         }
@@ -183,7 +181,7 @@ public:
             last_build_.ldlt = use_ldlt_;
         }
         last_build_.kept_stale = keep && last_build_.action != BuildAction::Factorized;
-        last_build_.stale = stale_count_;
+        last_build_.stale_ratio = stale_ratio();
         return *this;
     }
 
@@ -240,7 +238,7 @@ public:
         bool ldlt = false;                   // LDLT on P_hat rather than Cholesky on P
         bool analyzed = false;               // Factorized with a symbolic analysis
         bool kept_stale = false;             // a mu/rho change was absorbed without refactorizing
-        int stale = 0;                       // mu/rho changes the factorization lags behind, after this setup
+        T stale_ratio = T(1);                // stale_ratio() after this setup (1: factorization current)
         double t_assembly = 0.0, t_analyze = 0.0, t_factorize = 0.0, t_smw_setup = 0.0; // seconds
     };
     const BuildInfo& last_build() const { return last_build_; }
@@ -327,7 +325,6 @@ public:
         numeric_dirty_       = true;
         use_smw_          = false;
         skip_smw_         = false;
-        stale_count_      = 0;
         stale_ok_         = false;
         smw_last_reject_reason_ = SmwRejectReason::None;
         smw_last_rank_          = 0;
@@ -492,7 +489,6 @@ private:
         rho_at_last_fact_      = rho_;
         mu_fact_               = mu_;
         rho_fact_              = rho_;
-        stale_count_           = 0;
         use_ldlt_at_last_fact_ = is_ldlt;
         if (n_act >= 0) n_act_ = n_act;
         s_current_ = static_cast<int>(s);
@@ -1035,9 +1031,9 @@ private:
     int             smw_last_rank_          = 0;
 
     // Kept (stale) factorization across mu/rho changes
-    int  refactor_after_ = 1;     // refactorize at this mu/rho change since the last factorization
-    int  stale_count_    = 0;     // mu/rho changes kept since the last factorization
+    T    refactor_ratio_ = T(1);  // refactorize once stale_ratio() exceeds this
     bool stale_ok_       = false; // set by compute(): the stored factorization may serve the current mu/rho
+    static T ratio(T a, T b) { return a > b ? a / b : b / a; }
 
     // Snapshots from last full rebuild (input to try_build_smw)
     bool    has_snapshot_ = false; // true once snapshot_state() has run at least once

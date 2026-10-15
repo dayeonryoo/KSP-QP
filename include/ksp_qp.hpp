@@ -129,7 +129,7 @@ public:
     double time_limit = 600.0; // in seconds,  on setup_time + solve time
     bool direct_solve = false; // experimental: skip PCG and solve by LDLT on K or Cholesky on its Schur complement
     bool direct_smw = true;    // with direct_solve: reuse the last factorization through SMW low-rank updates when the active sets change little
-    int refactor_after = 1;    // experimental, PCG: refactorize the preconditioner at this mu/rho change since its last factorization (1: every change)
+    T refactor_ratio = 1;      // experimental, PCG: refactorize the preconditioner once max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) since its factorization exceeds this (1: every change)
     int linesearch_fail = 0;
 
     // Primal/dual infeasibility certificate tolerances.

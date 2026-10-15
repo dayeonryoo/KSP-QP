@@ -2029,13 +2029,13 @@ TEST(KspQpSolveProfile, TraceRowsMatchTheCountersAndLeaveTheResultsUnchanged) {
   }
 }
 
-// ===================== kept preconditioner factorization (refactor_after) =====================
+// ===================== kept preconditioner factorization (refactor_ratio) =====================
 
-TEST(KspQpRefactorAfter, OneIsTheDefaultAndNeverKeeps) {
+TEST(KspQpRefactorRatio, OneIsTheDefaultAndNeverKeeps) {
   const auto problem = RandomFeasibleQp();
   KSP_QP<double> plain(problem), one(problem);
-  EXPECT_EQ(plain.refactor_after, 1);
-  one.refactor_after = 1;
+  EXPECT_EQ(plain.refactor_ratio, 1.0);
+  one.refactor_ratio = 1.0;
   const auto sol = plain.solve();
   const auto sol_one = one.solve();
 
@@ -2047,10 +2047,10 @@ TEST(KspQpRefactorAfter, OneIsTheDefaultAndNeverKeeps) {
   EXPECT_EQ(plain.profile.mu_rho_keep, 0);
 }
 
-TEST(KspQpRefactorAfter, KeepingEveryChangeReachesTheSameOptimumWithoutMuRhoRefactorizations) {
+TEST(KspQpRefactorRatio, KeepingEveryChangeReachesTheSameOptimumWithoutMuRhoRefactorizations) {
   const auto problem = RandomFeasibleQp();
   KSP_QP<double> base(problem), kept(problem);
-  kept.refactor_after = 1000;
+  kept.refactor_ratio = 1e30;
   const auto sol = base.solve();
   const auto sol_kept = kept.solve();
 

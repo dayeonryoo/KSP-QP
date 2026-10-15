@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     if (cli::has_flag(argc, argv, "--help") || cli::has_flag(argc, argv, "-h")) {
         std::cout <<
             "Usage: ksp_qp_netlib [--root DIR] [--set feasible|infeasible] [--in DIR] [--name PROBLEM|all]\n"
-            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--refactor-after K] [--out FILE] [--trace PREFIX] [--cooldown S] [--ref FILE]\n"
+            "                     [--tol T] [--max-iter N] [--time-limit S] [--direct [--no-direct-smw]] [--refactor-ratio R] [--out FILE] [--trace PREFIX] [--cooldown S] [--ref FILE]\n"
             "  Solves one Netlib LP from ROOT/IN/PROBLEM.mps, or sweeps the whole set with --name all.\n"
             "  --root DIR       working directory; --in, --ref and --out are resolved relative to this (default: ./)\n"
             "  --set SET        which problem set to use: feasible or infeasible (default: feasible)\n"
@@ -115,12 +115,13 @@ int main(int argc, char** argv) {
             "                   complement (Cholesky) exactly, reusing the last factorization through SMW\n"
             "                   low-rank updates while the active sets change little\n"
             "  --no-direct-smw  with --direct: refactorize on every active-set change instead\n"
-            "  --refactor-after K\n"
+            "  --refactor-ratio R\n"
             "                   experimental, PCG: keep the preconditioner's factorization across mu/rho\n"
-            "                   changes and refactorize at the K-th since the last (default 1: every change)\n"
+            "                   changes until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R\n"
+            "                   (default 1: refactorize at every change)\n"
             "  --out FILE       (--name all only) output CSV path, relative to --root\n"
             "                   (default: results/pcg_netlib.csv or results/pcg_infeas.csv, per --set;\n"
-            "                   pcg_ra<K>_ with --refactor-after K > 1, direct_ instead of pcg_ with\n"
+            "                   pcg_rr<R>_ with --refactor-ratio R > 1, direct_ instead of pcg_ with\n"
             "                   --direct, direct_nosmw_ with --no-direct-smw)\n"
             "  --trace PREFIX   also write PREFIX_events.csv (every factorization, SMW update and PCG\n"
             "                   failure, with its reason), PREFIX_ssn.csv and PREFIX_pmm.csv (one row per\n"
@@ -157,13 +158,13 @@ int main(int argc, char** argv) {
     bool direct_smw = !cli::has_flag(argc, argv, "--no-direct-smw");
     if (!direct_smw && !direct)
         std::cerr << "WARNING: --no-direct-smw has no effect without --direct\n";
-    const int refactor_after = cli::get_int(argc, argv, "--refactor-after", 1);
-    if (refactor_after < 1) {
-        std::cerr << "ERROR: --refactor-after must be at least 1\n";
+    const double refactor_ratio = cli::get_double(argc, argv, "--refactor-ratio", 1.0);
+    if (!(refactor_ratio >= 1.0)) {
+        std::cerr << "ERROR: --refactor-ratio must be at least 1\n";
         return 1;
     }
-    if (refactor_after > 1 && direct)
-        std::cerr << "WARNING: --refactor-after has no effect with --direct\n";
+    if (refactor_ratio > 1.0 && direct)
+        std::cerr << "WARNING: --refactor-ratio has no effect with --direct\n";
     const std::string trace_arg = cli::get_str(argc, argv, "--trace", "");
     const std::string trace_prefix = trace_arg.empty() ? "" : root + trace_arg;
 
@@ -186,7 +187,9 @@ int main(int argc, char** argv) {
         PrintWhat what = PrintWhat::TUNING;
         int cooldown_sec = cli::get_int(argc, argv, "--cooldown", 0);
 
-        std::string pcg_tag = refactor_after > 1 ? "pcg_ra" + std::to_string(refactor_after) : "pcg";
+        std::ostringstream ratio_tag;
+        ratio_tag << refactor_ratio; // 2 -> "2", 1.5 -> "1.5"
+        std::string pcg_tag = refactor_ratio > 1.0 ? "pcg_rr" + ratio_tag.str() : "pcg";
         std::string default_out = "results/" + (!direct ? pcg_tag : direct_smw ? "direct" : "direct_nosmw")
                                 + (infeasible_set ? "_infeas.csv" : "_netlib.csv");
         std::string csv_path = root + cli::get_str(argc, argv, "--out", default_out);
@@ -213,7 +216,7 @@ int main(int argc, char** argv) {
                 KSP_QP<T> solver(prob);
                 solver.direct_solve = direct;
                 solver.direct_smw = direct_smw;
-                solver.refactor_after = refactor_after;
+                solver.refactor_ratio = refactor_ratio;
                 solver.trace.enabled = !trace_prefix.empty();
 
                 // Solve the LP
@@ -296,7 +299,7 @@ int main(int argc, char** argv) {
     KSP_QP<T> solver(prob);
     solver.direct_solve = direct;
     solver.direct_smw = direct_smw;
-    solver.refactor_after = refactor_after;
+    solver.refactor_ratio = refactor_ratio;
     solver.trace.enabled = !trace_prefix.empty();
 
     // Solve:
