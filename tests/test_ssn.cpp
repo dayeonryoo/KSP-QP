@@ -1658,6 +1658,97 @@ TEST(SolveNewtonDirection, IterativeRefinementCorrectsArtificiallyInjectedError)
   EXPECT_TRUE(ns.prev_dy_.isApprox(ns.dxdy_.tail(s)));
 }
 
+// ===================== newton_residual_norm =====================
+
+// For any dxdy_, the norm equals ||J du + grad M|| built densely from M's gradient and generalized Jacobian,
+// with du = (dx, dy2), dy2 = dy on active W and -y2 elsewhere, in tol_achieved's unscaled norm.
+TEST(NewtonResidualNorm, MatchesTheDenseNewtonResidual) {
+  const int N = 6, M = 2, l = 4;
+  Eigen::MatrixXd A(M, N), B(l, N);
+  for (int j = 0; j < N; ++j) {
+    for (int i = 0; i < M; ++i) A(i, j) = std::sin(1.0 + 2.0 * i + 3.0 * j);
+    for (int i = 0; i < l; ++i) B(i, j) = std::cos(0.5 + i + 2.0 * j);
+  }
+  SsnFixture f(DenseToSparse(A), DenseToSparse(B));
+  f.Q_info = 1;
+  f.Q_diag = Vec(N);
+  for (int j = 0; j < N; ++j) {
+    f.Q_diag(j) = 0.5 + 0.25 * j;
+    f.c(j) = 0.3 * std::sin(j + 1.0);
+    f.D2_ext_inv(j) = 0.5 + 0.3 * j;
+  }
+  for (int i = 0; i < M; ++i) f.b(i) = std::cos(1.0 * i);
+  for (int i = 0; i < l; ++i) f.D1B_diag_inv(i) = 2.0 - 0.4 * i;
+  f.lx.setConstant(-0.5);
+  f.ux.setConstant(0.5);
+  f.lw.setConstant(-0.3);
+  f.uw.setConstant(0.3);
+  SSN<double> ns = f.Make();
+
+  const double mu = 5.0, rho = 50.0, alpha = 0.9;
+  Vec x(N), z(N), x_cur(N), y1(M), y2(l), y2_cur(l);
+  for (int j = 0; j < N; ++j) {
+    x(j) = 0.2 * std::sin(2.0 * j + 1.0);
+    z(j) = 1.5 * std::sin(3.0 * j + 0.2);
+    x_cur(j) = x(j) + 0.6 * std::cos(j + 0.4);
+  }
+  for (int i = 0; i < M; ++i) y1(i) = 0.7 + 0.1 * i;
+  for (int i = 0; i < l; ++i) {
+    y2(i) = 0.4 * std::cos(i + 0.5);
+    y2_cur(i) = y2(i) + 0.3 * std::sin(1.0 * i);
+  }
+  ns.update_ssn_system(x, y1, y2, z, Vec::Zero(M), Vec::Zero(N), mu, rho, alpha, 0);
+  ns.x_cur_ = x_cur;
+  ns.y2_cur_ = y2_cur;
+  ns.Ax_ssn_ = A * x_cur;
+  ns.Bx_ssn_ = B * x_cur;
+  ns.prepare_newton_system();
+  const int s = static_cast<int>(ns.G.rows());
+  ns.dxdy_.resize(N + s);
+  for (int k = 0; k < N + s; ++k) ns.dxdy_(k) = std::sin(0.9 * k + 0.1);
+
+  // Active sets of the generalized Jacobian: K inside its open box, W outside its closed box.
+  const Vec u = z / mu + x_cur, v = B * x_cur + ((1 - alpha) * y2_cur - y2) / mu;
+  const Vec dist_K = u - u.cwiseMax(f.lx).cwiseMin(f.ux), dist_W = v - v.cwiseMax(f.lw).cwiseMin(f.uw);
+  Vec P_K(N), D_W(l);
+  for (int j = 0; j < N; ++j) P_K(j) = (u(j) > f.lx(j) && u(j) < f.ux(j)) ? 1.0 : 0.0;
+  for (int i = 0; i < l; ++i) D_W(i) = (v(i) < f.lw(i) || v(i) > f.uw(i)) ? 1.0 : 0.0;
+  ASSERT_GT(P_K.sum(), 0.0);
+  ASSERT_LT(P_K.sum(), N);
+  ASSERT_GT(D_W.sum(), 0.0);
+  ASSERT_LT(D_W.sum(), l);
+  for (int j = 0; j < N; ++j) ASSERT_EQ(ns.active_K(j), P_K(j) == 1.0);
+  for (int i = 0; i < l; ++i) ASSERT_EQ(ns.active_W(i), D_W(i) == 1.0);
+
+  const Vec g_x = f.c + f.Q_diag.cwiseProduct(x_cur) + mu * A.transpose() * (A * x_cur - f.b)
+                + (mu / alpha) * B.transpose() * dist_W + mu * dist_K - A.transpose() * y1 + (x_cur - x) / rho;
+  const Vec g_y = (1 - alpha) / alpha * dist_W + (1 - alpha) / mu * y2_cur;
+  const Eigen::MatrixXd J_xx = Eigen::MatrixXd(f.Q_diag.asDiagonal()) + mu * A.transpose() * A
+                             + (mu / alpha) * B.transpose() * D_W.asDiagonal() * B
+                             + mu * Eigen::MatrixXd((Vec::Ones(N) - P_K).asDiagonal())
+                             + Eigen::MatrixXd::Identity(N, N) / rho;
+  const Eigen::MatrixXd J_xy = (1 - alpha) / alpha * B.transpose() * D_W.asDiagonal();
+  const Eigen::MatrixXd J_yy = Eigen::MatrixXd(((1 - alpha) / alpha * (1 - alpha) / mu * D_W).asDiagonal())
+                             + (1 - alpha) / mu * Eigen::MatrixXd::Identity(l, l);
+
+  const Vec dx = ns.dxdy_.head(N);
+  Vec dy2(l);
+  for (int i = 0, k = N + M; i < l; ++i) dy2(i) = D_W(i) == 1.0 ? ns.dxdy_(k++) : -y2_cur(i);
+  const Vec e_x = J_xx * dx + J_xy * dy2 + g_x;
+  const Vec e_y = J_xy.transpose() * dx + J_yy * dy2 + g_y;
+  const double expected = std::max(e_x.cwiseProduct(f.D2_ext_inv).cwiseAbs().maxCoeff(),
+                                   e_y.cwiseProduct(f.D1B_diag_inv).cwiseAbs().maxCoeff());
+
+  ASSERT_GT(expected, 1e-3);
+  EXPECT_NEAR(ns.newton_residual_norm(), expected, 1e-10 * expected);
+
+  // With the x block scaled away (ns reads f.D2_ext_inv by reference), the W block alone decides.
+  f.D2_ext_inv *= 1e-12;
+  const double expected_W = e_y.cwiseProduct(f.D1B_diag_inv).cwiseAbs().maxCoeff();
+  ASSERT_GT(expected_W, 100 * e_x.cwiseProduct(f.D2_ext_inv).cwiseAbs().maxCoeff());
+  EXPECT_NEAR(ns.newton_residual_norm(), expected_W, 1e-10 * expected_W);
+}
+
 // ===================== solve_using_ldlt =====================
 
 namespace {
@@ -1965,7 +2056,7 @@ TEST(SolveUsingCg, PcgFailureLatchPermanentlyRoutesToTheDirectSolver) {
   EXPECT_LT(res2_2.cwiseAbs().maxCoeff(), 1e-8);
 }
 
-// max_iter = 0 makes CG stop at its zero initial guess with relative error 1 > 1e-10: a genuine
+// max_iter = 0 makes CG stop at its zero initial guess with relative error 1: a genuine
 // non-convergence on a well-posed system, so the direct solver's choice (not a breakdown) decides
 // which system the fallback factorizes.
 TEST(SolveUsingCg, PcgFailureFallsBackToTheSchurComplementWhenTheThresholdPrefersIt) {
@@ -2027,7 +2118,7 @@ TEST(SolveUsingCg, PcgFailureFallsBackToTheKktSystemWhenTheThresholdPrefersIt) {
   ExpectKktResidualSmall(sol, A, H_diag, r1, r2, ns.mu);
 }
 
-// A NaN right-hand side makes CG's error NaN, which is not <= 1e-10: a failure like any other,
+// A NaN right-hand side makes CG's error NaN, so it never converges: a failure like any other,
 // counted and (with no SMW to retry) handed to the direct solver instead of returning a NaN dy.
 TEST(SolveUsingCg, NanErrorCountsAsAKrylovFailure) {
   SsnFixture f(DefaultA(), DefaultB());
@@ -2049,6 +2140,93 @@ TEST(SolveUsingCg, NanErrorCountsAsAKrylovFailure) {
                     ns.krylov_tol, ns.krylov_max_in_iter, /*update_prec=*/true,
                     /*prec_pattern_changed=*/true, /*schur_use_ldlt=*/false);
 
+  EXPECT_EQ(ns.krylov_fail, 1);
+  EXPECT_TRUE(ns.pcg_failed);
+}
+
+namespace {
+
+// s x n Newton system whose preconditioner drops every odd column, so PCG takes a few iterations.
+struct CgSystem {
+  SpMat G, G_tr;
+  Vec H_diag, r1, r2;
+  BoolArr active_K;
+  CgSystem(int s, int n) : H_diag(n), r1(n), r2(s), active_K(n) {
+    Eigen::MatrixXd Gd(s, n);
+    for (int i = 0; i < s; ++i)
+      for (int j = 0; j < n; ++j) Gd(i, j) = std::sin(1.0 + 3.0 * i + 7.0 * j);
+    G = DenseToSparse(Gd);
+    G_tr = SpMat(G.transpose());
+    for (int j = 0; j < n; ++j) {
+      H_diag(j) = 1.5 + std::cos(2.0 * j);
+      r1(j) = std::sin(5.0 * j + 0.3);
+      active_K(j) = j % 2 == 0;
+    }
+    for (int i = 0; i < s; ++i) r2(i) = std::cos(3.0 * i + 0.7);
+  }
+  // rhs_S - S dy, with S = G H^{-1} G^T + I/mu and rhs_S = G H^{-1} r1 + r2.
+  Vec SchurResidual(const Vec& dy, double mu) const {
+    const Vec H_inv = H_diag.cwiseInverse();
+    return G * H_inv.cwiseProduct(r1) + r2 - G * H_inv.cwiseProduct(G_tr * dy) - dy / mu;
+  }
+  Vec Solve(SSN<double>& ns, double tol, int max_iter) const {
+    return ns.solve_using_cg(G, G_tr, H_diag, H_diag.cwiseInverse(), active_K, r1, r2, ns.mu, tol, max_iter,
+                             /*update_prec=*/true, /*prec_pattern_changed=*/true, /*schur_use_ldlt=*/false);
+  }
+};
+
+void SetUpForCgSystem(SSN<double>& ns) {
+  ns.mu = 2.0;
+  ns.rho = 1.0;
+  ns.active_W = BoolArr(0);
+}
+
+}  // namespace
+
+// An armed absolute target a becomes Eigen's relative tolerance a / ||rhs_S||_2.
+TEST(SolveUsingCg, AbsoluteTargetBoundsTheSchurResidual) {
+  const CgSystem sys(10, 6);
+  SsnFixture f(sys.G, SpMat(0, 6));
+  SSN<double> ns = f.Make();
+  SetUpForCgSystem(ns);
+  const double rhs_norm = sys.SchurResidual(Vec::Zero(10), ns.mu).norm();
+  ns.krylov_abs_tol_ = 1e-6 * rhs_norm;
+
+  const Vec sol = sys.Solve(ns, ns.krylov_tol, ns.krylov_max_in_iter);
+
+  EXPECT_FALSE(ns.pcg_failed);
+  EXPECT_NEAR(ns.it_state_.krylov_rtol, 1e-6, 1e-15);
+  EXPECT_LT(sys.SchurResidual(sol.tail(10), ns.mu).norm(), ns.krylov_abs_tol_);
+}
+
+// The relative tolerance passed in is the floor of the target's, and the whole tolerance when unarmed.
+TEST(SolveUsingCg, AbsoluteTargetIsFlooredAtTheRelativeTolerance) {
+  const CgSystem sys(10, 6);
+  SsnFixture f(sys.G, SpMat(0, 6));
+  SSN<double> tiny = f.Make(), unarmed = f.Make();
+  SetUpForCgSystem(tiny);
+  SetUpForCgSystem(unarmed);
+  tiny.krylov_abs_tol_ = 1e-30;
+
+  sys.Solve(tiny, tiny.krylov_tol, tiny.krylov_max_in_iter);
+  sys.Solve(unarmed, 1e-8, unarmed.krylov_max_in_iter);
+
+  EXPECT_EQ(tiny.it_state_.krylov_rtol, tiny.krylov_tol);
+  EXPECT_EQ(unarmed.it_state_.krylov_rtol, 1e-8);
+  EXPECT_FALSE(tiny.pcg_failed);
+  EXPECT_FALSE(unarmed.pcg_failed);
+}
+
+// No acceptance band: missing the tolerance (0 here) fails however small the error is.
+TEST(SolveUsingCg, NonConvergenceFailsEvenWithATinyError) {
+  const CgSystem sys(10, 6);
+  SsnFixture f(sys.G, SpMat(0, 6));
+  SSN<double> ns = f.Make();
+  SetUpForCgSystem(ns);
+
+  sys.Solve(ns, /*tol=*/0.0, /*max_iter=*/3);
+
+  EXPECT_LE(ns.it_state_.pcg_err, 1e-10);  // the old band would have accepted this solve
   EXPECT_EQ(ns.krylov_fail, 1);
   EXPECT_TRUE(ns.pcg_failed);
 }
@@ -2892,6 +3070,21 @@ TEST(SolveSsn, DirectModeConvergesToStrictlyInteriorMinimizerWithNoEqualityOrIne
   EXPECT_EQ(ns.G.rows(), 0);
   EXPECT_EQ(ns.fact, 0);
   EXPECT_EQ(ns.krylov_iter, 0);
+}
+
+TEST(SolveSsn, ArmsThePcgAbsoluteTargetFromSsnTolAndMu) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  EXPECT_EQ(ns.krylov_abs_tol_, 0.0);  // unarmed until solve_ssn()
+  Vec x0(3);
+  x0 << 0.3, 0.3, 0.3;
+  ns.update_ssn_system(x0, Vec::Zero(1), Vec::Zero(2), Vec::Zero(3), Vec::Zero(1), Vec::Zero(3),
+                       /*mu=*/4.0, /*rho=*/1.0, /*alpha=*/0.95, 0);
+
+  ns.solve_ssn(/*ssn_tol=*/1e-5);
+
+  EXPECT_EQ(ns.opt, SSN<double>::TerminationStatus::Optimal);
+  EXPECT_DOUBLE_EQ(ns.krylov_abs_tol_, 0.1 * 1e-5 / 4.0);
 }
 
 // ===================== kept preconditioner factorization (refactor_ratio) =====================

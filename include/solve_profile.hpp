@@ -260,6 +260,8 @@ struct SsnRow {
     int facts = 0, smw = 0;         // factorizations and SMW updates in this iteration (retries included)
     int krylov = 0, krylov_refine = 0;
     double pcg_err = std::numeric_limits<double>::quiet_NaN(); // main PCG solve's relative error
+    double krylov_rtol = std::numeric_limits<double>::quiet_NaN(); // ... and the relative tolerance it was given
+    double newton_res = std::numeric_limits<double>::quiet_NaN();  // ||J du + grad M|| of the direction, unscaled inf-norm
     SsnLsOutcome ls_outcome = SsnLsOutcome::Step;
     bool ls_steepest = false;
     T tau = T(0), grad_norm = T(0);
@@ -289,6 +291,8 @@ struct SsnRow {
         f("krylov", krylov);
         f("krylov_refine", krylov_refine);
         f("pcg_err", pcg_err);
+        f("krylov_rtol", krylov_rtol);
+        f("newton_res", newton_res);
         f("ls_outcome", to_string(ls_outcome));
         f("ls_steepest", int(ls_steepest));
         f("tau", double(tau));

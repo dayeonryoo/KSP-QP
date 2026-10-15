@@ -158,6 +158,8 @@ public:
         int rank = -1;
         int facts = 0, smw = 0, krylov = 0, krylov_refine = 0;
         double pcg_err = std::numeric_limits<double>::quiet_NaN();
+        double krylov_rtol = std::numeric_limits<double>::quiet_NaN(); // main PCG solve's relative tolerance
+        double newton_res = std::numeric_limits<double>::quiet_NaN();  // ||J du + grad M|| of the direction (traced runs only)
         bool ls_steepest = false;
     };
     IterTimes it_;
@@ -166,7 +168,9 @@ public:
     FactReason direct_pending_reason_ = FactReason::Count;    // reason of the next direct factorization (Count: none)
 
     // Krylov (conjugate gradient) parameters
-    T krylov_tol = 1e-12; // Eigen's error convention: ||rhs - S*dy||_2 / ||rhs||_2.
+    T krylov_tol = 1e-12;      // Eigen's error convention: ||rhs - S*dy||_2 / ||rhs||_2; the floor once krylov_abs_tol_ is armed.
+    T krylov_tol_factor = 0.1; // solve_ssn() arms krylov_abs_tol_ = krylov_tol_factor * ssn_tol / mu.
+    T krylov_abs_tol_ = 0;     // PCG stops at ||rhs - S*dy||_2 < krylov_abs_tol_ (0: unarmed, relative tol only).
     int krylov_max_in_iter = 100;
 
     // Iterative refinement parameters
@@ -380,6 +384,7 @@ public:
     // max(||r1||_inf, ||r2||_inf).
     struct RefineResult { T res_norm; T ref_norm; };
     RefineResult iterative_refine_dxdy(bool need_final_residual = false);
+    T newton_residual_norm(); // ||J du + grad M|| of dxdy_, in tol_achieved's norm
     SsnLineSearchParams<T> make_line_search_params();
     void solve_ssn(const T ssn_tol);
 

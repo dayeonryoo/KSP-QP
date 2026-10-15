@@ -160,6 +160,12 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     cg_rhs_.noalias() = G * cg_Hinv_r1_ + r2;
     const Vec& rhs = cg_rhs_;
 
+    // The absolute target as Eigen's relative tolerance, floored at tol.
+    if (krylov_abs_tol_ > T(0)) {
+        const T rhs_norm = rhs.norm();
+        if (rhs_norm > T(0)) tol = std::max(krylov_abs_tol_ / rhs_norm, tol);
+    }
+    if (!in_refinement_) it_state_.krylov_rtol = static_cast<double>(tol);
     cg.setTolerance(tol);
     cg.setMaxIterations(max_iter);
 
@@ -175,8 +181,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         record_prec_build(new_facts);
     };
 
-    // Run PCG. Returns false (and counts a krylov_fail) on preconditioner failure or on
-    // non-convergence with error > 1e-10.
+    // Run PCG. Returns false (and counts a krylov_fail) on preconditioner failure or on non-convergence.
     auto attempt_solve = [&](Vec& dy_out) -> bool {
         if (cg.preconditioner().info() != Eigen::Success) {
             std::cout << "[PCG] CG failed due to preconditioner failure.\n";
@@ -204,11 +209,9 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         T err = cg.error();
         if (!in_refinement_) it_state_.pcg_err = static_cast<double>(err);
         if (cg.info() != Eigen::Success) {
-            if (!(err <= T(1e-10))) { // Acceptable error threshold for PCG failure.
-                krylov_fail++;
-                record_pcg_fail(PcgFailKind::NoConvergence, static_cast<int>(cg.iterations()), static_cast<double>(err));
-                return false;
-            }
+            krylov_fail++;
+            record_pcg_fail(PcgFailKind::NoConvergence, static_cast<int>(cg.iterations()), static_cast<double>(err));
+            return false;
         }
         dy_out = std::move(dy_);
         return true;
@@ -935,6 +938,25 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
 }
 
 template <typename T>
+T SSN<T>::newton_residual_norm() {
+    // From the KKT residual (rho1, rho2) of dxdy_: e_x = rho1 - mu G^T D rho2, e_W = -((1 - alpha) / alpha) rho2_W,
+    // with D = 1 on A rows and 1/alpha on active-W rows; e is 0 on inactive W.
+    const int s = static_cast<int>(r2_.size());
+    const auto dx = dxdy_.head(N);
+    const auto dy = dxdy_.tail(s);
+    Vec rho1 = r1_ + H_diag.cwiseProduct(dx) - G_tr * dy;
+    Vec rho2 = r2_ - G * dx - dy / mu;
+
+    T e_W = T(0);
+    for (int i = 0, k = M; i < l; ++i)
+        if (active_W(i)) e_W = std::max(e_W, std::abs((1 - alpha) / alpha * rho2(k++)) * D1B_diag_inv(i));
+
+    rho2.tail(n_active_W) /= alpha;
+    rho1.noalias() -= mu * (G_tr * rho2);
+    return std::max(inf_norm(rho1.cwiseProduct(D2_ext_inv)), e_W);
+}
+
+template <typename T>
 void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed) {
     SSN_TIMER_BLOCK(it_.linear_solve);
     // Solve for dx and dy2_active_W.
@@ -957,6 +979,7 @@ void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed)
             iterative_refine_dxdy();
         }
     }
+    if (trace_ && trace_->enabled) it_state_.newton_res = static_cast<double>(newton_residual_norm());
 
     // Split dxdy_ into dx_ and dy2_active_W.
     dx_ = dxdy_.head(N);
@@ -1079,6 +1102,9 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
     std::optional<TerminationStatus> _opt;
     T prev_tol_achieved = inf;
     int stagnation = 0;
+
+    // PCG's absolute target: the gradient a step leaves is about mu G^T times the Schur residual.
+    krylov_abs_tol_ = krylov_tol_factor * ssn_tol / mu;
 
     // Useful matvecs
     Ax_ssn_.noalias() = A * x_cur_;
@@ -1316,6 +1342,8 @@ void SSN<T>::end_iteration(SsnLsOutcome outcome, T tau, T ssn_tol) {
     row.krylov = it_state_.krylov;
     row.krylov_refine = it_state_.krylov_refine;
     row.pcg_err = it_state_.pcg_err;
+    row.krylov_rtol = it_state_.krylov_rtol;
+    row.newton_res = it_state_.newton_res;
     row.ls_outcome = outcome;
     row.ls_steepest = it_state_.ls_steepest;
     row.tau = tau;

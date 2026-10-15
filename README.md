@@ -281,7 +281,11 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 By default each Newton system is solved by PCG on its Schur complement
 `S = G H⁻¹ Gᵀ + (1/μ) I`, preconditioned by a factorization that is reused across iterations
 through Sherman-Morrison-Woodbury (SMW) low-rank updates (`include/schur_preconditioner.hpp`).
-If PCG fails, the direct solver below takes over for the rest of the run. Two public
+PCG stops once `‖rhs − S·dy‖₂ < 0.1 · ssn_tol / μ` (`SSN::krylov_tol_factor`), but never asks for a
+relative residual below `1e-12` (`SSN::krylov_tol`). The 1/μ is there because the gradient a step
+leaves is about μ·Gᵀ times the Schur residual. Iterative refinement on the KKT system follows every
+solve. A solve that misses its tolerance is a PCG failure. If PCG fails, the direct solver below takes
+over for the rest of the run. Two public
 `KSP_QP<T>` members select the experimental direct mode instead:
 
 | Member | Default | Description |
@@ -795,6 +799,9 @@ The last four columns are informational parts of these phases:
   - the active-set sizes and flips;
   - the main solve's setup and reason;
   - Krylov iterations, step size and gradient norm;
+  - `krylov_rtol`: the relative tolerance the main PCG solve was given (`1e-12` where the floor binds; `nan` for direct solves);
+  - `newton_res`: ‖J·du + ∇M‖ of the direction after refinement, in the norm of the gradient norm. A full step with
+    unchanged active sets leaves this gradient;
   - the phases.
 - **`pmm`**: one row per PMM iteration. Each row has:
   - the SSN status;

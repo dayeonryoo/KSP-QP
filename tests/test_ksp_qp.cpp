@@ -2005,13 +2005,20 @@ TEST(KspQpSolveProfile, TraceRowsMatchTheCountersAndLeaveTheResultsUnchanged) {
 
     const auto& tr = traced.trace;
     EXPECT_EQ(static_cast<int>(tr.pmm.size()), sol.pmm_iter);
-    int steps = 0;
+    int steps = 0, rtol_rows = 0;
     for (const auto& row : tr.ssn) {
       steps += row.ls_outcome == SsnLsOutcome::Step;
       EXPECT_GE(row.pmm_iter, 1);
       EXPECT_LE(row.pmm_iter, sol.pmm_iter);
+      EXPECT_GE(row.newton_res, 0.0);  // NaN fails
+      if (std::isfinite(row.krylov_rtol)) {
+        ++rtol_rows;
+        EXPECT_GE(row.krylov_rtol, 1e-12);  // krylov_tol, the floor
+      }
     }
     EXPECT_EQ(steps, sol.ssn_iter);
+    if (mode == 0) EXPECT_GT(rtol_rows, 0);
+    else EXPECT_EQ(rtol_rows, 0);  // only PCG solves record a tolerance
     int facts = 0, smw = 0, pcg_fail = 0;
     for (const auto& e : tr.events) {
       facts += e.action == LinAction::Factorize;
