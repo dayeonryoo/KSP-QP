@@ -916,6 +916,7 @@ Solution<T> KSP_QP<T>::solve() {
     NS.report_ = report_;
     NS.direct_solve = direct_solve;
     NS.direct_smw = direct_smw;
+    NS.cg.preconditioner().set_refactor_after(refactor_after);
     NS.trace_ = &trace;
 
     // Print header.

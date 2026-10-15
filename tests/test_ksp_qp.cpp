@@ -2028,3 +2028,39 @@ TEST(KspQpSolveProfile, TraceRowsMatchTheCountersAndLeaveTheResultsUnchanged) {
     EXPECT_EQ(tr.pmm.back().rule, PmmRule::Stop);  // the last PMM iteration ended the run
   }
 }
+
+// ===================== kept preconditioner factorization (refactor_after) =====================
+
+TEST(KspQpRefactorAfter, OneIsTheDefaultAndNeverKeeps) {
+  const auto problem = RandomFeasibleQp();
+  KSP_QP<double> plain(problem), one(problem);
+  EXPECT_EQ(plain.refactor_after, 1);
+  one.refactor_after = 1;
+  const auto sol = plain.solve();
+  const auto sol_one = one.solve();
+
+  ASSERT_EQ(sol.opt, TerminationStatus::Optimal);
+  EXPECT_TRUE(sol_one.x == sol.x);
+  EXPECT_EQ(sol_one.krylov_iter, sol.krylov_iter);
+  EXPECT_EQ(sol_one.fact, sol.fact);
+  EXPECT_EQ(one.profile.fact_by_reason, plain.profile.fact_by_reason);
+  EXPECT_EQ(plain.profile.mu_rho_keep, 0);
+}
+
+TEST(KspQpRefactorAfter, KeepingEveryChangeReachesTheSameOptimumWithoutMuRhoRefactorizations) {
+  const auto problem = RandomFeasibleQp();
+  KSP_QP<double> base(problem), kept(problem);
+  kept.refactor_after = 1000;
+  const auto sol = base.solve();
+  const auto sol_kept = kept.solve();
+
+  ASSERT_EQ(sol.opt, TerminationStatus::Optimal);
+  ASSERT_EQ(sol_kept.opt, TerminationStatus::Optimal);
+  const double scale = 1.0 + std::abs(sol.obj_val);
+  EXPECT_NEAR(sol_kept.obj_val, sol.obj_val, 1e-6 * scale);
+  ExpectProfileAccounting(kept, sol_kept);
+  EXPECT_GT(base.profile.fact_by_reason[static_cast<int>(FactReason::MuRho)], 0);
+  EXPECT_EQ(kept.profile.fact_by_reason[static_cast<int>(FactReason::MuRho)], 0);
+  EXPECT_GT(kept.profile.mu_rho_keep, 0);
+  EXPECT_FALSE(kept.pcg_failed);
+}

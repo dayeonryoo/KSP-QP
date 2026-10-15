@@ -240,12 +240,12 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
         return solve_direct(G, G_tr, H_diag, H_diag_inv, r1, r2);
     }
 
-    // If CG succeeded and the preconditioner used SMW, reset the SMW fail streak.
-    if (ok && cg.preconditioner().used_smw())
+    // If CG succeeded through an SMW update or a stale factorization, reset the SMW fail streak.
+    if (ok && (cg.preconditioner().used_smw() || cg.preconditioner().is_stale()))
         cg.preconditioner().reset_smw_fail_streak();
 
-    // If CG failed and the preconditioner used SMW, retry after a full rebuild.
-    // If it already used a full factorization: fall back to the direct solver.
+    // If CG failed through an SMW update or a stale factorization, retry after a full rebuild.
+    // If it already used a fresh full factorization: fall back to the direct solver.
     if (!ok && cg.preconditioner().should_retry_after_failure()) {
         try {
             setup_prec(true);
@@ -1183,6 +1183,7 @@ void SSN<T>::record_event(const LinEvent<T>& e) {
         case LinAction::SmwUpdate: ++profile_.smw_update; ++it_state_.smw; break;
         case LinAction::SmwReuse:  ++profile_.smw_reuse; break;
         case LinAction::PcgFail:   ++profile_.pcg_fail; break;
+        case LinAction::MuRhoKeep: break; // counted in record_prec_build(), with the keeps inside SMW setups
     }
     if (e.action != LinAction::PcgFail && it_state_.setup < 0) { // the main solve's setup comes first
         it_state_.setup = static_cast<int>(e.action);
@@ -1194,18 +1195,20 @@ void SSN<T>::record_event(const LinEvent<T>& e) {
 
 template <typename T>
 void SSN<T>::record_prec_build(int new_facts) {
-    // One event per factorization counted in fact (new_facts is 0 or 1), or per SMW update / reuse.
+    // One event per factorization counted in fact (new_facts is 0 or 1), or per SMW update / reuse / keep.
     const auto& b = cg.preconditioner().last_build();
     it_.fact    += b.t_assembly + b.t_analyze + b.t_factorize;
     it_.analyze += b.t_analyze;
     it_.lowrank += b.t_smw_setup;
     if (!b.ran) return;
+    if (b.kept_stale) ++profile_.mu_rho_keep;
 
     using Action = typename SchurPreconditioner<T>::BuildAction;
     LinAction action;
     if (new_facts > 0)                           action = LinAction::Factorize;
     else if (b.action == Action::SmwUpdated)     action = LinAction::SmwUpdate;
     else if (b.action == Action::ReusedSnapshot) action = LinAction::SmwReuse;
+    else if (b.action == Action::KeptStale)      action = LinAction::MuRhoKeep;
     else return;
 
     LinEvent<T> e = make_event(LinTarget::Prec, action);
@@ -1218,6 +1221,7 @@ void SSN<T>::record_prec_build(int new_facts) {
     e.h = b.h;
     e.p = b.p;
     e.q = b.q;
+    e.stale = b.stale;
     e.mu_changed = b.mu_changed;   // since the preconditioner's last factorization or update
     e.rho_changed = b.rho_changed;
     e.t_assembly = b.t_assembly;
@@ -1231,6 +1235,7 @@ template <typename T>
 void SSN<T>::record_pcg_fail(PcgFailKind kind, int iters, double err) {
     LinEvent<T> e = make_event(LinTarget::Prec, LinAction::PcgFail);
     e.ldlt = schur_use_ldlt;
+    e.stale = cg.preconditioner().stale_count();
     e.pcg_fail = kind;
     e.pcg_iters = iters;
     e.pcg_err = err;

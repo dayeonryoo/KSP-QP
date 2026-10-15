@@ -98,6 +98,28 @@ void print_feasibility(const KSPQPdata<T>& pd,
     }
 }
 
+// Throws if `path` exists with another header: appended rows would land under the wrong columns
+// (e.g. in a file written before a column was added).
+inline void check_existing_header(const std::string& path, const std::string& header) {
+    namespace fs = std::filesystem;
+    if (!fs::exists(path) || fs::is_empty(path)) return;
+    std::ifstream in(path);
+    std::string first;
+    std::getline(in, first);
+    if (!first.empty() && first.back() == '\r') first.pop_back();
+    if (first != header)
+        throw std::runtime_error(path + " has another header than this binary writes; write to a new file");
+}
+
+inline std::string csv_result_header() {
+    std::string h = "System,agree,opt_status,diverged,name,abs_err,rel_err,obj_val,"
+                    "pmm_iter,ssn_iter,krylov_iter,fact,smw_count,pmm_tol_achieved,ssn_tol_achieved,"
+                    "run_time,linesearch_fail,krylov_fail,"
+                    "setup_time,solve_time,kkt_ldlt_fact,schur_chol_fact";
+    SolveProfile{}.visit([&](const char* col, const auto&) { h += ','; h += col; });
+    return h;
+}
+
 inline void write_csv_header(const std::string& path) {
     namespace fs = std::filesystem;
 
@@ -105,18 +127,14 @@ inline void write_csv_header(const std::string& path) {
     if (p.has_parent_path()) {
         fs::create_directories(p.parent_path());
     }
+    check_existing_header(path, csv_result_header());
 
     if (!fs::exists(p) || fs::is_empty(p)) {
         std::ofstream csv(path);
         if (!csv.is_open()) {
             throw std::runtime_error("write_csv_header: failed to open " + path + " for writing");
         }
-        csv << "System,agree,opt_status,diverged,name,abs_err,rel_err,obj_val,"
-            << "pmm_iter,ssn_iter,krylov_iter,fact,smw_count,pmm_tol_achieved,ssn_tol_achieved,"
-            << "run_time,linesearch_fail,krylov_fail,"
-            << "setup_time,solve_time,kkt_ldlt_fact,schur_chol_fact";
-        SolveProfile{}.visit([&](const char* col, const auto&) { csv << ',' << col; });
-        csv << "\n";
+        csv << csv_result_header() << "\n";
     } else {
         std::ofstream csv(path, std::ios::out | std::ios::app);
         if (!csv.is_open()) {
@@ -148,19 +166,23 @@ void append_csv_result(const std::string& path, const TestResult<T>& r) {
 // linear-solver event, SSN iteration and PMM iteration, each led by the problem's name. They are
 // appended to, with the header written when a file is new.
 template <typename Row>
+std::string trace_header() {
+    std::string h = "name";
+    Row{}.visit([&](const char* col, const auto&) { h += ','; h += col; });
+    return h;
+}
+
+template <typename Row>
 void append_trace_csv(const std::string& path, const std::string& name, const std::vector<Row>& rows) {
     namespace fs = std::filesystem;
     fs::path p(path);
     if (p.has_parent_path()) fs::create_directories(p.parent_path());
     const bool new_file = !fs::exists(p) || fs::is_empty(p);
+    if (!new_file) check_existing_header(path, trace_header<Row>());
     std::ofstream csv(path, std::ios::out | std::ios::app);
     if (!csv.is_open()) throw std::runtime_error("append_trace_csv: failed to open " + path + " for appending");
     csv << std::setprecision(10);
-    if (new_file) {
-        csv << "name";
-        Row{}.visit([&](const char* col, const auto&) { csv << ',' << col; });
-        csv << "\n";
-    }
+    if (new_file) csv << trace_header<Row>() << "\n";
     for (const Row& row : rows) {
         csv << name;
         row.visit([&](const char*, const auto& v) { csv << ',' << v; });
@@ -175,6 +197,14 @@ void append_trace_csvs(const std::string& prefix, const std::string& name, const
     append_trace_csv(prefix + "_pmm.csv", name, trace.pmm);
 }
 
+// Throws before a sweep if an existing PREFIX trace file has another header (see check_existing_header()).
+template <typename T>
+void check_trace_csvs(const std::string& prefix) {
+    check_existing_header(prefix + "_events.csv", trace_header<LinEvent<T>>());
+    check_existing_header(prefix + "_ssn.csv", trace_header<SsnRow<T>>());
+    check_existing_header(prefix + "_pmm.csv", trace_header<PmmRow<T>>());
+}
+
 // Prints the factorizations by reason and the run time by phase (single-problem runs).
 inline void print_profile(const SolveProfile& p) {
     std::cout << "Factorizations by reason:";
@@ -182,7 +212,8 @@ inline void print_profile(const SolveProfile& p) {
         if (p.fact_by_reason[i] > 0)
             std::cout << " " << to_string(static_cast<FactReason>(i)) << "=" << p.fact_by_reason[i];
     std::cout << "  (with symbolic analysis: " << p.fact_analyzed << "); SMW updates: " << p.smw_update
-              << ", reuses: " << p.smw_reuse << ", PCG failures: " << p.pcg_fail << "\n";
+              << ", reuses: " << p.smw_reuse << ", mu/rho keeps: " << p.mu_rho_keep
+              << ", PCG failures: " << p.pcg_fail << "\n";
     std::cout << "Run time by phase (s): setup=" << p.t.setup << " prep=" << p.t.prep << " fact=" << p.t.fact
               << " lowrank=" << p.t.lowrank << " krylov=" << p.t.krylov << " direct_solve=" << p.t.direct_solve
               << " linesearch=" << p.t.linesearch << " update=" << p.t.update << " ssn_other=" << p.t.ssn_other

@@ -46,15 +46,19 @@
 //                     as pattern_dirty_, not set on a mu/rho-only change.
 //   mu_/rho_ vs mu_at_last_fact_/rho_at_last_fact_ : on active_K entries H_diag(i) = Q_diag(i) +
 //                     1/rho, so mu and rho touch disjoint parts of P/P_hat. compute() calls build()
-//                     on either change, which patches without the dirty flags:
+//                     on either change unless it keeps the factorization (refactor_after_), and
+//                     build() patches from the stored mu_fact_/rho_fact_ without the dirty flags:
 //                       mu-only  : both variants overwrite the (1/mu)I block in place, O(s).
 //                       rho-only : chol must rebuild G E G^T (E = 1/H_diag is inside the product);
 //                                  ldlt patches -H_act on P_hat's diagonal in place, O(n_act).
+//   refactor_after_ / stale_count_ : the factorization is kept across mu/rho changes and redone at
+//                     the refactor_after_-th change since it (1: at every change).
 //   use_ldlt_ / use_ldlt_at_last_fact_ : Cholesky vs LDLT, from SSN::schur_use_ldlt via arm(); a
 //                     switch forces prec_pattern_changed.
 //   skip_smw_ / use_smw_ / has_snapshot_ / smw_fail_streak_ : SMW control (see try_build_smw()).
 //                     The update reuses P_old from the last full rebuild for every retained row and
-//                     column, so smw_gate_open() rejects any rho or mu change since the snapshot.
+//                     column, so smw_gate_open() rejects any rho or mu change since the snapshot,
+//                     unless the factorization is kept; the update then uses the snapshot's mu/rho.
 // =================================================================================================
 
 template <typename T>
@@ -79,6 +83,11 @@ public:
 
     // Sets the number of equality-constraint (A) rows once from data. 
     void set_num_equality_rows(int M) { M_rows_ = M; }
+
+    // Refactorize at the k-th mu/rho change since the last factorization (1: at every change).
+    void set_refactor_after(int k) { refactor_after_ = std::max(1, k); }
+    int stale_count() const { return stale_count_; } // mu/rho changes kept since the last factorization
+    bool is_stale() const { return initialized_ && (mu_ != mu_fact_ || rho_ != rho_fact_); }
 
     void set_data(const SpMat& G, const SpMat& G_tr, const Vec& H_diag,
                  const BoolArr& active_K, const BoolArr& active_W,
@@ -134,10 +143,10 @@ public:
         return delta;
     }
 
-    // On PCG failure: if the preconditioner used SMW, records the failure and returns true (retry with
-    // arm(..., force_rebuild=true)); otherwise returns false.
+    // On PCG failure: if the preconditioner used SMW or a stale factorization, records the failure and
+    // returns true (retry with arm(..., force_rebuild=true)); otherwise returns false.
     bool should_retry_after_failure() {
-        if (!use_smw_) return false;
+        if (!use_smw_ && !is_stale()) return false;
         record_smw_rebuild();
         return true;
     }
@@ -146,12 +155,35 @@ public:
 
     template <typename MatrixType>
     SchurPreconditioner& compute(const MatrixType&) {
-        bool mu_changed  = initialized_ && (mu_  != mu_at_last_fact_);
-        bool rho_changed = initialized_ && (rho_ != rho_at_last_fact_);
-        if (!initialized_ || rebuild_ || mu_changed || rho_changed) {
-            build();
-            initialized_ = true;
+        const bool mu_changed  = initialized_ && (mu_  != mu_at_last_fact_);
+        const bool rho_changed = initialized_ && (rho_ != rho_at_last_fact_);
+        const bool changed = mu_changed || rho_changed;
+
+        // Keep the factorization across a mu/rho change unless it is the refactor_after_-th since it;
+        // back at the factorization's own mu/rho, it is exact again.
+        const bool exact_again = changed && mu_ == mu_fact_ && rho_ == rho_fact_;
+        const bool keep = changed && (exact_again || stale_count_ + 1 < refactor_after_)
+                          && info_ == Eigen::Success && !skip_smw_ && !smw_suppressed()
+                          && use_ldlt_ == use_ldlt_at_last_fact_;
+        stale_ok_ = !changed || keep;
+        if (keep) {
+            stale_count_ = exact_again ? 0 : stale_count_ + 1;
+            mu_at_last_fact_  = mu_;
+            rho_at_last_fact_ = rho_;
         }
+
+        if (!initialized_ || rebuild_ || (changed && !keep)) {
+            build(mu_changed, rho_changed);
+            initialized_ = true;
+        } else if (keep) {
+            last_build_.ran = true;
+            last_build_.action = BuildAction::KeptStale;
+            last_build_.mu_changed = mu_changed;
+            last_build_.rho_changed = rho_changed;
+            last_build_.ldlt = use_ldlt_;
+        }
+        last_build_.kept_stale = keep && last_build_.action != BuildAction::Factorized;
+        last_build_.stale = stale_count_;
         return *this;
     }
 
@@ -196,9 +228,9 @@ public:
     enum class SkipCause { None, PcgFailure, Suppressed };
 
     // What compute() did since the last arm(), for SSN's factorization log (solve_profile.hpp).
-    enum class BuildAction { None, Factorized, SmwUpdated, ReusedSnapshot };
+    enum class BuildAction { None, Factorized, SmwUpdated, ReusedSnapshot, KeptStale };
     struct BuildInfo {
-        bool ran = false;                    // compute() called build()
+        bool ran = false;                    // compute() called build() or kept the factorization
         BuildAction action = BuildAction::None;
         bool initial = false;                // first build (or first after release())
         bool mu_changed = false, rho_changed = false; // since the last factorization or update
@@ -207,6 +239,8 @@ public:
         int rank = -1, h = -1, p = -1, q = -1; // SMW delta against the snapshot (-1: not classified)
         bool ldlt = false;                   // LDLT on P_hat rather than Cholesky on P
         bool analyzed = false;               // Factorized with a symbolic analysis
+        bool kept_stale = false;             // a mu/rho change was absorbed without refactorizing
+        int stale = 0;                       // mu/rho changes the factorization lags behind, after this setup
         double t_assembly = 0.0, t_analyze = 0.0, t_factorize = 0.0, t_smw_setup = 0.0; // seconds
     };
     const BuildInfo& last_build() const { return last_build_; }
@@ -293,6 +327,8 @@ public:
         numeric_dirty_       = true;
         use_smw_          = false;
         skip_smw_         = false;
+        stale_count_      = 0;
+        stale_ok_         = false;
         smw_last_reject_reason_ = SmwRejectReason::None;
         smw_last_rank_          = 0;
     }
@@ -373,15 +409,15 @@ private:
 
     // ------ Formation and Cholesky factorization ------
 
-    void build() {
+    void build(bool mu_changed, bool rho_changed) {
         use_smw_ = false;
 
         // Record what this build does (last_build()); skip_smw_ is consumed by smw_gate_open().
         BuildInfo& b = last_build_;
         b.ran = true;
         b.initial = !initialized_;
-        b.mu_changed  = initialized_ && (mu_  != mu_at_last_fact_);
-        b.rho_changed = initialized_ && (rho_ != rho_at_last_fact_);
+        b.mu_changed  = mu_changed; // from compute(), before a kept change moved mu/rho_at_last_fact_
+        b.rho_changed = rho_changed;
         b.skip_cause = skip_smw_ ? skip_cause_ : SkipCause::None;
         b.ldlt = use_ldlt_;
         const double t_assembly0 = assembly_time_, t_analyze0 = analyze_time_, t_factorize0 = factorize_time_,
@@ -454,6 +490,9 @@ private:
         fact_count_++;
         mu_at_last_fact_       = mu_;
         rho_at_last_fact_      = rho_;
+        mu_fact_               = mu_;
+        rho_fact_              = rho_;
+        stale_count_           = 0;
         use_ldlt_at_last_fact_ = is_ldlt;
         if (n_act >= 0) n_act_ = n_act;
         s_current_ = static_cast<int>(s);
@@ -526,7 +565,7 @@ private:
                 //    on active_K entries).
                 n_act = n_act_;
                 assert(sol.P_hat.rows() == n_act + s && sol.P_hat.cols() == n_act + s);
-                if (rho_ != rho_at_last_fact_)
+                if (rho_ != rho_fact_)
                     for (int k = 0; k < n_act; ++k)
                         sol.P_hat.valuePtr()[ldlt_diag_top_idx_[k]] = -H_diag(ldlt_act_idx_[k]);
                 for (Eigen::Index i = 0; i < s; ++i)
@@ -556,7 +595,7 @@ private:
 
         auto& sol = std::get<CholSolver>(active_solver_);
 
-        const bool rho_changed = (rho_ != rho_at_last_fact_);
+        const bool rho_changed = (rho_ != rho_fact_);
         const bool structural_change = numeric_dirty_; // captured before the branch below resets it.
         {
             SCHUR_PREC_TIMER_BLOCK(assembly_time_);
@@ -594,7 +633,7 @@ private:
             } else {
                 // G E G^T unchanged; only mu changed: shift the (1/mu) I diagonal by delta.
                 assert(sol.P.rows() == s && sol.P.cols() == s);
-                const T delta = (mu_at_last_fact_ - mu_) / (mu_ * mu_at_last_fact_);
+                const T delta = (mu_fact_ - mu_) / (mu_ * mu_fact_);
                 for (Eigen::Index i = 0; i < s; ++i)
                     sol.P.valuePtr()[diag_idx_chol_[i]] += delta;
             }
@@ -657,14 +696,14 @@ private:
             return false;
         }
         // P_old was factorized with the snapshot's rho, and H_diag(i) = Q_diag(i) + 1/rho on
-        // active_K entries, so a rho change invalidates it.
-        if (rho_ != rho_old_) {
+        // active_K entries, so a rho change invalidates it unless compute() keeps it (stale_ok_).
+        if (rho_ != rho_old_ && !stale_ok_) {
             smw_last_reject_reason_ = SmwRejectReason::RhoChangedSinceSnapshot;
             return false;
         }
         // The update recomputes (1/mu) only for added W rows; retained rows inherit it from P_old.
-        // A mu change is thus a full-rank shift.
-        if (mu_ != mu_old_) {
+        // A mu change is thus a full-rank shift, accepted only when compute() keeps P_old.
+        if (mu_ != mu_old_ && !stale_ok_) {
             smw_last_reject_reason_ = SmwRejectReason::MuChangedSinceSnapshot;
             return false;
         }
@@ -717,6 +756,14 @@ private:
         return true;
     }
 
+    // H(col) of an active_K column at the snapshot's rho: a kept P_old is updated at its own mu/rho, so
+    // the result is P(current active sets; mu_old_, rho_old_) and stays SPD.
+    T H_snap(int col) const {
+        if (rho_ == rho_old_)   return (*H_diag_)(col);
+        if (active_K_old_(col)) return H_diag_old_(col);
+        return (*H_diag_)(col) + (T(1) / rho_old_ - T(1) / rho_);
+    }
+
     // Phase 3: build V_plus_ (s_old_ x q_) and M_sub (rank x rank).
     Mat build_capacitance_setup() {
         const int rank = h_ + p_ + q_;
@@ -726,10 +773,10 @@ private:
         // Block 2: -C^-1 (diagonal p_×p_); C_jj = E_new[idx] - E_old[idx].
         for (int j = 0; j < p_; ++j) {
             const int idx = delta_K_idx_[j];
-            M_sub(h_ + j, h_ + j) = (*active_K_)(idx) ? -(*H_diag_)(idx) : H_diag_old_(idx);
+            M_sub(h_ + j, h_ + j) = (*active_K_)(idx) ? -H_snap(idx) : H_diag_old_(idx);
         }
 
-        // V_plus_[:,j] = sum_{i in B_j, active_K[i]} (b_ji / H_diag[i]) * G_old_[:,i].
+        // V_plus_[:,j] = sum_{i in B_j, active_K[i]} (b_ji / H_snap(i)) * G_old_[:,i].
         // Block 3: W_+ = B_+ E_new B_+^T + (1/mu) I  (q_×q_).
         V_plus_.setZero(s_old_, q_);
         zero_resize(smw_e_new_b_, N);
@@ -742,7 +789,7 @@ private:
             for (typename RowMajorSpMat::InnerIterator it(*B_rm_, added_W_src_[j]); it; ++it) {
                 const int col = it.col();
                 if ((*active_K_)(col)) {
-                    smw_e_new_b_(col) = it.value() / (*H_diag_)(col);
+                    smw_e_new_b_(col) = it.value() / H_snap(col);
                     smw_touched_.push_back(col);
                 }
             }
@@ -751,7 +798,7 @@ private:
                     V_plus_(git.row(), j) += smw_e_new_b_(col) * git.value();
 
             for (int k = j; k < q_; ++k) {
-                T val = (j == k) ? T(1) / mu_ : T(0);
+                T val = (j == k) ? T(1) / mu_old_ : T(0);
                 for (typename RowMajorSpMat::InnerIterator it(*B_rm_, added_W_src_[k]); it; ++it)
                     val += it.value() * smw_e_new_b_(it.col());  // smw_e_new_b_ is 0 at non-active_K
                 M_sub(h_ + p_ + j, h_ + p_ + k) = val;
@@ -876,8 +923,8 @@ private:
         z_base_.resize(s_old_);
         z_new_.resize(s_new);
         s_current_ = s_new;
-        mu_at_last_fact_  = mu_;  // SMW's result reflects the current mu/rho, not the snapshot's;
-        rho_at_last_fact_ = rho_; // keep compute()'s mu_changed/rho_changed gate in sync with that.
+        mu_at_last_fact_  = mu_;  // the mu/rho this update serves (built at the snapshot's if kept);
+        rho_at_last_fact_ = rho_; // keeps compute()'s mu_changed/rho_changed gate in sync.
         use_smw_   = true;
         smw_count_++;
     }
@@ -888,7 +935,7 @@ private:
         V_plus_.resize(0, 0);
         Y_all_.resize(0, 0);
         s_current_        = s_old_;
-        mu_at_last_fact_  = mu_;   // equal to mu_old_ and rho_old_ (checked by smw_gate_open())
+        mu_at_last_fact_  = mu_;   // mu_old_ and rho_old_ (smw_gate_open()), unless kept stale
         rho_at_last_fact_ = rho_;
         pattern_dirty_    = false; // the cached symbolic analysis and values match P again
         numeric_dirty_    = false;
@@ -927,8 +974,10 @@ private:
     bool pattern_analyzed_ = false;
     bool pattern_dirty_    = true;
     bool numeric_dirty_       = true;
-    T    mu_at_last_fact_  = T(-1);
+    T    mu_at_last_fact_  = T(-1); // mu/rho the preconditioner was last set up or kept for
     T    rho_at_last_fact_ = T(-1);
+    T    mu_fact_          = T(-1); // mu/rho in the stored P/P_hat values (finish_factorization())
+    T    rho_fact_         = T(-1);
 
     // Cumulative wall-clock seconds: build()'s phases, then solve() calls without and with SMW.
     double assembly_time_  = 0.0;
@@ -984,6 +1033,11 @@ private:
     static constexpr int    kSmwRankThreshold = 50; // try_build_smw() rejects rank > this; rank 0 reuses the snapshot.
     SmwRejectReason smw_last_reject_reason_ = SmwRejectReason::None;
     int             smw_last_rank_          = 0;
+
+    // Kept (stale) factorization across mu/rho changes
+    int  refactor_after_ = 1;     // refactorize at this mu/rho change since the last factorization
+    int  stale_count_    = 0;     // mu/rho changes kept since the last factorization
+    bool stale_ok_       = false; // set by compute(): the stored factorization may serve the current mu/rho
 
     // Snapshots from last full rebuild (input to try_build_smw)
     bool    has_snapshot_ = false; // true once snapshot_state() has run at least once

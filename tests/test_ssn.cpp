@@ -2893,3 +2893,58 @@ TEST(SolveSsn, DirectModeConvergesToStrictlyInteriorMinimizerWithNoEqualityOrIne
   EXPECT_EQ(ns.fact, 0);
   EXPECT_EQ(ns.krylov_iter, 0);
 }
+
+// ===================== kept preconditioner factorization (refactor_after) =====================
+
+// A PCG failure through a kept (stale) preconditioner refactorizes it and retries, instead of handing
+// the rest of the run to the direct solver.
+TEST(SolveUsingCg, PcgFailureThroughAKeptPreconditionerRetriesWithAFreshFactorization) {
+  // G = [A; B row 0] (s = 2), all of K active and Q = 0 (H = 1/rho), so a fresh P equals S and one CG
+  // iteration solves exactly. The P kept from (mu, rho) = (2, 1) is not a multiple of S at (4, 2).
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  SolveTrace<double> trace;
+  trace.enabled = true;
+  ns.trace_ = &trace;
+  ns.cg.preconditioner().set_refactor_after(2);
+  ns.active_W = ToBoolArr({true, false});
+
+  const SpMat G = DenseToSparse((Eigen::MatrixXd(2, 3) << 1.0, 1.0, 1.0, 1.0, 0.0, 0.0).finished());
+  const SpMat G_tr = SpMat(G.transpose());
+  const BoolArr active_K = ToBoolArr({true, true, true});
+  Vec r1(3), r2(2);
+  r1 << 1.0, -2.0, 0.5;
+  r2 << 0.5, -1.0;
+
+  ns.rho = 1.0;
+  const Vec H1 = Vec::Constant(3, 1.0);
+  ns.solve_using_cg(G, G_tr, H1, H1.cwiseInverse(), active_K, r1, r2, /*mu=*/2.0, ns.krylov_tol,
+                    /*max_iter=*/1, /*update_prec=*/true, /*prec_pattern_changed=*/true, /*schur_use_ldlt=*/false);
+  ASSERT_EQ(ns.krylov_fail, 0);
+  ASSERT_EQ(ns.fact, 1);
+
+  ns.rho = 2.0;
+  const Vec H2 = Vec::Constant(3, 0.5);
+  const Vec sol = ns.solve_using_cg(G, G_tr, H2, H2.cwiseInverse(), active_K, r1, r2, /*mu=*/4.0,
+                                    ns.krylov_tol, /*max_iter=*/1, /*update_prec=*/false,
+                                    /*prec_pattern_changed=*/false, /*schur_use_ldlt=*/false);
+
+  EXPECT_FALSE(ns.pcg_failed);
+  EXPECT_EQ(ns.krylov_fail, 1);
+  EXPECT_EQ(ns.fact, 2);
+  EXPECT_EQ(ns.profile_.fact_total(), ns.fact);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::PcgFailure)], 1);
+  EXPECT_EQ(ns.profile_.mu_rho_keep, 1);
+  EXPECT_EQ(ns.profile_.pcg_fail, 1);
+  ASSERT_EQ(trace.events.size(), 4u);
+  EXPECT_EQ(trace.events[0].action, LinAction::Factorize);
+  EXPECT_EQ(trace.events[1].action, LinAction::MuRhoKeep);
+  EXPECT_EQ(trace.events[1].stale, 1);
+  EXPECT_EQ(trace.events[2].action, LinAction::PcgFail);
+  EXPECT_EQ(trace.events[2].stale, 1);
+  EXPECT_EQ(trace.events[3].action, LinAction::Factorize);
+  EXPECT_EQ(trace.events[3].reason, FactReason::PcgFailure);
+  EXPECT_EQ(trace.events[3].stale, 0);
+  ExpectKktResidualSmall(sol, G, H2, r1, r2, /*mu=*/4.0, 1e-8);
+}

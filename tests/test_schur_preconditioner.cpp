@@ -3037,3 +3037,302 @@ TEST(RandomizedCholLdltConsistency, FiftyColumnRandomSystemCholeskyAndLdltAgree)
     EXPECT_TRUE(got_ldlt.isApprox(expected, 1e-7)) << "ldlt trial " << trial;
   }
 }
+
+// ===================== kept (stale) factorization across mu/rho changes (refactor_after) =====================
+
+namespace {
+
+// H from SSN's model: q_i + (active_K ? 0 : mu) + 1/rho.
+Eigen::VectorXd ModelH(const Eigen::VectorXd& q, const std::vector<bool>& active_k, double mu, double rho) {
+  Eigen::VectorXd H(q.size());
+  for (int i = 0; i < q.size(); ++i) H(i) = q(i) + (active_k[i] ? 0.0 : mu) + 1.0 / rho;
+  return H;
+}
+
+// The matrix the preconditioner applies: its solve() of each unit vector.
+Eigen::MatrixXd AppliedInverse(const Prec& prec, int s) {
+  Eigen::MatrixXd Z(s, s);
+  for (int i = 0; i < s; ++i) Z.col(i) = prec.solve(Eigen::VectorXd::Unit(s, i));
+  return Z;
+}
+
+// Arms the preconditioner the way SSN does: rebuild and prec_pattern_changed both mean "the active
+// sets changed since the previous call". Holds everything arm() keeps pointers to.
+struct KeepRig {
+  Fixture f;
+  Eigen::VectorXd q = (Eigen::VectorXd(3) << 0.5, 0.0, 1.5).finished();  // column 1 is LP-like (H = 1/rho)
+  RowMajorSpMat B_rm = f.B_rm();
+  Eigen::MatrixXd G_dense;
+  SpMat G, G_tr;
+  BoolArr active_K, active_W;
+  Eigen::VectorXd H;
+  std::vector<bool> k_cur, w_cur;
+  bool first = true;
+  bool use_ldlt = false;
+  Prec prec;
+
+  explicit KeepRig(int refactor_after, bool ldlt = false) : use_ldlt(ldlt) { prec.set_refactor_after(refactor_after); }
+
+  void Step(const std::vector<bool>& k, const std::vector<bool>& w, double mu, double rho) {
+    const bool changed = first || k != k_cur || w != w_cur;
+    first = false;
+    k_cur = k;
+    w_cur = w;
+    G_dense = f.StackG(w);
+    G = DenseToSparse(G_dense);
+    G_tr = DenseToSparse(G_dense.transpose());
+    active_K = ToBoolArr(k);
+    active_W = ToBoolArr(w);
+    H = ModelH(q, k, mu, rho);
+    prec.arm(G, G_tr, H, active_K, active_W, B_rm, mu, rho, changed, changed, use_ldlt);
+    prec.compute(0);
+  }
+
+  // Inverse of the exact P for the current active sets at (mu, rho).
+  Eigen::MatrixXd DensePInverse(double mu, double rho) const {
+    return DenseSchurComplement(G_dense, ModelH(q, k_cur, mu, rho), k_cur, mu).inverse();
+  }
+  Eigen::MatrixXd Applied() const { return AppliedInverse(prec, static_cast<int>(G_dense.rows())); }
+};
+
+}  // namespace
+
+TEST(KeptFactorization, RefactorAfterOneRefactorizesOnEveryPenaltyChange) {
+  // The default: no change is ever kept, and every result is the exact P at the current mu/rho.
+  for (const bool ldlt : {false, true}) {
+    SCOPED_TRACE(ldlt ? "ldlt" : "chol");
+    KeepRig r(/*refactor_after=*/1, ldlt);
+    struct S { std::vector<bool> k, w; double mu, rho; int fact; };
+    const std::vector<S> script = {
+        {{true, true, true}, {false, false}, 5, 3, 1},
+        {{true, true, true}, {false, false}, 10, 3, 2},    // mu only
+        {{true, true, false}, {false, false}, 10, 3, 2},   // K flip: SMW
+        {{true, true, false}, {false, false}, 10, 6, 3},   // rho only
+        {{true, true, false}, {true, false}, 20, 6, 4},    // W row added with a mu change
+        {{true, false, false}, {true, false}, 20, 6, 4},   // K flip: SMW
+        {{true, false, false}, {true, false}, 40, 12, 5},  // both
+    };
+    for (const S& s : script) {
+      r.Step(s.k, s.w, s.mu, s.rho);
+      EXPECT_EQ(r.prec.fact_count(), s.fact);
+      EXPECT_FALSE(r.prec.last_build().kept_stale);
+      EXPECT_EQ(r.prec.stale_count(), 0);
+      EXPECT_FALSE(r.prec.is_stale());
+      EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(s.mu, s.rho), kTol));
+    }
+  }
+}
+
+TEST(KeptFactorization, RefactorizesAtTheKthPenaltyChange) {
+  for (const bool ldlt : {false, true}) {
+    SCOPED_TRACE(ldlt ? "ldlt" : "chol");
+    KeepRig r(/*refactor_after=*/3, ldlt);
+    const std::vector<bool> k = {true, true, false}, w = {true, false};
+    r.Step(k, w, 5, 3);
+    ASSERT_EQ(r.prec.fact_count(), 1);
+
+    double mu = 5, mu_fact = 5;
+    const int want_fact[] = {1, 1, 2, 2, 2, 3};
+    const int want_stale[] = {1, 2, 0, 1, 2, 0};
+    for (int i = 0; i < 6; ++i) {
+      mu *= 2;
+      r.Step(k, w, mu, 3);
+      EXPECT_EQ(r.prec.fact_count(), want_fact[i]) << "change " << i + 1;
+      EXPECT_EQ(r.prec.stale_count(), want_stale[i]) << "change " << i + 1;
+      EXPECT_EQ(r.prec.last_build().stale, want_stale[i]);
+      EXPECT_TRUE(r.prec.last_build().mu_changed);
+      if (want_stale[i] > 0) {
+        EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::KeptStale);
+        EXPECT_TRUE(r.prec.last_build().kept_stale);
+        EXPECT_TRUE(r.prec.is_stale());
+        // Still the factorization's P, which is not the current one.
+        EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(mu_fact, 3), kTol));
+        EXPECT_FALSE(r.Applied().isApprox(r.DensePInverse(mu, 3), 1e-3));
+      } else {
+        mu_fact = mu;
+        EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::Factorized);
+        EXPECT_FALSE(r.prec.last_build().kept_stale);
+        EXPECT_EQ(r.prec.smw_last_reject_reason(), Prec::SmwRejectReason::MuChangedSinceSnapshot);
+        EXPECT_FALSE(r.prec.is_stale());
+        EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(mu, 3), kTol));
+      }
+    }
+  }
+}
+
+TEST(KeptFactorization, MuShiftAfterAKeepStartsFromTheFactorizationsMu) {
+  // Cholesky's mu-only refactorization shifts the stored diagonal; it must shift from the mu in the
+  // stored values (5), not from the mu the kept factorization last served (10).
+  KeepRig r(/*refactor_after=*/2);
+  const std::vector<bool> k = {true, true, false}, w = {true, false};
+  r.Step(k, w, 5, 3);
+  r.Step(k, w, 10, 3);
+  ASSERT_EQ(r.prec.fact_count(), 1);
+  r.Step(k, w, 20, 3);
+  ASSERT_EQ(r.prec.fact_count(), 2);
+  EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(20, 3), kTol));
+}
+
+TEST(KeptFactorization, RhoPatchAfterAKeepStartsFromTheFactorizationsRho) {
+  // The kept factorization served rho = 6, but its values are at rho = 3: the refactorization at
+  // (20, 6) must still rebuild (Cholesky) or patch (LDLT) the rho-dependent entries.
+  for (const bool ldlt : {false, true}) {
+    SCOPED_TRACE(ldlt ? "ldlt" : "chol");
+    KeepRig r(/*refactor_after=*/2, ldlt);
+    const std::vector<bool> k = {true, true, false}, w = {true, false};
+    r.Step(k, w, 5, 3);
+    r.Step(k, w, 10, 6);
+    ASSERT_EQ(r.prec.fact_count(), 1);
+    r.Step(k, w, 20, 6);
+    ASSERT_EQ(r.prec.fact_count(), 2);
+    EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(20, 6), kTol));
+  }
+}
+
+TEST(KeptFactorization, SmwOnAKeptFactorizationUsesItsPenalties) {
+  // Column 1 enters active_K and W row 0 is added while mu and rho change: the update must be
+  // P(new active sets) at the factorization's (mu, rho) = (5, 3), not at the current (10, 6).
+  for (const bool ldlt : {false, true}) {
+    SCOPED_TRACE(ldlt ? "ldlt" : "chol");
+    KeepRig r(/*refactor_after=*/2, ldlt);
+    r.Step({true, false, true}, {false, false}, 5, 3);
+    r.Step({true, true, true}, {true, false}, 10, 6);
+
+    EXPECT_TRUE(r.prec.used_smw());
+    EXPECT_EQ(r.prec.fact_count(), 1);
+    EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::SmwUpdated);
+    EXPECT_TRUE(r.prec.last_build().kept_stale);
+    EXPECT_EQ(r.prec.last_build().stale, 1);
+    EXPECT_TRUE(r.prec.last_build().mu_changed);
+    EXPECT_TRUE(r.prec.last_build().rho_changed);
+    EXPECT_EQ(r.prec.last_build().p, 1);
+    EXPECT_EQ(r.prec.last_build().q, 1);
+    EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(5, 3), kTol));
+    EXPECT_FALSE(r.Applied().isApprox(r.DensePInverse(10, 6), 1e-3));
+
+    // The next change refactorizes in full at the current penalties.
+    r.Step({true, true, true}, {true, false}, 20, 6);
+    EXPECT_EQ(r.prec.fact_count(), 2);
+    EXPECT_FALSE(r.prec.used_smw());
+    EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(20, 6), kTol));
+  }
+}
+
+TEST(KeptFactorization, SmwOnAKeptFactorizationStaysPositiveDefinite) {
+  // One LP column (H = 1/rho), A = [1], B = [1]. Kept from (mu, rho) = (10, 1), the W row is added at
+  // (20, 2). At the factorization's penalties the update is [[1.1, 1], [1, 1.1]]; with the current
+  // rho in its new terms it would be [[1.1, 2], [2, 2.05]], which is indefinite.
+  const Eigen::MatrixXd A_row = (Eigen::MatrixXd(1, 1) << 1.0).finished();
+  const RowMajorSpMat B_rm = DenseToSparseRowMajor((Eigen::MatrixXd(1, 1) << 1.0).finished());
+  const BoolArr active_K = ToBoolArr({true});
+  const BoolArr active_W1 = ToBoolArr({false}), active_W2 = ToBoolArr({true});
+  const SpMat G1 = DenseToSparse(A_row), G1_tr = DenseToSparse(A_row.transpose());
+  const Eigen::MatrixXd G2_dense = (Eigen::MatrixXd(2, 1) << 1.0, 1.0).finished();
+  const SpMat G2 = DenseToSparse(G2_dense), G2_tr = DenseToSparse(G2_dense.transpose());
+  const Eigen::VectorXd H1 = (Eigen::VectorXd(1) << 1.0).finished();  // 1/rho at rho = 1
+  const Eigen::VectorXd H2 = (Eigen::VectorXd(1) << 0.5).finished();  // 1/rho at rho = 2
+
+  for (const bool ldlt : {false, true}) {
+    SCOPED_TRACE(ldlt ? "ldlt" : "chol");
+    Prec prec;
+    prec.set_refactor_after(2);
+    prec.arm(G1, G1_tr, H1, active_K, active_W1, B_rm, 10.0, 1.0, true, true, ldlt);
+    prec.compute(0);
+    prec.arm(G2, G2_tr, H2, active_K, active_W2, B_rm, 20.0, 2.0, true, true, ldlt);
+    prec.compute(0);
+    ASSERT_TRUE(prec.used_smw());
+    ASSERT_EQ(prec.fact_count(), 1);
+
+    const Eigen::MatrixXd Z = AppliedInverse(prec, 2);
+    const Eigen::MatrixXd P_snap = (Eigen::MatrixXd(2, 2) << 1.1, 1.0, 1.0, 1.1).finished();
+    EXPECT_TRUE(Z.isApprox(P_snap.inverse(), 1e-12));
+    const Eigen::MatrixXd Z_sym = 0.5 * (Z + Z.transpose());
+    EXPECT_GT(Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd>(Z_sym).eigenvalues().minCoeff(), 0.0);
+  }
+}
+
+TEST(KeptFactorization, KeptChangeWithARankExceedingDeltaRefactorizesWithoutCountingAKeep) {
+  // Same delta as FallsBackToFullRebuildWhenDeltaRankExceedsThreshold (rank 51), with a mu change
+  // that would be kept: the rank refuses the update, so the factorization is redone at the current mu.
+  const int N = 51;
+  Eigen::MatrixXd A_row = Eigen::MatrixXd::Ones(1, N);
+  Eigen::MatrixXd B_rows = Eigen::MatrixXd::Identity(N, N);
+  const RowMajorSpMat B_rm = DenseToSparseRowMajor(B_rows);
+  const Eigen::VectorXd H_diag = Eigen::VectorXd::LinSpaced(N, 2.0, 2.0 + N - 1);  // active_K: no mu term
+  const BoolArr active_K = ToBoolArr(std::vector<bool>(N, true));
+  const BoolArr active_W1 = ToBoolArr(std::vector<bool>(N, false));
+  const BoolArr active_W2 = ToBoolArr(std::vector<bool>(N, true));
+  const SpMat G1 = DenseToSparse(A_row), G1_tr = DenseToSparse(A_row.transpose());
+  Eigen::MatrixXd G2_dense(N + 1, N);
+  G2_dense.row(0) = A_row.row(0);
+  G2_dense.bottomRows(N) = B_rows;
+  const SpMat G2 = DenseToSparse(G2_dense), G2_tr = DenseToSparse(G2_dense.transpose());
+
+  Prec prec;
+  prec.set_refactor_after(3);
+  prec.arm(G1, G1_tr, H_diag, active_K, active_W1, B_rm, 5.0, 3.0, true, true, false);
+  prec.compute(0);
+  prec.arm(G2, G2_tr, H_diag, active_K, active_W2, B_rm, 10.0, 3.0, true, true, false);
+  prec.compute(0);
+
+  EXPECT_EQ(prec.fact_count(), 2);
+  EXPECT_EQ(prec.smw_last_reject_reason(), Prec::SmwRejectReason::RankExceedsThreshold);
+  EXPECT_EQ(prec.last_build().action, Prec::BuildAction::Factorized);
+  EXPECT_FALSE(prec.last_build().kept_stale);
+  EXPECT_EQ(prec.last_build().stale, 0);
+  EXPECT_EQ(prec.stale_count(), 0);
+  EXPECT_FALSE(prec.is_stale());
+}
+
+TEST(KeptFactorization, PcgFailureThroughAKeptFactorizationIsRetriedFresh) {
+  KeepRig r(/*refactor_after=*/2);
+  const std::vector<bool> k = {true, true, false}, w = {true, false};
+  r.Step(k, w, 5, 3);
+  r.Step(k, w, 10, 3);
+  ASSERT_TRUE(r.prec.is_stale());
+  ASSERT_FALSE(r.prec.used_smw());
+
+  EXPECT_TRUE(r.prec.should_retry_after_failure());  // stale, though not SMW-updated
+  r.prec.arm(r.G, r.G_tr, r.H, r.active_K, r.active_W, r.B_rm, 10, 3, false, false, false, /*force_rebuild=*/true);
+  r.prec.compute(0);
+
+  EXPECT_EQ(r.prec.fact_count(), 2);
+  EXPECT_EQ(r.prec.last_build().reject, Prec::SmwRejectReason::ForcedRebuild);
+  EXPECT_EQ(r.prec.last_build().skip_cause, Prec::SkipCause::PcgFailure);
+  EXPECT_FALSE(r.prec.is_stale());
+  EXPECT_FALSE(r.prec.should_retry_after_failure());  // fresh and not SMW-updated: fall back instead
+  EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(10, 3), kTol));
+}
+
+TEST(KeptFactorization, ReturningToTheFactorizationsPenaltiesResetsTheCount) {
+  // x2 then x0.5: back at the factorization's own (mu, rho), it is exact again, so the count restarts.
+  KeepRig r(/*refactor_after=*/2);
+  const std::vector<bool> k = {true, true, false}, w = {true, false};
+  r.Step(k, w, 5, 3);
+  r.Step(k, w, 10, 3);
+  EXPECT_EQ(r.prec.stale_count(), 1);
+  r.Step(k, w, 5, 3);
+  EXPECT_EQ(r.prec.stale_count(), 0);
+  EXPECT_FALSE(r.prec.is_stale());
+  EXPECT_EQ(r.prec.last_build().action, Prec::BuildAction::KeptStale);
+  EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(5, 3), kTol));
+  r.Step(k, w, 10, 3);
+  EXPECT_EQ(r.prec.stale_count(), 1);
+  EXPECT_EQ(r.prec.fact_count(), 1);
+}
+
+TEST(KeptFactorization, MethodSwitchIsNeverKept) {
+  // A switch to LDLT with no active-set change: keeping the Cholesky factorization would leave
+  // solve() without an LDLT solver, so the change is refactorized with the new method.
+  KeepRig r(/*refactor_after=*/3);
+  const std::vector<bool> k = {true, true, false}, w = {true, false};
+  r.Step(k, w, 5, 3);
+  r.use_ldlt = true;
+  r.Step(k, w, 10, 3);
+
+  EXPECT_EQ(r.prec.fact_count(), 2);
+  EXPECT_EQ(r.prec.smw_last_reject_reason(), Prec::SmwRejectReason::FactorizationMethodChanged);
+  EXPECT_TRUE(r.prec.last_build().ldlt);
+  EXPECT_FALSE(r.prec.last_build().kept_stale);
+  EXPECT_TRUE(r.Applied().isApprox(r.DensePInverse(10, 3), kTol));
+}

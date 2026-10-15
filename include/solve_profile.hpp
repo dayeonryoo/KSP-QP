@@ -10,7 +10,8 @@
 // SolveProfile (always on) holds a run's totals: its factorizations by reason, SMW updates, PCG
 // failures, and its run time split into disjoint phases that add up to the run time.
 // SolveTrace (opt-in, KSP_QP::trace.enabled) also keeps one row per linear-solver event
-// (factorization, SMW update or reuse, PCG failure), per SSN iteration and per PMM iteration.
+// (factorization, SMW update or reuse, kept factorization, PCG failure), per SSN iteration and per
+// PMM iteration.
 // Every row type lists its columns through visit(f), which calls f(name, value) per column, so
 // the CSV writers (record_result.hpp) and the Python binding share one definition.
 // =================================================================================================
@@ -29,10 +30,10 @@ struct ScopedTimer {
 // capacitance matrix); the event's mu/rho/k/w change flags keep the others.
 enum class FactReason : int {
     Initial,             // first factorization of the run (direct mode: of the direct solver)
-    MuRho,               // mu and/or rho changed since the last factorization
+    MuRho,               // mu and/or rho changed since the last factorization (prec: the refactor_after-th change)
     RankExceeded,        // the active sets moved too far from the last factorization's for an SMW update (rank > 50)
     SingularCapacitance, // the SMW capacitance matrix was (near-)singular or non-finite
-    PcgFailure,          // PCG failed through an SMW-updated preconditioner: rebuilt in full and retried
+    PcgFailure,          // PCG failed through an SMW-updated or stale preconditioner: rebuilt in full and retried
     SmwSuppressed,       // SMW updates off after 5 failures in a row (until the next PMM iteration)
     NoSnapshot,          // nothing to update from (snapshot wiped after a fail streak, or invalidated)
     MethodSwitch,        // switch between Cholesky and LDLT (preconditioner callback, or direct system)
@@ -69,6 +70,7 @@ enum class LinAction : int {
     SmwUpdate, // low-rank update of the last factorization
     SmwReuse,  // the last factorization reused as is (active sets back to its own)
     PcgFail,   // a PCG solve failed (see PcgFailKind)
+    MuRhoKeep, // mu/rho changed; the preconditioner's factorization was kept (KSP_QP::refactor_after)
 };
 enum class PcgFailKind : int { None, PrecFailed, NoConvergence, BadAlloc };
 
@@ -79,6 +81,7 @@ inline const char* to_string(LinAction a) {
         case LinAction::SmwUpdate: return "smw_update";
         case LinAction::SmwReuse:  return "smw_reuse";
         case LinAction::PcgFail:   return "pcg_fail";
+        case LinAction::MuRhoKeep: return "mu_rho_keep";
     }
     return "";
 }
@@ -152,6 +155,7 @@ struct SolveProfile {
     int fact_analyzed = 0; // factorizations that included a symbolic analysis
     int smw_update = 0;    // Newton systems solved through an SMW update instead of a factorization (= smw_count)
     int smw_reuse = 0;     // ... or with the last factorization as is (active sets back to its own)
+    int mu_rho_keep = 0;   // mu/rho changes absorbed without refactorizing the preconditioner
     int pcg_fail = 0;      // failed PCG solves (= krylov_fail)
     int krylov_refine = 0; // Krylov iterations spent in iterative refinement (part of krylov_iter)
     int ls_steepest = 0;   // line searches retried along steepest descent
@@ -170,6 +174,7 @@ struct SolveProfile {
         f("fact_analyzed", fact_analyzed);
         f("smw_update", smw_update);
         f("smw_reuse", smw_reuse);
+        f("mu_rho_keep", mu_rho_keep);
         f("pcg_fail", pcg_fail);
         f("krylov_refine", krylov_refine);
         f("ls_steepest", ls_steepest);
@@ -190,7 +195,7 @@ struct SolveProfile {
     }
 };
 
-// One linear-solver event: a factorization, an SMW update or reuse, or a PCG failure.
+// One linear-solver event: a factorization, an SMW update or reuse, a kept factorization, or a PCG failure.
 template <typename T>
 struct LinEvent {
     int pmm_iter = 0;                      // PMM iteration it happened in (1-based)
@@ -201,6 +206,7 @@ struct LinEvent {
     bool ldlt = false;                     // LDLT (on P_hat or K) rather than Cholesky (on P or S)
     bool analyzed = false;                 // Factorize: included a symbolic analysis
     int rank = -1, h = -1, p = -1, q = -1; // SMW delta against the last factorization (-1: not classified)
+    int stale = 0;                         // prec: mu/rho changes its factorization lags behind, after the event
     T mu = T(0), rho = T(0);
     bool mu_changed = false, rho_changed = false; // since the last factorization or update (prec), or SSN iteration
     bool k_changed = false, w_changed = false;    // active sets changed since the previous SSN iteration
@@ -223,6 +229,7 @@ struct LinEvent {
         f("h", h);
         f("p", p);
         f("q", q);
+        f("stale", stale);
         f("mu", double(mu));
         f("rho", double(rho));
         f("mu_changed", int(mu_changed));
