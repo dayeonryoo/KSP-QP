@@ -13,10 +13,10 @@ Outputs
   OSQP results are kept. Joining the files on "name" and the size columns gives the former combined
   comparison table plus the problem size.
 
-  mm_kspqp.csv also has KSP-QP's factorization log and run-time split (experimental; see
-  include/solve_profile.hpp): fact_<reason> (they add up to fact), smw_update, pcg_fail, ... and
-  t_setup ... t_pmm_other (they add up to ssn_time, the run time). With --trace, KSP-QP's
-  per-event / per-SSN-iteration / per-PMM-iteration rows go to mm_kspqp_trace_{events,ssn,pmm}.csv.
+  mm_kspqp.csv also has ksp_mode (pcg or direct) and KSP-QP's factorization log and run-time split
+  (experimental; see include/solve_profile.hpp): fact_<reason> (they add up to fact), smw_update,
+  pcg_fail, ... and t_setup ... t_pmm_other (they add up to ssn_time, the run time). With --trace,
+  KSP-QP's per-event / per-SSN-iteration / per-PMM-iteration rows go to mm_kspqp_trace_{events,ssn,pmm}.csv.
 
 === HOW TO RUN FROM SCRATCH ===
 
@@ -49,10 +49,12 @@ Settings: tol = 1e-6, time limit = 60 s, max iterations = infinity.
         --tol:        to change the solver tolerance (default: 1e-6).
         --time-limit: to change the solver time limit in seconds (default: 60).
         --cooldown:   to change the cooldown time in seconds between solver runs (default: 0).
+        --direct:     run KSP-QP with its direct solver instead of PCG.
         --trace:      also write KSP-QP's trace files (see Outputs).
 
   Example: rerun KSP-QP only; this prefix's QPALM and OSQP files are kept:
     python3 benchmark_mm.py --solver ksp-qp --out 1015
+    python3 benchmark_mm.py --solver ksp-qp --direct   # direct solver instead of PCG
 """
 
 import sys
@@ -267,9 +269,9 @@ FIELDS = {
                "osqp_run_id", "osqp_timestamp", "osqp_host", "osqp_cpu", "osqp_version"],
 }
 
-# KSP-QP's factorization log and run-time split (experimental; include/solve_profile.hpp), appended
-# to its file: factorizations by reason (fact_*), SMW updates, and the run time by phase (t_*).
-KSPQP_EXTRA = ["ssn_tol_achieved", "linesearch_fail", "krylov_fail", "kkt_ldlt_fact", "schur_chol_fact",
+# KSP-QP's mode and its factorization log and run-time split (experimental; include/solve_profile.hpp),
+# appended to its file: factorizations by reason (fact_*), SMW updates, and the run time by phase (t_*).
+KSPQP_EXTRA = ["ksp_mode", "ssn_tol_achieved", "linesearch_fail", "krylov_fail", "kkt_ldlt_fact", "schur_chol_fact",
                *ksp_qp_bind.profile_columns()]
 FIELDS["ksp-qp"] += KSPQP_EXTRA
 
@@ -277,11 +279,12 @@ FIELDS["ksp-qp"] += KSPQP_EXTRA
 # Subprocess worker functions (each spawned in a fresh process for clean RSS)
 # ---------------------------------------------------------------------------
 
-def _worker_ssn_mm(sif_path, tol, time_limit, max_iter, trace, conn):
+def _worker_ssn_mm(sif_path, tol, time_limit, max_iter, direct, trace, conn):
     result = {}
     try:
         pd_data = ksp_qp_bind.parse_sif(sif_path)
-        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, trace=trace)
+        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit,
+                                                    direct=direct, trace=trace)
     except Exception as e:
         result["error"] = str(e)
     conn.send(result)
@@ -347,6 +350,11 @@ def main() -> None:
         help="Run only these problems (default: all). Their rows are replaced; the others are kept.",
     )
     parser.add_argument(
+        "--direct", action="store_true",
+        help="Run KSP-QP with its experimental direct solver (LDLT on K or "
+             "Cholesky on its Schur complement) instead of PCG",
+    )
+    parser.add_argument(
         "--trace", action="store_true",
         help="Also write KSP-QP's per-event, per-SSN-iteration and per-PMM-iteration rows to "
              "mm_kspqp_trace_{events,ssn,pmm}.csv (experimental; see include/solve_profile.hpp)",
@@ -378,7 +386,9 @@ def main() -> None:
     max_iter   = 10_000_000_000   # effectively infinite for KSP-QP
     eps_inf    = None if args.library_cert_tol else args.inf_tol_factor * tol
 
-    print(f"tol = {tol:g}, time limit = {time_limit:g} s, QPALM/OSQP certificate tolerance = "
+    ksp_mode   = "direct" if args.direct else "pcg"
+
+    print(f"tol = {tol:g}, time limit = {time_limit:g} s, ksp-qp = {ksp_mode}, QPALM/OSQP certificate tolerance = "
           + ("library defaults (QPALM 1e-5, OSQP 1e-4)" if eps_inf is None
              else f"{eps_inf:g} ({args.inf_tol_factor:g} * tol, matching KSP-QP)"))
 
@@ -396,7 +406,7 @@ def main() -> None:
     # Provenance recorded on every row this run writes, per solver.
     prov = provenance()
     run_cols = {
-        "ksp-qp": {"ssn_tol": tol, "ssn_time_limit": time_limit,
+        "ksp-qp": {"ksp_mode": ksp_mode, "ssn_tol": tol, "ssn_time_limit": time_limit,
                    "ssn_run_id": prov["run_id"], "ssn_timestamp": prov["timestamp"],
                    "ssn_host": prov["host"], "ssn_cpu": prov["cpu"], "ssn_git_sha": prov["git_sha"]},
         "qpalm":  {"qpalm_tol": tol, "qpalm_time_limit": time_limit,
@@ -432,7 +442,7 @@ def main() -> None:
         # ---- KSP-QP ------------------------------------------------
         if "ksp-qp" in solvers:
             row: dict = {"name": name, **size}
-            ssn_out = _run_isolated(_worker_ssn_mm, (sif_path, tol, time_limit, max_iter, args.trace))
+            ssn_out = _run_isolated(_worker_ssn_mm, (sif_path, tol, time_limit, max_iter, args.direct, args.trace))
             if "error" in ssn_out:
                 print(f"  KSP-QP : ERROR — {ssn_out['error']}")
                 row.update(ssn_status=-99, ssn_solved=0, ssn_time=np.inf,
@@ -454,7 +464,7 @@ def main() -> None:
                 row["smw_count"]        = r["smw_count"]
                 row["ssn_obj"]          = r["obj_val"]
                 row["pmm_tol_achieved"] = r["pmm_tol_achieved"]
-                row.update({k: r[k] for k in KSPQP_EXTRA})
+                row.update({k: r[k] for k in KSPQP_EXTRA if k != "ksp_mode"})
                 status_str = "OPTIMAL" if r["status"] == 0 else f"status={r['status']}"
                 print(f"  KSP-QP : {status_str:12s}  t = {r['run_time']:.3f} s  "
                       f"pmm={r['pmm_iter']} ssn={r['ssn_iter']} "
