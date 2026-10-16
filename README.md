@@ -598,7 +598,7 @@ including the run's provenance, and a line is printed per solve.
 --time-limit 300       per-problem time limit in seconds
 --M 5 10 20 50 100 200 300   vehicle counts to sweep
 --N 20 50 100 200 400        horizons to sweep
---max-nz 65000         skip (M, N) configurations larger than this nonzero count
+--max-nz 0             skip (M, N) configurations with more variables than this (0: full grid)
 --T 6                  MPC rollout steps per configuration
 --reps 4               timed repeats per instance (repeat 0 is discarded as warm-up)
 --solver {ksp-qp,qpalm} [...]   default: both

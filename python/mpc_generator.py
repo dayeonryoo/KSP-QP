@@ -41,7 +41,8 @@ Mapping to KSP-QP's min c'x + 0.5x'Qx s.t. Ax=b, lw<=Bx<=uw, lx<=x<=ux:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 import scipy.sparse as sp
@@ -113,6 +114,14 @@ class MpcSystem:
     xbar0: np.ndarray
     n_x: int
     n_u: int
+    # Computed once per system: the DARE alone takes ~15 s at M=300.
+    Ad: np.ndarray = field(init=False, repr=False)
+    Bd: np.ndarray = field(init=False, repr=False)
+    P: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.Ad, self.Bd = discretize(self.Ac, self.Bc, self.Ts)
+        self.P = terminal_cost(self.Ad, self.Bd, self.Q, self.R)
 
 
 def discretize(Ac: np.ndarray, Bc: np.ndarray, Ts: float) -> tuple[np.ndarray, np.ndarray]:
@@ -133,6 +142,7 @@ def lqr_gain(Ad: np.ndarray, Bd: np.ndarray, P: np.ndarray, R: np.ndarray) -> np
     return np.linalg.solve(R + Bd.T @ P @ Bd, Bd.T @ P @ Ad)
 
 
+@lru_cache(maxsize=None)    # one system, so one DARE solve, per M
 def platoon_system(M: int) -> MpcSystem:
     """Chain of M coupled double integrators (vehicle platoon), in velocity-
     deviation coordinates relative to a constant-speed lead vehicle (v_0=0
@@ -249,11 +259,8 @@ def generate_mpc_qp(system: MpcSystem, N: int, xbar: np.ndarray,
     if u_ref is None:
         u_ref = np.zeros(n_u)
 
-    Ad, Bd = discretize(system.Ac, system.Bc, system.Ts)
-    P = terminal_cost(Ad, Bd, system.Q, system.R)
-
-    A, b, n_z, col_x, col_u = _build_dynamics(Ad, Bd, xbar, N, n_x, n_u)
-    Q_ksp, c, obj_const = _build_cost(system.Q, system.R, P, N, n_x, n_u, n_z,
+    A, b, n_z, col_x, col_u = _build_dynamics(system.Ad, system.Bd, xbar, N, n_x, n_u)
+    Q_ksp, c, obj_const = _build_cost(system.Q, system.R, system.P, N, n_x, n_u, n_z,
                                        col_x, col_u, x_ref, u_ref)
 
     lx = np.full(n_z, -INF)
@@ -274,5 +281,4 @@ def generate_mpc_qp(system: MpcSystem, N: int, xbar: np.ndarray,
 
 def step_dynamics(system: MpcSystem, x: np.ndarray, u0: np.ndarray) -> np.ndarray:
     """Advance the true (discretized) system state by one control step."""
-    Ad, Bd = discretize(system.Ac, system.Bc, system.Ts)
-    return Ad @ x + Bd @ u0
+    return system.Ad @ x + system.Bd @ u0

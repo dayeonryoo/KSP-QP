@@ -194,7 +194,7 @@ def main() -> None:
     parser.add_argument("--max-M", type=int, default=0,
                         help="Skip section-4 feasibility configs above this vehicle count. "
                              "Default 0 (no cap): verify benchmark_mpc.py's whole default "
-                             "sweep, which is the point of the section and costs ~45s in "
+                             "sweep, which is the point of the section and costs ~1.5 min in "
                              "total. Pass e.g. --max-M 50 for a faster partial run.")
     args = parser.parse_args()
 

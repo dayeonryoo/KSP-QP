@@ -16,7 +16,7 @@ The platoon has two size axes:
 
 QPALM's iteration count grows with both axes while KSP-QP's stays nearly fixed, so
 problems of almost the same size can favor either solver depending on (M, N). The
-benchmark therefore sweeps the (M, N) grid, capped by problem size (--max-nz).
+benchmark therefore sweeps the full (M, N) grid; --max-nz can cap it by problem size.
 
 Scope note: KSP-QP has no warm start, so every solve is a cold start for both solvers
 (QPALM's warm_start() is never called). This measures cold-solve cost on MPC QPs, not
@@ -97,11 +97,9 @@ from benchmark_common import (
 )
 import mpc_generator as mg
 
-# Sweep grid. The cross product is filtered by MAX_NZ, which drops only the
-# top-right corner (large M *and* large N simultaneously).
+# Sweep grid: the full cross product, unless --max-nz caps n_z.
 DEFAULT_M = [5, 10, 20, 50, 100, 200, 300]
 DEFAULT_N = [20, 50, 100, 200, 400]
-MAX_NZ = 65_000
 
 DEFAULT_T = 6               # rollout steps per config
 DEFAULT_REPS = 4            # timed repeats per instance; repeat 0 is discarded
@@ -112,9 +110,9 @@ SOLVER_FILES = {"ksp-qp": "kspqp", "qpalm": "qpalm"}   # results/{prefix}mpc_<ta
 PREFIX = {"ksp-qp": "ssn", "qpalm": "qpalm"}           # column prefix, as in benchmark_mm.py
 
 
-def sweep_configs(M_list=None, N_list=None, max_nz: int = MAX_NZ):
-    """(M, N) pairs of the grid, size-capped. Shared with validate_mpc_generator.py
-    so the validated matrix and the benchmarked matrix cannot drift apart."""
+def sweep_configs(M_list=None, N_list=None, max_nz: int = 0):
+    """(M, N) pairs of the grid, with n_z <= max_nz if max_nz > 0. Shared with
+    validate_mpc_generator.py so the validated matrix and the benchmarked matrix cannot drift apart."""
     M_list = DEFAULT_M if M_list is None else M_list
     N_list = DEFAULT_N if N_list is None else N_list
     out = []
@@ -232,7 +230,8 @@ def generate_trajectory(M: int, N: int, T: int) -> list:
     traj = [xbar.copy()]
     for _ in range(T - 1):
         pdd = mg.generate_mpc_qp(sysm, N, xbar)
-        x = _solve_osqp_x(kspqp_to_qpalm(pdd), 1e-8, 30.0)
+        # Must converge, not time out, or the instances would differ between runs.
+        x = _solve_osqp_x(kspqp_to_qpalm(pdd), 1e-8, 300.0)
         u0 = x[sysm.n_x:sysm.n_x + sysm.n_u]
         xbar = mg.step_dynamics(sysm, xbar, u0)
         traj.append(xbar.copy())
@@ -260,13 +259,12 @@ def _set_high_qos():
         pass
 
 
-def _worker_rollout(M, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_iter,
+def _worker_rollout(sysm, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_iter,
                     solvers, direct, trace, refactor_ratio, conn):
     rows = {s: [] for s in solvers}
     traces = []  # (step and repeat, KSP-QP's trace tables) per traced solve
     try:
         _set_high_qos()
-        sysm = mg.platoon_system(M)
 
         # Spin briefly so the scheduler promotes us off an efficiency core before
         # the first timed solve.
@@ -371,8 +369,9 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
 
     xbar_source = generate_trajectory(M, N, T) if loop_mode == "shared" else sysm.xbar0
 
+    # Pass sysm itself, so the worker doesn't solve the DARE again.
     out = _run_isolated(_worker_rollout,
-                        (M, N, loop_mode, xbar_source, T, reps, tol, time_limit,
+                        (sysm, N, loop_mode, xbar_source, T, reps, tol, time_limit,
                          max_iter, solvers, direct, bool(trace_paths), refactor_ratio))
     if "error" in out:
         print(f"    ERROR - {out['error']}", flush=True)
@@ -418,9 +417,8 @@ def main() -> None:
                         help="Platoon vehicle counts (grid rows)")
     parser.add_argument("--N", type=int, nargs="+", default=DEFAULT_N,
                         help="Horizon lengths (grid columns)")
-    parser.add_argument("--max-nz", type=int, default=MAX_NZ,
-                        help="Skip (M,N) combinations above this n_z (0 = no cap). "
-                             "Only trims the large-M-and-large-N corner.")
+    parser.add_argument("--max-nz", type=int, default=0,
+                        help="Skip (M,N) combinations above this n_z (default 0: no cap, the full grid)")
     parser.add_argument("--T", type=int, default=DEFAULT_T,
                         help="Rollout steps per configuration")
     parser.add_argument("--reps", type=int, default=DEFAULT_REPS,
