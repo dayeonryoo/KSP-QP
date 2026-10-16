@@ -160,12 +160,15 @@ typename SSN<T>::Vec SSN<T>::solve_using_cg(const SpMat& G, const SpMat& G_tr, c
     cg_rhs_.noalias() = G * cg_Hinv_r1_ + r2;
     const Vec& rhs = cg_rhs_;
 
-    // The absolute target as Eigen's relative tolerance, floored at tol.
+    // The absolute target as Eigen's relative tolerance.
     if (krylov_abs_tol_ > T(0)) {
         const T rhs_norm = rhs.norm();
-        if (rhs_norm > T(0)) tol = std::max(krylov_abs_tol_ / rhs_norm, tol);
+        if (rhs_norm > T(0)) tol = krylov_abs_tol_ / rhs_norm;
     }
-    if (!in_refinement_) it_state_.krylov_rtol = static_cast<double>(tol);
+    if (!in_refinement_) {
+        it_state_.krylov_rtol = static_cast<double>(tol);
+        if (krylov_abs_tol_ > T(0)) it_state_.krylov_atol = static_cast<double>(krylov_abs_tol_);
+    }
     cg.setTolerance(tol);
     cg.setMaxIterations(max_iter);
 
@@ -905,16 +908,19 @@ typename SSN<T>::PrepResult SSN<T>::prepare_newton_system() {
 }
 
 template <typename T>
-typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_residual) {
-    // Iterative refinement: correct the residual of K [dx;dy] = [r1_;r2_], K = [-H, G^T; G, (1/mu)I].
-    // The residual after the last of refine_max_iter corrections is measured only if need_final_residual.
+typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_residual, T newton_target) {
+    // Iterative refinement: correct the residual of K [dx;dy] = [r1_;r2_], K = [-H, G^T; G, (1/mu)I], until
+    // newton_res <= newton_target if that is positive, else until the KKT test passes.
+    // The residual after the last of refine_max_iter corrections is measured only if need_final_residual or newton_target > 0.
     SSN_TIMER_BLOCK(it_.refine);
     const int s = static_cast<int>(r2_.size());
     const T ref_norm = std::max(inf_norm(r1_), inf_norm(r2_));
     T res_norm = std::numeric_limits<T>::quiet_NaN();
+    T e = std::numeric_limits<T>::quiet_NaN();
     Vec rho1(N), rho2(s);
 
-    const int last_k = need_final_residual ? refine_max_iter : refine_max_iter - 1;
+    const bool newton = newton_target > T(0);
+    const int last_k = (need_final_residual || newton) ? refine_max_iter : refine_max_iter - 1;
     for (int k = 0; k <= last_k; ++k) {
         const auto dx_k = dxdy_.head(N);
         const auto dy_k = dxdy_.tail(s);
@@ -924,7 +930,9 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
         rho2 = r2_ - G_dx_ - dy_k / mu;
 
         res_norm = std::max(inf_norm(rho1), inf_norm(rho2));
-        if (res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol) || k == refine_max_iter) break;
+        if (newton) e = newton_residual_norm(rho1, rho2);
+        const bool met = newton ? e <= newton_target : res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol);
+        if (met || k == refine_max_iter) break;
 
         prev_dy_.resize(0); // cold-start for iterative refinement
         in_refinement_ = true;
@@ -934,19 +942,21 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
         dxdy_ += correction;
         prev_dy_ = dxdy_.tail(s); // warm-start for the next SSN iteration's main solve
     }
-    return {res_norm, ref_norm};
+    return {res_norm, ref_norm, e};
 }
 
 template <typename T>
 T SSN<T>::newton_residual_norm() {
-    // From the KKT residual (rho1, rho2) of dxdy_: e_x = rho1 - mu G^T D rho2, e_W = -((1 - alpha) / alpha) rho2_W,
-    // with D = 1 on A rows and 1/alpha on active-W rows; e is 0 on inactive W.
     const int s = static_cast<int>(r2_.size());
     const auto dx = dxdy_.head(N);
     const auto dy = dxdy_.tail(s);
-    Vec rho1 = r1_ + H_diag.cwiseProduct(dx) - G_tr * dy;
-    Vec rho2 = r2_ - G * dx - dy / mu;
+    return newton_residual_norm(r1_ + H_diag.cwiseProduct(dx) - G_tr * dy, r2_ - G * dx - dy / mu);
+}
 
+template <typename T>
+T SSN<T>::newton_residual_norm(Vec rho1, Vec rho2) {
+    // From the KKT residual (rho1, rho2) of dxdy_: e_x = rho1 - mu G^T D rho2, e_W = -((1 - alpha) / alpha) rho2_W,
+    // with D = 1 on A rows and 1/alpha on active-W rows; e is 0 on inactive W.
     T e_W = T(0);
     for (int i = 0, k = M; i < l; ++i)
         if (active_W(i)) e_W = std::max(e_W, std::abs((1 - alpha) / alpha * rho2(k++)) * D1B_diag_inv(i));
@@ -957,29 +967,62 @@ T SSN<T>::newton_residual_norm() {
 }
 
 template <typename T>
+bool SSN<T>::full_step_keeps_active_sets() {
+    // At the full step, u = z/mu + x and v = Bx + ((1 - alpha) y2 - y2_k)/mu stay on their side (below, inside, above)
+    // of their bounds, with compute_subgrad_and_dist()'s conventions: K is inside iff l < u < h, W iff l <= v <= h.
+    auto side_K = [](T u, T lo, T hi) { return u <= lo ? -1 : (u >= hi ? 1 : 0); };
+    auto side_W = [](T v, T lo, T hi) { return v < lo ? -1 : (v > hi ? 1 : 0); };
+    const auto dx = dxdy_.head(N);
+    for (int i = 0; i < N; ++i)
+        if (side_K(u_(i), lx(i), ux(i)) != side_K(u_(i) + dx(i), lx(i), ux(i))) return false;
+    if (l == 0) return true;
+
+    Vec dy2(l);
+    retrieve_row_order(dxdy_.tail(n_active_W), dy2_inactive_W_.head(n_inactive_W), active_W, dy2);
+    const Vec v1 = v_ + B * dx + ((1 - alpha) / mu) * dy2;
+    for (int i = 0; i < l; ++i)
+        if (side_W(v_(i), lw(i), uw(i)) != side_W(v1(i), lw(i), uw(i))) return false;
+    return true;
+}
+
+template <typename T>
 void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed) {
     SSN_TIMER_BLOCK(it_.linear_solve);
+    // In solve_ssn(), PCG aims at newton_res <= kappa * g, g = max(ssn_tol, ||grad M||); refinement goes on to
+    // kappa * ssn_tol only if the full step keeps the active sets, the one step that can end the SSN loop.
+    const bool armed = ssn_tol_cur_ > T(0) && !(direct_solve || pcg_failed);
+    const T g = std::max(ssn_tol_cur_, grad_cur_);
+    if (armed) krylov_abs_tol_ = krylov_tol_factor * g / mu;
+
     // Solve for dx and dy2_active_W.
     dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
 
-    // An SMW-updated direct solve is kept only if refinement brings its KKT residual within
-    // direct_smw_accept_tol; otherwise refactorize and solve again (cf. the preconditioner's retry after a
-    // PCG failure). A NaN residual fails the check.
-    const bool used_smw = direct_smw_enabled() && direct_smw_.active();
-    const RefineResult refined = iterative_refine_dxdy(/*need_final_residual=*/used_smw);
-    if (used_smw) {
-        if (refined.res_norm <= std::max(direct_smw_accept_tol * refined.ref_norm, refine_abs_tol)) {
-            direct_smw_.reset_fail_streak();
-        } else {
-            ++direct_smw_reject;
-            direct_smw_.record_failure();
-            direct_force_full_ = direct_stale_ = true;
-            direct_pending_reason_ = FactReason::SmwResidual;
-            dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
-            iterative_refine_dxdy();
+    if (armed && !pcg_failed) {
+        const bool keeps = full_step_keeps_active_sets();
+        it_state_.on_piece = keeps ? 1 : 0;
+        const T target = krylov_tol_factor * (keeps ? ssn_tol_cur_ : g);
+        krylov_abs_tol_ = target / mu;
+        it_state_.newton_res = static_cast<double>(iterative_refine_dxdy(/*need_final_residual=*/false, target).newton_res);
+    } else {
+        // An SMW-updated direct solve is kept only if refinement brings its KKT residual within
+        // direct_smw_accept_tol; otherwise refactorize and solve again (cf. the preconditioner's retry after a
+        // PCG failure). A NaN residual fails the check.
+        const bool used_smw = direct_smw_enabled() && direct_smw_.active();
+        const RefineResult refined = iterative_refine_dxdy(/*need_final_residual=*/used_smw);
+        if (used_smw) {
+            if (refined.res_norm <= std::max(direct_smw_accept_tol * refined.ref_norm, refine_abs_tol)) {
+                direct_smw_.reset_fail_streak();
+            } else {
+                ++direct_smw_reject;
+                direct_smw_.record_failure();
+                direct_force_full_ = direct_stale_ = true;
+                direct_pending_reason_ = FactReason::SmwResidual;
+                dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
+                iterative_refine_dxdy();
+            }
         }
+        if (trace_ && trace_->enabled) it_state_.newton_res = static_cast<double>(newton_residual_norm());
     }
-    if (trace_ && trace_->enabled) it_state_.newton_res = static_cast<double>(newton_residual_norm());
 
     // Split dxdy_ into dx_ and dy2_active_W.
     dx_ = dxdy_.head(N);
@@ -1103,12 +1146,15 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
     T prev_tol_achieved = inf;
     int stagnation = 0;
 
-    // PCG's absolute target: the gradient a step leaves is about mu G^T times the Schur residual.
-    krylov_abs_tol_ = krylov_tol_factor * ssn_tol / mu;
+    // Arms solve_newton_direction()'s targets; the gradient a step leaves is about mu G^T times the Schur residual.
+    ssn_tol_cur_ = ssn_tol;
 
     // Useful matvecs
     Ax_ssn_.noalias() = A * x_cur_;
     Bx_ssn_.noalias() = B * x_cur_;
+
+    // ||grad M|| at the start point; tol_achieved keeps the previous solve's value until the first step.
+    grad_cur_ = compute_grad_Lagrangian_unscaled_inf_norm(compute_grad_Lagrangian(x_cur_, y2_cur_, Ax_ssn_, Bx_ssn_));
 
     // SSN main loop
     while (_iter < ssn_max_in_iter) {
@@ -1132,6 +1178,7 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
         }
 
         update_iterate(ls.tau, _iter);
+        grad_cur_ = tol_achieved;
         _iter++;
 
         if (what == PrintWhat::SSN) {
@@ -1157,6 +1204,7 @@ void SSN<T>::solve_ssn(const T ssn_tol) {
     y2 = y2_cur_;
     opt = *_opt;
     iter = _iter;
+    ssn_tol_cur_ = krylov_abs_tol_ = T(0);
 }
 
 // ===================== factorization log and run-time split (solve_profile.hpp) =====================
@@ -1343,7 +1391,9 @@ void SSN<T>::end_iteration(SsnLsOutcome outcome, T tau, T ssn_tol) {
     row.krylov_refine = it_state_.krylov_refine;
     row.pcg_err = it_state_.pcg_err;
     row.krylov_rtol = it_state_.krylov_rtol;
+    row.krylov_atol = it_state_.krylov_atol;
     row.newton_res = it_state_.newton_res;
+    row.on_piece = it_state_.on_piece;
     row.ls_outcome = outcome;
     row.ls_steepest = it_state_.ls_steepest;
     row.tau = tau;

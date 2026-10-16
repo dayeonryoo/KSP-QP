@@ -1658,6 +1658,34 @@ TEST(SolveNewtonDirection, IterativeRefinementCorrectsArtificiallyInjectedError)
   EXPECT_TRUE(ns.prev_dy_.isApprox(ns.dxdy_.tail(s)));
 }
 
+// With a newton_target, refinement stops once newton_res meets it, and corrects nothing if it already does.
+TEST(IterativeRefineDxdy, StopsAtTheNewtonTarget) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
+  Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
+  ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, 1.0, 1.0, 0.95, 0);
+  ns.x_cur_ = Vec(3);
+  ns.x_cur_ << 5.0, 0.0, 0.0;
+  ns.y2_cur_ = Vec::Zero(2);
+  ns.Ax_ssn_ = Vec::Constant(1, 5.0);
+  ns.Bx_ssn_ = Vec::Zero(2);
+  auto prep = ns.prepare_newton_system();
+  ns.solve_newton_direction(prep.update_prec, prep.prec_pattern_changed);
+  ns.dxdy_ += Vec::Constant(ns.dxdy_.size(), 1e-6);
+  const double e0 = ns.newton_residual_norm();
+  ASSERT_GT(e0, 1e-8);
+
+  const Vec corrupted = ns.dxdy_;
+  const auto met = ns.iterative_refine_dxdy(/*need_final_residual=*/false, /*newton_target=*/2 * e0);
+  EXPECT_TRUE(ns.dxdy_ == corrupted);
+  EXPECT_NEAR(met.newton_res, e0, 1e-12 * e0);
+
+  const auto refined = ns.iterative_refine_dxdy(/*need_final_residual=*/false, /*newton_target=*/1e-3 * e0);
+  EXPECT_LE(refined.newton_res, 1e-3 * e0);
+  EXPECT_NEAR(ns.newton_residual_norm(), refined.newton_res, 1e-12 * e0);  // measured on the final dxdy_
+}
+
 // ===================== newton_residual_norm =====================
 
 // For any dxdy_, the norm equals ||J du + grad M|| built densely from M's gradient and generalized Jacobian,
@@ -1741,12 +1769,77 @@ TEST(NewtonResidualNorm, MatchesTheDenseNewtonResidual) {
 
   ASSERT_GT(expected, 1e-3);
   EXPECT_NEAR(ns.newton_residual_norm(), expected, 1e-10 * expected);
+  // ... and so does the overload refinement uses, from the KKT residual (rho1, rho2) of dxdy_.
+  const Vec rho1 = ns.r1_ + ns.H_diag.cwiseProduct(dx) - ns.G_tr * ns.dxdy_.tail(s);
+  const Vec rho2 = ns.r2_ - ns.G * dx - ns.dxdy_.tail(s) / mu;
+  EXPECT_NEAR(ns.newton_residual_norm(rho1, rho2), expected, 1e-10 * expected);
 
   // With the x block scaled away (ns reads f.D2_ext_inv by reference), the W block alone decides.
   f.D2_ext_inv *= 1e-12;
   const double expected_W = e_y.cwiseProduct(f.D1B_diag_inv).cwiseAbs().maxCoeff();
   ASSERT_GT(expected_W, 100 * e_x.cwiseProduct(f.D2_ext_inv).cwiseAbs().maxCoeff());
   EXPECT_NEAR(ns.newton_residual_norm(), expected_W, 1e-10 * expected_W);
+}
+
+// ===================== full_step_keeps_active_sets =====================
+
+namespace {
+
+// prepare_newton_system() at x_cur_ = x with Bx_ssn_ = Bx, y1 = y2 = z = 0 and mu = rho = 1.
+void PrepareAt(SSN<double>& ns, const Vec& x, const Vec& Bx) {
+  ns.update_ssn_system(Vec::Zero(3), Vec::Zero(1), Vec::Zero(2), Vec::Zero(3), Vec::Zero(1), Vec::Zero(3),
+                       1.0, 1.0, 0.95, 0);
+  ns.x_cur_ = x;
+  ns.y2_cur_ = Vec::Zero(2);
+  ns.Ax_ssn_ = ns.A * x;
+  ns.Bx_ssn_ = Bx;
+  ns.prepare_newton_system();
+}
+
+bool KeepsWith(SSN<double>& ns, std::initializer_list<double> dxdy) {
+  ns.dxdy_.resize(static_cast<int>(dxdy.size()));
+  int k = 0;
+  for (double d : dxdy) ns.dxdy_(k++) = d;
+  return ns.full_step_keeps_active_sets();
+}
+
+}  // namespace
+
+TEST(FullStepKeepsActiveSets, InteriorStepKeepsThem) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  PrepareAt(ns, Vec::Zero(3), Vec::Zero(2));
+  ASSERT_EQ(ns.n_active_W, 0);
+  EXPECT_TRUE(KeepsWith(ns, {0.1, -0.2, 0.3, 0.5}));
+}
+
+TEST(FullStepKeepsActiveSets, KComponentCrossingItsUpperBoundChangesThem) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  PrepareAt(ns, Vec::Zero(3), Vec::Zero(2));
+  EXPECT_FALSE(KeepsWith(ns, {0.0, 0.0, 1.5, 0.0}));  // x2 is in no W row
+}
+
+TEST(FullStepKeepsActiveSets, KComponentOnABoundMovingInwardChangesThem) {
+  SsnFixture f(DefaultA(), DefaultB());
+  SSN<double> ns = f.Make();
+  Vec x(3);
+  x << 0.0, 0.0, 1.0;  // u = x on ux, outside K's open box
+  PrepareAt(ns, x, Vec::Zero(2));
+  EXPECT_FALSE(KeepsWith(ns, {0.0, 0.0, -0.5, 0.0}));
+}
+
+TEST(FullStepKeepsActiveSets, WRowJumpingAcrossItsBoxChangesThemThoughActiveAtBothEnds) {
+  SsnFixture f(DefaultA(), DefaultB());
+  f.lx(0) = -std::numeric_limits<double>::infinity();  // x0 free in K, so only W row 0 can change
+  f.ux(0) = std::numeric_limits<double>::infinity();
+  SSN<double> ns = f.Make();
+  Vec Bx(2);
+  Bx << -5.0, 0.0;  // W row 0 below lw = -1
+  PrepareAt(ns, Vec::Zero(3), Bx);
+  ASSERT_EQ(ns.n_active_W, 1);
+  EXPECT_TRUE(KeepsWith(ns, {1.0, 0.0, 0.0, 0.0, 0.0}));    // v(0): -5 -> -4, still below
+  EXPECT_FALSE(KeepsWith(ns, {10.0, 0.0, 0.0, 0.0, 0.0}));  // v(0): -5 -> 5, below to above
 }
 
 // ===================== solve_using_ldlt =====================
@@ -2199,20 +2292,22 @@ TEST(SolveUsingCg, AbsoluteTargetBoundsTheSchurResidual) {
   EXPECT_LT(sys.SchurResidual(sol.tail(10), ns.mu).norm(), ns.krylov_abs_tol_);
 }
 
-// The relative tolerance passed in is the floor of the target's, and the whole tolerance when unarmed.
-TEST(SolveUsingCg, AbsoluteTargetIsFlooredAtTheRelativeTolerance) {
+// An armed target has no floor; unarmed, the relative tolerance passed in is the whole tolerance.
+TEST(SolveUsingCg, AbsoluteTargetHasNoFloor) {
   const CgSystem sys(10, 6);
   SsnFixture f(sys.G, SpMat(0, 6));
   SSN<double> tiny = f.Make(), unarmed = f.Make();
   SetUpForCgSystem(tiny);
   SetUpForCgSystem(unarmed);
-  tiny.krylov_abs_tol_ = 1e-30;
+  tiny.krylov_abs_tol_ = 1e-14 * sys.SchurResidual(Vec::Zero(10), tiny.mu).norm();
 
   sys.Solve(tiny, tiny.krylov_tol, tiny.krylov_max_in_iter);
   sys.Solve(unarmed, 1e-8, unarmed.krylov_max_in_iter);
 
-  EXPECT_EQ(tiny.it_state_.krylov_rtol, tiny.krylov_tol);
+  EXPECT_NEAR(tiny.it_state_.krylov_rtol, 1e-14, 1e-20);  // below krylov_tol = 1e-12, the old floor
+  EXPECT_EQ(tiny.it_state_.krylov_atol, tiny.krylov_abs_tol_);
   EXPECT_EQ(unarmed.it_state_.krylov_rtol, 1e-8);
+  EXPECT_TRUE(std::isnan(unarmed.it_state_.krylov_atol));
   EXPECT_FALSE(tiny.pcg_failed);
   EXPECT_FALSE(unarmed.pcg_failed);
 }
@@ -3072,19 +3167,35 @@ TEST(SolveSsn, DirectModeConvergesToStrictlyInteriorMinimizerWithNoEqualityOrIne
   EXPECT_EQ(ns.krylov_iter, 0);
 }
 
-TEST(SolveSsn, ArmsThePcgAbsoluteTargetFromSsnTolAndMu) {
+// The main solve aims at 0.1 * max(ssn_tol, ||grad M||) / mu, and refinement goes on to 0.1 * ssn_tol only where the
+// full step keeps the active sets; solve_ssn() disarms the targets on exit.
+TEST(SolveSsn, TargetsTheGradientAndRefinesToSsnTolOnlyOnThePiece) {
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
-  EXPECT_EQ(ns.krylov_abs_tol_, 0.0);  // unarmed until solve_ssn()
+  SolveTrace<double> trace;
+  trace.enabled = true;
+  ns.trace_ = &trace;
   Vec x0(3);
   x0 << 0.3, 0.3, 0.3;
+  const double mu = 4.0, ssn_tol = 1e-5;
   ns.update_ssn_system(x0, Vec::Zero(1), Vec::Zero(2), Vec::Zero(3), Vec::Zero(1), Vec::Zero(3),
-                       /*mu=*/4.0, /*rho=*/1.0, /*alpha=*/0.95, 0);
+                       mu, /*rho=*/1.0, /*alpha=*/0.95, 0);
+  const Vec Ax0 = f.A * x0, Bx0 = f.B * x0;
+  const double g0 = ns.compute_grad_Lagrangian_unscaled_inf_norm(ns.compute_grad_Lagrangian(x0, Vec::Zero(2), Ax0, Bx0));
 
-  ns.solve_ssn(/*ssn_tol=*/1e-5);
+  ns.solve_ssn(ssn_tol);
 
   EXPECT_EQ(ns.opt, SSN<double>::TerminationStatus::Optimal);
-  EXPECT_DOUBLE_EQ(ns.krylov_abs_tol_, 0.1 * 1e-5 / 4.0);
+  ASSERT_FALSE(trace.ssn.empty());
+  EXPECT_DOUBLE_EQ(trace.ssn.front().krylov_atol, 0.1 * std::max(ssn_tol, g0) / mu);
+  double g_before = g0;
+  for (const auto& row : trace.ssn) {
+    ASSERT_TRUE(row.on_piece == 0 || row.on_piece == 1);
+    EXPECT_LE(row.newton_res, 0.1 * (row.on_piece == 1 ? ssn_tol : std::max(ssn_tol, g_before)));
+    g_before = row.grad_norm;
+  }
+  EXPECT_EQ(ns.krylov_abs_tol_, 0.0);
+  EXPECT_EQ(ns.ssn_tol_cur_, 0.0);
 }
 
 // ===================== kept preconditioner factorization (refactor_ratio) =====================

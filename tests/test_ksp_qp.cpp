@@ -2013,7 +2013,11 @@ TEST(KspQpSolveProfile, TraceRowsMatchTheCountersAndLeaveTheResultsUnchanged) {
       EXPECT_GE(row.newton_res, 0.0);  // NaN fails
       if (std::isfinite(row.krylov_rtol)) {
         ++rtol_rows;
-        EXPECT_GE(row.krylov_rtol, 1e-12);  // krylov_tol, the floor
+        EXPECT_GT(row.krylov_rtol, 0.0);
+        EXPECT_GT(row.krylov_atol, 0.0);  // NaN fails
+        EXPECT_TRUE(row.on_piece == 0 || row.on_piece == 1);
+      } else {
+        EXPECT_EQ(row.on_piece, -1);
       }
     }
     EXPECT_EQ(steps, sol.ssn_iter);
