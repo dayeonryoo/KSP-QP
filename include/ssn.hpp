@@ -262,21 +262,20 @@ public:
     Eigen::Index chol_nnz_at_analyze_ = -1; // S's nonzero count at the last analyzePattern; a mismatch forces re-analysis.
     Vec chol_Hinv_r1_, chol_rhs_;           // size n, s
 
-    // SMW low-rank updates of the direct solver (direct mode only; see schur_smw_update.hpp). Every full
-    // factorization of K or S is recorded as a snapshot; a later Newton system whose active sets differ from
+    // SMW low-rank updates of the direct solver (direct mode and the PCG fallback; see schur_smw_update.hpp). Every
+    // full factorization of K or S is recorded as a snapshot; a later Newton system whose active sets differ from
     // the snapshot's by a low-rank delta (and with the same mu, rho) is solved through that factorization
-    // instead of refactorizing. The result is kept only if iterative refinement brings its KKT residual within
-    // direct_smw_accept_tol; otherwise the system is refactorized (see solve_newton_direction()).
-    bool direct_smw = true;           // True means use SMW updates when direct_solve is set; false refactorizes on every change.
-    T direct_smw_accept_tol = 1e-10;  // Relative KKT residual (after refinement) up to which an SMW-updated solve is kept (refine_rel_tol's default).
+    // instead of refactorizing. The result is kept only if iterative refinement meets its target; otherwise
+    // the system is refactorized (see solve_newton_direction()).
+    bool direct_smw = true;           // True means the direct solver uses SMW updates; false refactorizes on every change.
     int direct_smw_count = 0;         // Newton systems set up as SMW updates (not included in fact).
-    int direct_smw_reject = 0;        // SMW-updated solves rejected by the residual check and refactorized.
+    int direct_smw_reject = 0;        // SMW-updated solves whose refinement missed its target, refactorized.
     SchurSmwUpdate<T> direct_smw_;    // Snapshot of the last full factorization and the current update.
     bool direct_stale_ = true;        // True means the Newton matrix changed since the direct solver was last set up for it.
     bool direct_force_full_ = false;  // True means the next direct setup must refactorize (an SMW result was rejected).
     Vec direct_smw_Hinv_r1_, direct_smw_rhs_, direct_smw_dy_; // size n, s, s
     Vec direct_smw_pad_;              // size of K for the LDLT base solve
-    bool direct_smw_enabled() const { return direct_solve && direct_smw; }
+    bool direct_smw_enabled() const { return (direct_solve || pcg_failed) && direct_smw; }
 
     SSN(const int Q_info, const Vec& Q_diag, const SpMat& L,
         const SpMat& A, const SpMat& B, const SpMat& A_tr, const SpMat& B_tr,
@@ -385,8 +384,9 @@ public:
     typename SchurSmwUpdate<T>::BaseSolve direct_base_solve(bool use_ldlt);
 
     // iterative_refine_dxdy()'s last measured residual max(||rho1||_inf, ||rho2||_inf), its reference
-    // max(||r1||_inf, ||r2||_inf) and, when it stops on newton_target, the last newton_res.
-    struct RefineResult { T res_norm; T ref_norm; T newton_res = std::numeric_limits<T>::quiet_NaN(); };
+    // max(||r1||_inf, ||r2||_inf), when it stops on newton_target the last newton_res, and whether the last
+    // measured residual met the target.
+    struct RefineResult { T res_norm; T ref_norm; T newton_res = std::numeric_limits<T>::quiet_NaN(); bool met = false; };
     RefineResult iterative_refine_dxdy(bool need_final_residual = false, T newton_target = 0);
     T newton_residual_norm(); // ||J du + grad M|| of dxdy_, in tol_achieved's norm
     T newton_residual_norm(Vec rho1, Vec rho2); // ... from dxdy_'s KKT residual (rho1, rho2)

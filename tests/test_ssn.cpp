@@ -1437,35 +1437,69 @@ TEST(DirectSmw, FlipOfAColumnEmptyInTheSnapshotsGIsSolvedExactlyOnBothBases) {
   }
 }
 
-TEST(DirectSmw, UpdateFailingTheResidualCheckIsRefactorizedAndStillSolved) {
+// After a PCG failure, the direct solver updates its factorization through SMW as in direct mode.
+TEST(DirectSmw, PcgFallbackUsesTheUpdatesToo) {
   for (const bool use_ldlt : {false, true}) {
     SCOPED_TRACE(use_ldlt ? "LDLT on K" : "Cholesky on S");
     SsnFixture f(DefaultA(), DefaultB());
     SSN<double> ns = f.Make();
     SetUpDirectModeDefaultState(ns);
+    ns.direct_solve = false;
+    ns.pcg_failed = true;
     PinDirectSystem(ns, use_ldlt);
-    ns.direct_smw_accept_tol = -1.0;  // no residual passes the check
-    ns.refine_abs_tol = -1.0;
-    Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
-    Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
 
     DirectStep(ns, {false, true, true}, {false, false});
-    ASSERT_EQ(ns.fact, 1);
-
-    DirectStep(ns, {false, false, true}, {false, false});
     ExpectNewtonSystemSolved(ns);
-    EXPECT_EQ(ns.direct_smw_count, 1);
-    EXPECT_EQ(ns.direct_smw_reject, 1);
-    EXPECT_EQ(ns.fact, 2);  // the rejected update was replaced by a factorization of the current system
-    EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::Initial)], 1);
-    EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::SmwResidual)], 1);
-    EXPECT_EQ(ns.profile_.smw_update, 1);
-    EXPECT_FALSE(ns.direct_smw_.active());
-    EXPECT_EQ(ns.direct_smw_.fail_streak(), 1);
+    ASSERT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::DirectFallback)], 1);
+    EXPECT_TRUE(ns.direct_smw_.has_snapshot());
 
-    // A new PMM iteration clears the fail streak.
-    ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, /*mu=*/1.0, /*rho=*/1.0, 0.95, 1);
-    EXPECT_EQ(ns.direct_smw_.fail_streak(), 0);
+    DirectStep(ns, {false, false, true}, {false, false});  // column 1 leaves active_K
+    ExpectNewtonSystemSolved(ns);
+    EXPECT_EQ(ns.fact, 1);
+    EXPECT_EQ(ns.direct_smw_count, 1);
+    EXPECT_EQ(ns.direct_smw_reject, 0);
+    EXPECT_TRUE(ns.direct_smw_.active());
+    EXPECT_EQ(ns.krylov_iter, 0);
+  }
+}
+
+TEST(DirectSmw, UpdateMissingTheRefinementTargetIsRefactorizedAndStillSolved) {
+  for (const bool fallback : {false, true}) {
+    for (const bool use_ldlt : {false, true}) {
+      SCOPED_TRACE(std::string(fallback ? "PCG fallback, " : "direct mode, ") + (use_ldlt ? "LDLT on K" : "Cholesky on S"));
+      SsnFixture f(DefaultA(), DefaultB());
+      SSN<double> ns = f.Make();
+      SetUpDirectModeDefaultState(ns);
+      if (fallback) {
+        ns.direct_solve = false;
+        ns.pcg_failed = true;
+      }
+      PinDirectSystem(ns, use_ldlt);
+      ns.refine_rel_tol = -1.0;  // no residual meets refinement's target
+      ns.refine_abs_tol = -1.0;
+      Vec x0 = Vec::Zero(3), y10 = Vec::Zero(1), y20 = Vec::Zero(2), z0 = Vec::Zero(3);
+      Vec dy10 = Vec::Zero(1), dz0 = Vec::Zero(3);
+
+      DirectStep(ns, {false, true, true}, {false, false});
+      ASSERT_EQ(ns.fact, 1);
+
+      DirectStep(ns, {false, false, true}, {false, false});
+      ExpectNewtonSystemSolved(ns);
+      EXPECT_EQ(ns.direct_smw_count, 1);
+      EXPECT_EQ(ns.direct_smw_reject, 1);
+      EXPECT_EQ(ns.fact, 2);  // the rejected update was replaced by a factorization of the current system
+      const FactReason first = fallback ? FactReason::DirectFallback : FactReason::Initial;
+      EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(first)], 1);
+      EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::SmwResidual)], 1);
+      EXPECT_EQ(ns.profile_.smw_update, 1);
+      EXPECT_FALSE(ns.direct_smw_.active());
+      EXPECT_EQ(ns.direct_smw_.fail_streak(), 1);
+
+      // A new PMM iteration clears the fail streak.
+      ns.update_ssn_system(x0, y10, y20, z0, dy10, dz0, /*mu=*/1.0, /*rho=*/1.0, 0.95, 1);
+      EXPECT_EQ(ns.direct_smw_.fail_streak(), 0);
+    }
   }
 }
 
@@ -1495,18 +1529,21 @@ TEST(DirectSmw, EmptyGShortCircuitDeactivatesTheUpdate) {
   EXPECT_EQ(ns.direct_smw_count, 1);
 }
 
-TEST(DirectSmw, PcgFailureFallbackNeverSnapshotsOrUpdates) {
-  // Default (PCG) mode after PCG failed: the direct solver refactorizes on every change, as before.
+TEST(DirectSmw, PcgFailureFallbackWithSmwOffNeverSnapshotsOrUpdates) {
+  // Default (PCG) mode after PCG failed, with direct_smw off: the direct solver refactorizes on every change.
   SsnFixture f(DefaultA(), DefaultB());
   SSN<double> ns = f.Make();
   SetUpDirectModeDefaultState(ns);
   ns.direct_solve = false;
   ns.pcg_failed = true;
+  ns.direct_smw = false;
 
   DirectStep(ns, {false, true, true}, {false, false});
   DirectStep(ns, {false, false, true}, {false, false});
   ExpectNewtonSystemSolved(ns);
   EXPECT_EQ(ns.fact, 2);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::DirectFallback)], 1);
+  EXPECT_EQ(ns.profile_.fact_by_reason[static_cast<int>(FactReason::ActiveSetChange)], 1);
   EXPECT_EQ(ns.direct_smw_count, 0);
   EXPECT_FALSE(ns.direct_smw_.has_snapshot());
   EXPECT_EQ(ns.krylov_iter, 0);
@@ -1680,9 +1717,11 @@ TEST(IterativeRefineDxdy, StopsAtTheNewtonTarget) {
   const auto met = ns.iterative_refine_dxdy(/*need_final_residual=*/false, /*newton_target=*/2 * e0);
   EXPECT_TRUE(ns.dxdy_ == corrupted);
   EXPECT_NEAR(met.newton_res, e0, 1e-12 * e0);
+  EXPECT_TRUE(met.met);
 
   const auto refined = ns.iterative_refine_dxdy(/*need_final_residual=*/false, /*newton_target=*/1e-3 * e0);
   EXPECT_LE(refined.newton_res, 1e-3 * e0);
+  EXPECT_TRUE(refined.met);
   EXPECT_NEAR(ns.newton_residual_norm(), refined.newton_res, 1e-12 * e0);  // measured on the final dxdy_
 }
 
@@ -3168,34 +3207,40 @@ TEST(SolveSsn, DirectModeConvergesToStrictlyInteriorMinimizerWithNoEqualityOrIne
 }
 
 // The main solve aims at 0.1 * max(ssn_tol, ||grad M||) / mu, and refinement goes on to 0.1 * ssn_tol only where the
-// full step keeps the active sets; solve_ssn() disarms the targets on exit.
+// full step keeps the active sets, with PCG, in direct mode and after a PCG failure; solve_ssn() disarms the targets on exit.
 TEST(SolveSsn, TargetsTheGradientAndRefinesToSsnTolOnlyOnThePiece) {
-  SsnFixture f(DefaultA(), DefaultB());
-  SSN<double> ns = f.Make();
-  SolveTrace<double> trace;
-  trace.enabled = true;
-  ns.trace_ = &trace;
-  Vec x0(3);
-  x0 << 0.3, 0.3, 0.3;
-  const double mu = 4.0, ssn_tol = 1e-5;
-  ns.update_ssn_system(x0, Vec::Zero(1), Vec::Zero(2), Vec::Zero(3), Vec::Zero(1), Vec::Zero(3),
-                       mu, /*rho=*/1.0, /*alpha=*/0.95, 0);
-  const Vec Ax0 = f.A * x0, Bx0 = f.B * x0;
-  const double g0 = ns.compute_grad_Lagrangian_unscaled_inf_norm(ns.compute_grad_Lagrangian(x0, Vec::Zero(2), Ax0, Bx0));
+  for (const int mode : {0, 1, 2}) {
+    SCOPED_TRACE(mode == 0 ? "PCG" : mode == 1 ? "direct mode" : "PCG fallback");
+    SsnFixture f(DefaultA(), DefaultB());
+    SSN<double> ns = f.Make();
+    ns.direct_solve = mode == 1;
+    ns.pcg_failed = mode == 2;
+    SolveTrace<double> trace;
+    trace.enabled = true;
+    ns.trace_ = &trace;
+    Vec x0(3);
+    x0 << 0.3, 0.3, 0.3;
+    const double mu = 4.0, ssn_tol = 1e-5;
+    ns.update_ssn_system(x0, Vec::Zero(1), Vec::Zero(2), Vec::Zero(3), Vec::Zero(1), Vec::Zero(3),
+                         mu, /*rho=*/1.0, /*alpha=*/0.95, 0);
+    const Vec Ax0 = f.A * x0, Bx0 = f.B * x0;
+    const double g0 = ns.compute_grad_Lagrangian_unscaled_inf_norm(ns.compute_grad_Lagrangian(x0, Vec::Zero(2), Ax0, Bx0));
 
-  ns.solve_ssn(ssn_tol);
+    ns.solve_ssn(ssn_tol);
 
-  EXPECT_EQ(ns.opt, SSN<double>::TerminationStatus::Optimal);
-  ASSERT_FALSE(trace.ssn.empty());
-  EXPECT_DOUBLE_EQ(trace.ssn.front().krylov_atol, 0.1 * std::max(ssn_tol, g0) / mu);
-  double g_before = g0;
-  for (const auto& row : trace.ssn) {
-    ASSERT_TRUE(row.on_piece == 0 || row.on_piece == 1);
-    EXPECT_LE(row.newton_res, 0.1 * (row.on_piece == 1 ? ssn_tol : std::max(ssn_tol, g_before)));
-    g_before = row.grad_norm;
+    EXPECT_EQ(ns.opt, SSN<double>::TerminationStatus::Optimal);
+    ASSERT_FALSE(trace.ssn.empty());
+    if (mode == 0) EXPECT_DOUBLE_EQ(trace.ssn.front().krylov_atol, 0.1 * std::max(ssn_tol, g0) / mu);
+    else EXPECT_EQ(ns.krylov_iter, 0);
+    double g_before = g0;
+    for (const auto& row : trace.ssn) {
+      ASSERT_TRUE(row.on_piece == 0 || row.on_piece == 1);
+      EXPECT_LE(row.newton_res, 0.1 * (row.on_piece == 1 ? ssn_tol : std::max(ssn_tol, g_before)));
+      g_before = row.grad_norm;
+    }
+    EXPECT_EQ(ns.krylov_abs_tol_, 0.0);
+    EXPECT_EQ(ns.ssn_tol_cur_, 0.0);
   }
-  EXPECT_EQ(ns.krylov_abs_tol_, 0.0);
-  EXPECT_EQ(ns.ssn_tol_cur_, 0.0);
 }
 
 // ===================== kept preconditioner factorization (refactor_ratio) =====================

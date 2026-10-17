@@ -41,7 +41,8 @@ int main(int argc, char** argv) {
             "  --direct         experimental: skip PCG and solve the KKT system (LDLT) or its Schur\n"
             "                   complement (Cholesky) exactly, reusing the last factorization through SMW\n"
             "                   low-rank updates while the active sets change little\n"
-            "  --no-direct-smw  with --direct: refactorize on every active-set change instead\n"
+            "  --no-direct-smw  the direct solver (--direct, or after a PCG failure) refactorizes on every\n"
+            "                   active-set change instead of using SMW updates\n"
             "  --refactor-ratio R\n"
             "                   experimental, PCG: keep the preconditioner's factorization across mu/rho\n"
             "                   changes until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R\n"
@@ -69,8 +70,6 @@ int main(int argc, char** argv) {
     int max_iter = cli::get_int(argc, argv, "--max-iter", 3000);
     bool direct = cli::has_flag(argc, argv, "--direct");
     bool direct_smw = !cli::has_flag(argc, argv, "--no-direct-smw");
-    if (!direct_smw && !direct)
-        std::cerr << "WARNING: --no-direct-smw has no effect without --direct\n";
     const double refactor_ratio = cli::get_double(argc, argv, "--refactor-ratio", 1.0);
     if (!(refactor_ratio >= 1.0)) {
         std::cerr << "ERROR: --refactor-ratio must be at least 1\n";
@@ -343,7 +342,7 @@ int main(int argc, char** argv) {
         std::cout << "Direct-solver factorizations: KKT system (LDLT) = " << solver.kkt_ldlt_fact
                   << ", Schur complement (Cholesky) = " << solver.schur_chol_fact << "\n";
     }
-    if (solver.direct_solve && solver.direct_smw) {
+    if ((solver.direct_solve || solver.pcg_failed) && solver.direct_smw) {
         std::cout << "Direct-solver SMW updates: " << solver.direct_smw_count << " used instead of refactorizing, "
                   << solver.direct_smw_reject << " of them rejected and refactorized\n";
     }

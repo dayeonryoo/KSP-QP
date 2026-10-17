@@ -1096,8 +1096,8 @@ Solution<T> KSP_QP<T>::solve() {
     profile.t.setup = setup_time;
     profile.t.pmm_other = solve_time - profile.t.ssn_total();
 
-    // SMW updates of the preconditioner (PCG mode) or of the direct solver's factorization (direct mode);
-    // the direct solver only uses them in direct mode, so the two never mix within a run.
+    // SMW updates of the preconditioner and of the direct solver's factorization (direct mode, or after a PCG
+    // failure, so a run with a fallback has both).
     const int smw_count = NS.smw_count + NS.direct_smw_count;
     return Solution<T>(opt, x_sol, y1_sol, y2_sol, z_sol, obj_val, pmm_iter, ssn_iter, krylov_iter, fact, smw_count, pmm_tol_achieved, ssn_tol_achieved, setup_time, solve_time, linesearch_fail, krylov_fail);
 }

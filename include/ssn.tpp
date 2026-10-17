@@ -323,9 +323,9 @@ typename SSN<T>::Vec SSN<T>::solve_direct(const SpMat& G, const SpMat& G_tr, con
     if (direct_ldlt_decisions_made_ == 0) decide_direct_system(G);
     const bool use_ldlt = direct_use_ldlt || schur_chol_failed_;
 
-    // The Newton matrix changed since the last setup. In direct mode, if the factorization in use would be
-    // redone, first try an SMW update of it against its snapshot. Refinement solves skip this block and
-    // reuse whatever the main solve set up.
+    // The Newton matrix changed since the last setup. If the factorization in use would be redone, first try
+    // an SMW update of it against its snapshot. Refinement solves skip this block and reuse whatever the main
+    // solve set up.
     if (direct_stale_) {
         direct_stale_ = false;
         direct_smw_.deactivate();
@@ -485,7 +485,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_ldlt(const SpMat& G, const Vec& H_diag,
         fact++;
         kkt_ldlt_fact++;
 
-        // Record the factorized K for later SMW updates (direct mode only).
+        // Record the factorized K for later SMW updates.
         if (direct_smw_enabled()) direct_smw_.snapshot(G, H_diag, active_W, mu, rho, /*base_is_ldlt=*/true);
     }
 
@@ -573,7 +573,7 @@ typename SSN<T>::Vec SSN<T>::solve_using_chol(const SpMat& G, const SpMat& G_tr,
                 reason = "not numerically positive definite";
             } else {
                 chol_numeric_dirty_ = false;
-                // Record the factorized S for later SMW updates (direct mode only).
+                // Record the factorized S for later SMW updates.
                 if (direct_smw_enabled()) direct_smw_.snapshot(G, H_diag, active_W, mu, rho, /*base_is_ldlt=*/false);
             }
         } catch (const std::bad_alloc&) {
@@ -917,6 +917,7 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
     const T ref_norm = std::max(inf_norm(r1_), inf_norm(r2_));
     T res_norm = std::numeric_limits<T>::quiet_NaN();
     T e = std::numeric_limits<T>::quiet_NaN();
+    bool met = false;
     Vec rho1(N), rho2(s);
 
     const bool newton = newton_target > T(0);
@@ -931,7 +932,7 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
 
         res_norm = std::max(inf_norm(rho1), inf_norm(rho2));
         if (newton) e = newton_residual_norm(rho1, rho2);
-        const bool met = newton ? e <= newton_target : res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol);
+        met = newton ? e <= newton_target : res_norm <= std::max(refine_rel_tol * ref_norm, refine_abs_tol); // NaN fails
         if (met || k == refine_max_iter) break;
 
         prev_dy_.resize(0); // cold-start for iterative refinement
@@ -942,7 +943,7 @@ typename SSN<T>::RefineResult SSN<T>::iterative_refine_dxdy(bool need_final_resi
         dxdy_ += correction;
         prev_dy_ = dxdy_.tail(s); // warm-start for the next SSN iteration's main solve
     }
-    return {res_norm, ref_norm, e};
+    return {res_norm, ref_norm, e, met};
 }
 
 template <typename T>
@@ -988,41 +989,41 @@ bool SSN<T>::full_step_keeps_active_sets() {
 template <typename T>
 void SSN<T>::solve_newton_direction(bool update_prec, bool prec_pattern_changed) {
     SSN_TIMER_BLOCK(it_.linear_solve);
-    // In solve_ssn(), PCG aims at newton_res <= kappa * g, g = max(ssn_tol, ||grad M||); refinement goes on to
+    // In solve_ssn(), the direction aims at newton_res <= kappa * g, g = max(ssn_tol, ||grad M||); refinement goes on to
     // kappa * ssn_tol only if the full step keeps the active sets, the one step that can end the SSN loop.
-    const bool armed = ssn_tol_cur_ > T(0) && !(direct_solve || pcg_failed);
+    const bool armed = ssn_tol_cur_ > T(0);
     const T g = std::max(ssn_tol_cur_, grad_cur_);
-    if (armed) krylov_abs_tol_ = krylov_tol_factor * g / mu;
 
-    // Solve for dx and dy2_active_W.
-    dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
-
-    if (armed && !pcg_failed) {
+    // Solve for dx and dy2_active_W, then refine (outside solve_ssn(), to the KKT test).
+    bool used_smw = false;
+    auto solve_and_refine = [&]() {
+        if (armed) krylov_abs_tol_ = krylov_tol_factor * g / mu; // PCG only; direct solves are exact
+        dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
+        used_smw = direct_smw_enabled() && direct_smw_.active();
+        if (!armed) return iterative_refine_dxdy(/*need_final_residual=*/used_smw);
         const bool keeps = full_step_keeps_active_sets();
         it_state_.on_piece = keeps ? 1 : 0;
         const T target = krylov_tol_factor * (keeps ? ssn_tol_cur_ : g);
         krylov_abs_tol_ = target / mu;
-        it_state_.newton_res = static_cast<double>(iterative_refine_dxdy(/*need_final_residual=*/false, target).newton_res);
-    } else {
-        // An SMW-updated direct solve is kept only if refinement brings its KKT residual within
-        // direct_smw_accept_tol; otherwise refactorize and solve again (cf. the preconditioner's retry after a
-        // PCG failure). A NaN residual fails the check.
-        const bool used_smw = direct_smw_enabled() && direct_smw_.active();
-        const RefineResult refined = iterative_refine_dxdy(/*need_final_residual=*/used_smw);
-        if (used_smw) {
-            if (refined.res_norm <= std::max(direct_smw_accept_tol * refined.ref_norm, refine_abs_tol)) {
-                direct_smw_.reset_fail_streak();
-            } else {
-                ++direct_smw_reject;
-                direct_smw_.record_failure();
-                direct_force_full_ = direct_stale_ = true;
-                direct_pending_reason_ = FactReason::SmwResidual;
-                dxdy_ = solve_using_cg(G, G_tr, H_diag, H_diag_inv, active_K, r1_, r2_, mu, krylov_tol, krylov_max_in_iter, update_prec, prec_pattern_changed, schur_use_ldlt);
-                iterative_refine_dxdy();
-            }
+        return iterative_refine_dxdy(/*need_final_residual=*/false, target);
+    };
+    RefineResult refined = solve_and_refine();
+
+    // An SMW-updated direct solve is kept only if refinement meets its target; otherwise refactorize and solve
+    // again (cf. the preconditioner's rebuild after a PCG failure).
+    if (used_smw) {
+        if (refined.met) {
+            direct_smw_.reset_fail_streak();
+        } else {
+            ++direct_smw_reject;
+            direct_smw_.record_failure();
+            direct_force_full_ = direct_stale_ = true;
+            direct_pending_reason_ = FactReason::SmwResidual;
+            refined = solve_and_refine();
         }
-        if (trace_ && trace_->enabled) it_state_.newton_res = static_cast<double>(newton_residual_norm());
     }
+    if (armed) it_state_.newton_res = static_cast<double>(refined.newton_res);
+    else if (trace_ && trace_->enabled) it_state_.newton_res = static_cast<double>(newton_residual_norm());
 
     // Split dxdy_ into dx_ and dy2_active_W.
     dx_ = dxdy_.head(N);

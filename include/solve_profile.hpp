@@ -38,8 +38,8 @@ enum class FactReason : int {
     NoSnapshot,          // nothing to update from (snapshot wiped after a fail streak, or invalidated)
     MethodSwitch,        // switch between Cholesky and LDLT (preconditioner callback, or direct system)
     DirectFallback,      // PCG failed for good: first factorization of the direct solver
-    ActiveSetChange,     // direct solver without SMW updates (after a PCG failure, or SMW off): active sets changed
-    SmwResidual,         // direct mode: an SMW-updated solve failed the residual check
+    ActiveSetChange,     // direct solver with SMW updates off: active sets changed
+    SmwResidual,         // direct solver: refinement of an SMW-updated solve missed its target
     CholFailed,          // direct solver: Cholesky on S failed, so LDLT on K takes over
     Other,
     Count,               // number of reasons; also "none" where a reason is pending

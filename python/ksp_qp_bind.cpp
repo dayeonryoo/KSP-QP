@@ -159,8 +159,8 @@ Returns dict:
                       solver factorized (direct mode, or after PCG failed)
   kkt_ldlt_fact     – direct-solver LDLT factorizations of the KKT system
   schur_chol_fact   – direct-solver Cholesky factorizations of the Schur complement
-  direct_smw_count  – direct-mode Newton systems solved through an SMW update (included in smw_count)
-  direct_smw_reject – of those, updates rejected by the residual check and refactorized
+  direct_smw_count  – direct-solver Newton systems solved through an SMW update (included in smw_count)
+  direct_smw_reject – of those, updates whose refinement missed its target, refactorized
   ssn_tol_achieved, linesearch_fail, krylov_fail – as in Solution
   fact_<reason>, smw_update, ..., t_<phase> – the factorization log and run-time split
                       (profile_columns(); see solve_profile.hpp)
@@ -454,11 +454,11 @@ its Schur complement (Cholesky) exactly. system is "S" when only PCG ran, otherw
 by "K" and/or "S" for the systems the direct solver factorized (direct mode, or after PCG failed);
 kkt_ldlt_fact/schur_chol_fact count those factorizations.
 
-direct_smw: default True; only used with direct=True. When True, an SSN iteration whose active
-sets differ little from the last factorization's is solved through a Sherman-Morrison-Woodbury
-update of that factorization instead of refactorizing; direct_smw_count counts those, and
-direct_smw_reject the ones whose residual check failed and were refactorized. When False, every
-change is refactorized.
+direct_smw: default True; used by the direct solver (direct=True, or after a PCG failure). When
+True, an SSN iteration whose active sets differ little from the last factorization's is solved
+through a Sherman-Morrison-Woodbury update of that factorization instead of refactorizing;
+direct_smw_count counts those, and direct_smw_reject the ones whose refinement missed its target
+and were refactorized. When False, every change is refactorized.
 
 refactor_ratio: experimental, default 1; PCG only. The preconditioner keeps its factorization across
 mu/rho changes, with SMW updates on top of it, until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho)

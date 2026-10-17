@@ -267,7 +267,7 @@ n, m, l = pd["n"], pd["m"], pd["l"]
 | `ssn_iter` | `int` | Total SSN inner iterations |
 | `krylov_iter` | `int` | Total Krylov iterations |
 | `fact` | `int` | Factorizations performed (of the preconditioner; of K or S by the direct solver) |
-| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates used instead of refactorizing (of the preconditioner; of the direct solver's factorization in direct mode) |
+| `smw_count` | `int` | Sherman-Morrison-Woodbury low-rank updates used instead of refactorizing (of the preconditioner; of the direct solver's factorization) |
 | `pmm_tol_achieved` | `T` | Final PMM (outer) residual |
 | `ssn_tol_achieved` | `T` | Final SSN (inner) residual |
 | `setup_time` | `double` | Wall-clock seconds in the `KSP_QP<T>` constructor |
@@ -283,22 +283,22 @@ By default each Newton system is solved by PCG on its Schur complement
 through Sherman-Morrison-Woodbury (SMW) low-rank updates (`include/schur_preconditioner.hpp`).
 PCG stops once `‖rhs − S·dy‖₂ < 0.1 · g / μ` (`SSN::krylov_tol_factor`), where g = max(ssn_tol, ‖∇M‖)
 at the current iterate. The 1/μ is there because the gradient a step leaves is about μ·Gᵀ times the
-Schur residual. Iterative refinement on the KKT system then brings the Newton residual ‖J·du + ∇M‖
-to `0.1 · ssn_tol` if the full step keeps the active sets (the one step that can end the SSN loop), and
-to `0.1 · g` otherwise, with at most 3 corrections. Both targets are absolute, with no floor. A solve
-that misses its tolerance is a PCG failure. If PCG fails, the direct solver below takes over for the
-rest of the run. Two public
-`KSP_QP<T>` members select the experimental direct mode instead:
+Schur residual. A solve that misses its tolerance is a PCG failure. If PCG fails, the direct solver
+below takes over for the rest of the run, as in direct mode. With either solver, iterative refinement
+on the KKT system then brings the Newton residual ‖J·du + ∇M‖ to `0.1 · ssn_tol` if the full step keeps
+the active sets (the one step that can end the SSN loop), and to `0.1 · g` otherwise, with at most 3
+corrections. Both targets are absolute, with no floor. Two public `KSP_QP<T>` members control the
+direct solver; `direct_solve` selects the experimental direct mode instead of PCG:
 
 | Member | Default | Description |
 |---|---|---|
 | `direct_solve` | `false` | Skip PCG and solve every Newton system exactly, by LDLT on the KKT matrix `K = [-H, Gᵀ; G, (1/μ) I]` or Cholesky on `S`, whichever is estimated cheaper |
-| `direct_smw` | `true` | With `direct_solve`: when the active sets differ by a few rows/columns from the last factorization's (and μ, ρ are unchanged), solve through an SMW update of that factorization instead of refactorizing (`include/schur_smw_update.hpp`). An update is kept only if iterative refinement brings its relative KKT residual to `1e-10`, the refinement target of a full factorization (`SSN::direct_smw_accept_tol`); otherwise that system is refactorized |
+| `direct_smw` | `true` | In direct mode and after a PCG failure: when the active sets differ by a few rows/columns from the last factorization's (and μ, ρ are unchanged), solve through an SMW update of that factorization instead of refactorizing (`include/schur_smw_update.hpp`). An update is kept only if iterative refinement meets its target; otherwise that system is refactorized |
 
 After `solve()`, `kkt_ldlt_fact` / `schur_chol_fact` count the direct solver's factorizations
 (both included in `Solution::fact`), `direct_smw_count` the Newton systems solved through an SMW
-update instead (included in `Solution::smw_count`), and `direct_smw_reject` the updates that the
-residual check rejected. The SMW updates are not used in the fallback after a PCG failure.
+update instead (included in `Solution::smw_count`), and `direct_smw_reject` the updates whose
+refinement missed its target.
 
 `refactor_ratio` (default `1`; experimental, PCG only) lets the preconditioner keep its factorization
 across μ/ρ changes. SMW updates for active-set changes continue on top of it, built at the
@@ -390,7 +390,8 @@ Pass `--name all` to sweep the set, appending a row per problem to
 `<root>/results/pcg_netlib.csv` or `<root>/results/pcg_infeas.csv`
 (override with `--out`). `--direct` runs the experimental direct mode
 (see ["Linear solver"](#linear-solver-for-the-ssn-newton-systems)) and writes `direct_*.csv`
-instead; `--no-direct-smw` additionally turns its SMW updates off (`direct_nosmw_*.csv`).
+instead; `--no-direct-smw` turns the direct solver's SMW updates off, in direct mode (`direct_nosmw_*.csv`)
+and in the fallback after a PCG failure.
 `--refactor-ratio R` sets `refactor_ratio` (see the same section); with R > 1 the default CSV is
 `pcg_rr<R>_*.csv`. A CSV or trace file written with another header is refused rather than appended to.
 The sweep is the directory listing, so adding or removing an `.mps` file is all it takes to
@@ -758,8 +759,8 @@ drivers' CSVs, as keys of the Python solve functions' dict, and in `mm_kspqp.csv
 | `no_snapshot` | no factorization to update from (snapshot wiped after a fail streak, or invalidated) |
 | `switch` | switch between Cholesky and LDLT (preconditioner callback, or the direct solver's system) |
 | `direct_fallback` | PCG failed for good: first factorization of the direct solver |
-| `active_set` | direct solver without SMW updates (after a PCG failure, or `--no-direct-smw`): the active sets changed |
-| `smw_residual` | direct mode: an SMW-updated solve failed the 1e-10 residual check |
+| `active_set` | direct solver with SMW updates off (`--no-direct-smw`): the active sets changed |
+| `smw_residual` | direct solver: refinement of an SMW-updated solve missed its target |
 | `chol_failed` | Cholesky on S failed, so LDLT on K took over |
 
 When several reasons apply, the first in the order the SMW checks run wins: a forced rebuild,
@@ -805,8 +806,7 @@ The last four columns are informational parts of these phases:
     (`nan` for direct solves);
   - `newton_res`: ‖J·du + ∇M‖ of the direction after refinement, in the norm of the gradient norm. A full step with
     unchanged active sets leaves this gradient;
-  - `on_piece`: 1 if the full Newton step keeps the active sets (refined to `0.1 · ssn_tol`), 0 if not, -1 for
-    direct solves;
+  - `on_piece`: 1 if the full Newton step keeps the active sets (refined to `0.1 · ssn_tol`), 0 if not;
   - the phases.
 - **`pmm`**: one row per PMM iteration. Each row has:
   - the SSN status;

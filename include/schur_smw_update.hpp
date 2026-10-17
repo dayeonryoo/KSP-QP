@@ -15,7 +15,7 @@
 // =================================================================================================
 // Sherman-Morrison-Woodbury (SMW) low-rank update of the exact Schur complement
 //     S = G H^{-1} G^T + (1/mu) I,   G = [A; rows of B in active_W],   H = diag(H_diag),
-// used by SSN's direct solver in direct mode (SSN::direct_solve; see ssn.hpp/.tpp). It mirrors
+// used by SSN's direct solver (direct mode and the PCG fallback; see ssn.hpp/.tpp). It mirrors
 // SchurPreconditioner's SMW (schur_preconditioner.hpp), including the equilibrated rank test on the
 // capacitance matrix (see factorize_capacitance()), with two differences:
 //   - weights: E = H^{-1} on ALL columns (the preconditioner keeps active_K columns only);

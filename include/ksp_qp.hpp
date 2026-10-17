@@ -128,7 +128,7 @@ public:
     T alpha = 0.95;
     double time_limit = 600.0; // in seconds,  on setup_time + solve time
     bool direct_solve = false; // experimental: skip PCG and solve by LDLT on K or Cholesky on its Schur complement
-    bool direct_smw = true;    // with direct_solve: reuse the last factorization through SMW low-rank updates when the active sets change little
+    bool direct_smw = true;    // direct solver (direct_solve, or after a PCG failure): reuse the last factorization through SMW low-rank updates when the active sets change little
     T refactor_ratio = 1;      // experimental, PCG: refactorize the preconditioner once max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) since its factorization exceeds this (1: every change)
     int linesearch_fail = 0;
 
@@ -155,7 +155,7 @@ public:
     int    kkt_ldlt_fact   = 0;     // mirrors SSN::kkt_ldlt_fact: direct-solver LDLT factorizations of K
     int    schur_chol_fact = 0;     // mirrors SSN::schur_chol_fact: direct-solver Cholesky factorizations of S
     int    direct_smw_count  = 0;   // mirrors SSN::direct_smw_count: SMW updates used instead of refactorizing
-    int    direct_smw_reject = 0;   // mirrors SSN::direct_smw_reject: SMW-updated solves rejected and refactorized
+    int    direct_smw_reject = 0;   // mirrors SSN::direct_smw_reject: SMW-updated solves whose refinement missed its target, refactorized
     double setup_time      = 0.0;   // wall-clock time spent in this constructor, in seconds
     bool   setup_failed    = false; // true if an error occurred during setup
 
