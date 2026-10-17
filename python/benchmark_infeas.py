@@ -161,7 +161,7 @@ def main() -> None:
     cert.add_argument(
         "--inf-tol-factor", type=float, default=INF_TOL_FACTOR, dest="inf_tol_factor",
         help=f"QPALM/OSQP eps_prim_inf = eps_dual_inf = FACTOR * tol "
-             f"(default: {INF_TOL_FACTOR:g}, matching KSP-QP's eps_pinf = 1e-3 * tol, "
+             f"(default: {INF_TOL_FACTOR:g}, matching KSP-QP's eps_pinf = 1e-1 * tol, "
              f"so all three solvers test their certificates at the same ratio).",
     )
     cert.add_argument(

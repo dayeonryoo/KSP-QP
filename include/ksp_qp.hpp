@@ -133,8 +133,8 @@ public:
     int linesearch_fail = 0;
 
     // Primal/dual infeasibility certificate tolerances.
-    T eps_pinf = 1e-3 * tol;
-    T eps_dinf = 1e-3 * tol;
+    T eps_pinf = 1e-1 * tol;
+    T eps_dinf = 1e-1 * tol;
 
     // Updated parameters
     T mu0 = 1e0;

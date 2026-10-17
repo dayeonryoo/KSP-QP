@@ -42,11 +42,11 @@ QPALM_SOLVED = qpalm.Info.SOLVED   # == 1
 OSQP_SOLVED  = 1                   # osqp.constant("OSQP_SOLVED")
 
 # Infeasibility certificate tolerance as a multiple of tol, mirroring KSP-QP's
-# eps_pinf = eps_dinf = 1e-3 * tol (include/ksp_qp.hpp), so all three solvers test
+# eps_pinf = eps_dinf = 1e-1 * tol (include/ksp_qp.hpp), so all three solvers test
 # their Farkas certificates at the same ratio. QPALM/OSQP default to fixed constants
 # (eps_prim_inf = 1e-5 / 1e-4), which are looser than the accuracy asked for once
 # eps_abs/eps_rel are tightened; run_qpalm/run_osqp take eps_inf to keep the ratio.
-INF_TOL_FACTOR = 1e-3
+INF_TOL_FACTOR = 1e-1
 
 
 # ---------------------------------------------------------------------------

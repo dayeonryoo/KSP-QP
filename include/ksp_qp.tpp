@@ -739,7 +739,7 @@ bool KSP_QP<T>::primal_infeas(const Vec& cert_y1, const Vec& cert_y2, const Vec&
     if (cert_inf < T(100) * std::numeric_limits<T>::epsilon()) return false;
 
     // Conditions 2 and 3. 
-    const T cert_tol = T(1e5) * eps_pinf * cert_inf; // 1e2 * tol * cert_inf; noise floor for "is this component zero"
+    const T cert_tol = T(1e5) * eps_pinf * cert_inf; // 1e4 * tol * cert_inf; noise floor for "is this component zero"
     T lhs2 = T(0); // scale-invariant
     if (M > 0) lhs2 -= b.dot(cert_y1);
     for (int i = 0; i < l; ++i) {
