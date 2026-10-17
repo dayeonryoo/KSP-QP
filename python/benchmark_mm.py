@@ -13,7 +13,7 @@ Outputs
   OSQP results are kept. Joining the files on "name" and the size columns gives the former combined
   comparison table plus the problem size.
 
-  mm_kspqp.csv also has ksp_mode (pcg or direct), refactor_ratio and KSP-QP's factorization log and run-time split
+  mm_kspqp.csv also has ksp_mode (pcg or direct), refactor_ratio, rho_init and KSP-QP's factorization log and run-time split
   (experimental; see include/solve_profile.hpp): fact_<reason> (they add up to fact), smw_update,
   pcg_fail, ... and t_setup ... t_pmm_other (they add up to ssn_time, the run time). With --trace,
   KSP-QP's per-event / per-SSN-iteration / per-PMM-iteration rows go to mm_kspqp_trace_{events,ssn,pmm}.csv.
@@ -52,6 +52,7 @@ Settings: tol = 1e-6, time limit = 60 s, max iterations = infinity.
         --direct:     run KSP-QP with its direct solver instead of PCG.
         --refactor-ratio R: PCG keeps its preconditioner's factorization across mu/rho changes until
                       max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R (default: 1, every change).
+        --rho-init RHO: rho's starting value (default: the solver's own; rho_init is then empty).
         --trace:      also write KSP-QP's trace files (see Outputs).
 
   Example: rerun KSP-QP only; this prefix's QPALM and OSQP files are kept:
@@ -273,20 +274,20 @@ FIELDS = {
 
 # KSP-QP's mode and its factorization log and run-time split (experimental; include/solve_profile.hpp),
 # appended to its file: factorizations by reason (fact_*), SMW updates, and the run time by phase (t_*).
-KSPQP_EXTRA = ["ksp_mode", "refactor_ratio", "ssn_tol_achieved", "linesearch_fail", "krylov_fail", "kkt_ldlt_fact",
-               "schur_chol_fact", *ksp_qp_bind.profile_columns()]
-KSPQP_RUN = {"ksp_mode", "refactor_ratio"}  # run settings in KSPQP_EXTRA, not solver outputs
+KSPQP_EXTRA = ["ksp_mode", "refactor_ratio", "rho_init", "ssn_tol_achieved", "linesearch_fail", "krylov_fail",
+               "kkt_ldlt_fact", "schur_chol_fact", *ksp_qp_bind.profile_columns()]
+KSPQP_RUN = {"ksp_mode", "refactor_ratio", "rho_init"}  # run settings in KSPQP_EXTRA, not solver outputs
 FIELDS["ksp-qp"] += KSPQP_EXTRA
 
 # ---------------------------------------------------------------------------
 # Subprocess worker functions (each spawned in a fresh process for clean RSS)
 # ---------------------------------------------------------------------------
 
-def _worker_ssn_mm(sif_path, tol, time_limit, max_iter, direct, trace, refactor_ratio, conn):
+def _worker_ssn_mm(sif_path, tol, time_limit, max_iter, direct, trace, refactor_ratio, rho_init, conn):
     result = {}
     try:
         pd_data = ksp_qp_bind.parse_sif(sif_path)
-        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit,
+        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, rho_init=rho_init,
                                                     direct=direct, trace=trace, refactor_ratio=refactor_ratio)
     except Exception as e:
         result["error"] = str(e)
@@ -363,6 +364,10 @@ def main() -> None:
              "max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R (default: 1, every change)",
     )
     parser.add_argument(
+        "--rho-init", type=float, default=None, metavar="RHO",
+        help="Experimental: rho's starting value (default: the solver's own)",
+    )
+    parser.add_argument(
         "--trace", action="store_true",
         help="Also write KSP-QP's per-event, per-SSN-iteration and per-PMM-iteration rows to "
              "mm_kspqp_trace_{events,ssn,pmm}.csv (experimental; see include/solve_profile.hpp)",
@@ -399,9 +404,12 @@ def main() -> None:
         sys.exit("--refactor-ratio must be at least 1")
     if args.refactor_ratio > 1 and args.direct:
         print("WARNING: --refactor-ratio has no effect with --direct")
+    if args.rho_init is not None and not args.rho_init > 0:
+        sys.exit("--rho-init must be positive")
 
     print(f"tol = {tol:g}, time limit = {time_limit:g} s, ksp-qp = {ksp_mode}, "
-          f"refactor_ratio = {args.refactor_ratio}, QPALM/OSQP certificate tolerance = "
+          f"refactor_ratio = {args.refactor_ratio}, rho_init = {args.rho_init or 'default'}, "
+          f"QPALM/OSQP certificate tolerance = "
           + ("library defaults (QPALM 1e-5, OSQP 1e-4)" if eps_inf is None
              else f"{eps_inf:g} ({args.inf_tol_factor:g} * tol, matching KSP-QP)"))
 
@@ -420,6 +428,7 @@ def main() -> None:
     prov = provenance()
     run_cols = {
         "ksp-qp": {"ksp_mode": ksp_mode, "refactor_ratio": args.refactor_ratio,
+                   "rho_init": "" if args.rho_init is None else args.rho_init,
                    "ssn_tol": tol, "ssn_time_limit": time_limit,
                    "ssn_run_id": prov["run_id"], "ssn_timestamp": prov["timestamp"],
                    "ssn_host": prov["host"], "ssn_cpu": prov["cpu"], "ssn_git_sha": prov["git_sha"]},
@@ -457,7 +466,8 @@ def main() -> None:
         if "ksp-qp" in solvers:
             row: dict = {"name": name, **size}
             ssn_out = _run_isolated(_worker_ssn_mm, (sif_path, tol, time_limit, max_iter, args.direct, args.trace,
-                                                     args.refactor_ratio))
+                                                     args.refactor_ratio,
+                                                     -1.0 if args.rho_init is None else args.rho_init))
             if "error" in ssn_out:
                 print(f"  KSP-QP : ERROR — {ssn_out['error']}")
                 row.update(ssn_status=-99, ssn_solved=0, ssn_time=np.inf,

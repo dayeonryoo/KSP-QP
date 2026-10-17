@@ -48,8 +48,8 @@ Outputs
   After the instance columns, the files use benchmark_mm.py's column names (ssn_*, pmm_iter, ...
   for KSP-QP, qpalm_* for QPALM) and record their run's provenance. A line is printed per solve.
 
-  mpc_kspqp.csv also has ksp_mode (pcg or direct), refactor_ratio and KSP-QP's factorization log and
-  run-time split (experimental; see include/solve_profile.hpp). With --trace, KSP-QP's per-event /
+  mpc_kspqp.csv also has ksp_mode (pcg or direct), refactor_ratio, rho_init and KSP-QP's factorization log
+  and run-time split (experimental; see include/solve_profile.hpp). With --trace, KSP-QP's per-event /
   per-SSN-iteration / per-PMM-iteration rows go to mpc_kspqp_trace_{events,ssn,pmm}.csv.
 
 === HOW TO RUN ===
@@ -59,6 +59,7 @@ Outputs
   python3 benchmark_mpc.py --solver ksp-qp --time-limit 60
   python3 benchmark_mpc.py --solver ksp-qp --direct   # direct solver instead of PCG
   python3 benchmark_mpc.py --solver ksp-qp --refactor-ratio 4 --out rr4   # one --out per R
+  python3 benchmark_mpc.py --solver ksp-qp --rho-init 1e3 --out rho3   # rho's starting value; one --out per value
   python3 benchmark_mpc.py --loop-mode own --max-nz 20000
 """
 
@@ -172,9 +173,10 @@ def _solve_osqp_x(qpalm_data: tuple, tol: float, time_limit: float):
 
 
 def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int,
-                   direct: bool = False, trace: bool = False, refactor_ratio: float = 1.0):
+                   direct: bool = False, trace: bool = False, refactor_ratio: float = 1.0,
+                   rho_init: float | None = None):
     r = ksp_qp_bind.solve_from_data(pdd, tol, max_iter, time_limit, direct=direct, trace=trace,
-                                    refactor_ratio=refactor_ratio)
+                                    refactor_ratio=refactor_ratio, rho_init=-1.0 if rho_init is None else rho_init)
     result = {
         "ssn_status": int(r["status"]),
         "ssn_solved": int(r["status"] == 0),
@@ -190,16 +192,18 @@ def _solve_kspqp_x(pdd: dict, tol: float, time_limit: float, max_iter: int,
         "pmm_tol_achieved": float(r["pmm_tol_achieved"]),
         "ksp_mode": "direct" if direct else "pcg",
         "refactor_ratio": refactor_ratio,
-        **{k: r[k] for k in KSPQP_EXTRA if k not in ("ksp_mode", "refactor_ratio")},
+        "rho_init": "" if rho_init is None else rho_init,
+        **{k: r[k] for k in KSPQP_EXTRA if k not in ("ksp_mode", "refactor_ratio", "rho_init")},
     }
     if trace:
         result["_trace"] = {t: r[f"trace_{t}"] for t in TRACE_TABLES}
     return result, np.asarray(r["x"], dtype=np.float64)
 
 
-def _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct=False, trace=False, refactor_ratio=1.0):
+def _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct=False, trace=False, refactor_ratio=1.0,
+               rho_init=None):
     if solver_name == "ksp-qp":
-        return _solve_kspqp_x(pdd, tol, time_limit, max_iter, direct, trace, refactor_ratio)
+        return _solve_kspqp_x(pdd, tol, time_limit, max_iter, direct, trace, refactor_ratio, rho_init)
     if solver_name == "qpalm":
         return _solve_qpalm_x(kspqp_to_qpalm(pdd), tol, time_limit, pdd.get("obj_const", 0.0))
     raise ValueError(f"Unknown solver_name: {solver_name}")
@@ -260,7 +264,7 @@ def _set_high_qos():
 
 
 def _worker_rollout(sysm, N, loop_mode, xbar_source, T, reps, tol, time_limit, max_iter,
-                    solvers, direct, trace, refactor_ratio, conn):
+                    solvers, direct, trace, refactor_ratio, rho_init, conn):
     rows = {s: [] for s in solvers}
     traces = []  # (step and repeat, KSP-QP's trace tables) per traced solve
     try:
@@ -283,7 +287,7 @@ def _worker_rollout(sysm, N, loop_mode, xbar_source, T, reps, tol, time_limit, m
                     pdd = mg.generate_mpc_qp(sysm, N, xbar)
                     t0 = time.perf_counter()
                     result, x = _solve_one(solver_name, pdd, tol, time_limit, max_iter, direct, trace,
-                                           refactor_ratio)
+                                           refactor_ratio, rho_init)
                     wall = time.perf_counter() - t0
                     if "_trace" in result:
                         traces.append(({"step": t, "rep": rep}, result.pop("_trace")))
@@ -333,7 +337,7 @@ FIELDS = {
 
 # mpc_kspqp.csv also has KSP-QP's mode and its factorization log and run-time split
 # (experimental; include/solve_profile.hpp): fact_<reason>, smw_update, ..., t_<phase>.
-KSPQP_EXTRA = ["ksp_mode", "refactor_ratio", "ssn_tol_achieved", "linesearch_fail", "krylov_fail",
+KSPQP_EXTRA = ["ksp_mode", "refactor_ratio", "rho_init", "ssn_tol_achieved", "linesearch_fail", "krylov_fail",
                "kkt_ldlt_fact", "schur_chol_fact", *ksp_qp_bind.profile_columns()]
 FIELDS["ksp-qp"] += KSPQP_EXTRA
 
@@ -354,7 +358,7 @@ ERROR_ROW = {
 
 def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
                run_cols, cooldown=0.0, loop_mode="shared", direct=False, trace_paths=None,
-               refactor_ratio=1.0) -> None:
+               refactor_ratio=1.0, rho_init=None) -> None:
     sysm = mg.platoon_system(M)
     pdd0 = mg.generate_mpc_qp(sysm, N, sysm.xbar0)
     n_z = int(pdd0["n"])
@@ -372,7 +376,7 @@ def run_config(M, N, T, reps, tol, time_limit, max_iter, solvers, csv_paths,
     # Pass sysm itself, so the worker doesn't solve the DARE again.
     out = _run_isolated(_worker_rollout,
                         (sysm, N, loop_mode, xbar_source, T, reps, tol, time_limit,
-                         max_iter, solvers, direct, bool(trace_paths), refactor_ratio))
+                         max_iter, solvers, direct, bool(trace_paths), refactor_ratio, rho_init))
     if "error" in out:
         print(f"    ERROR - {out['error']}", flush=True)
         for s in solvers:
@@ -439,6 +443,9 @@ def main() -> None:
                              "changes until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R "
                              "(default: 1, every change). Rows are keyed by (M, N, loop_mode), so use one "
                              "--out per R.")
+    parser.add_argument("--rho-init", type=float, default=None, metavar="RHO",
+                        help="Experimental: rho's starting value (default: the solver's own). Use one --out "
+                             "per value.")
     parser.add_argument("--trace", action="store_true",
                         help="Also write KSP-QP's per-event, per-SSN-iteration and per-PMM-iteration "
                              "rows to mpc_kspqp_trace_{events,ssn,pmm}.csv (experimental)")
@@ -448,6 +455,8 @@ def main() -> None:
         sys.exit("--refactor-ratio must be at least 1")
     if args.refactor_ratio > 1 and args.direct:
         print("WARNING: --refactor-ratio has no effect with --direct")
+    if args.rho_init is not None and not args.rho_init > 0:
+        sys.exit("--rho-init must be positive")
 
     root = Path(args.root).resolve()
     result_dir = root / "results"
@@ -481,12 +490,13 @@ def main() -> None:
 
     print(f"run_id={prov['run_id']}  git={prov['git_sha']}  {len(configs)} configurations  "
           f"tol={args.tol:g}  solvers={','.join(solvers)}  "
-          f"ksp-qp={'direct' if args.direct else 'pcg'}  refactor_ratio={args.refactor_ratio}")
+          f"ksp-qp={'direct' if args.direct else 'pcg'}  refactor_ratio={args.refactor_ratio}  "
+          f"rho_init={args.rho_init or 'default'}")
     for i, (M, N) in enumerate(configs, 1):
         print(f"\n[{i}/{len(configs)}]")
         run_config(M, N, args.T, args.reps, args.tol, args.time_limit, max_iter,
                    solvers, csv_paths, run_cols, args.cooldown, args.loop_mode, args.direct, trace_paths,
-                   args.refactor_ratio)
+                   args.refactor_ratio, args.rho_init)
 
     print("\nResults written to: " + ", ".join(str(p) for p in csv_paths.values()))
 
