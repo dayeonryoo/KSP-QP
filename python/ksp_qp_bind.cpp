@@ -339,7 +339,7 @@ py::dict solve_from_data(const py::dict& pd_dict,
                          write_trace_path ? PrintWhen::ALWAYS : PrintWhen::NEVER,
                          write_trace_path ? PrintWhat::SSN    : PrintWhat::NONE);
         KSP_QP<T>  solver(prob);
-        // Diagnostic-only: override rho's initial value (default -1 keeps rho_limit). rho is
+        // Diagnostic-only: override rho's initial value (default -1 keeps KSP_QP::rho's). rho is
         // not in the termination checks or objective_value(), so this changes only the
         // search path, not what "converged" means.
         if (rho_init > 0.0) solver.rho = (T)rho_init;
@@ -504,8 +504,8 @@ SSN<T>::TerminationStatus enum value (0=Optimal, 1=MaxInnerIterations, 2=LineSea
 PrintWhat::SSN-level per-inner-iteration reporting, which has non-trivial overhead on
 problems with many SSN iterations.
 
-rho_init: diagnostic-only override of rho's starting value (default: rho_limit, i.e. pinned
-at its ceiling from PMM iteration 0). Does not appear in any outer termination check or in
+rho_init: diagnostic-only override of rho's starting value (default: KSP_QP::rho's initial
+value, include/ksp_qp.hpp). Does not appear in any outer termination check or in
 objective_value(), only in update_PMM_parameters()'s own schedule and SSN's H_diag/gradient,
 so it cannot corrupt what "converged" means -- only the search dynamics. Sentinel -1
 (default) leaves rho at its usual start, an exact no-op.)");
