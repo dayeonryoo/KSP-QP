@@ -140,7 +140,7 @@ public:
     T mu0 = 1e0;
     T rho0 = 1e0;
     T mu = 1e2;
-    T rho = 1e7;
+    T rho = 1e3;
     T ssn_tol = 1e-2;
 
     // Outputs:
