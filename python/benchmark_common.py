@@ -234,11 +234,12 @@ def _run_isolated(target_func, args: tuple) -> dict:
 def run_solvers(result: dict, worker_args: tuple,
                 worker_ssn, worker_qpalm, worker_osqp,
                 tol: float, time_limit: float, max_iter: int, solvers: set,
-                cooldown: float = 0.0, flush_cb=None) -> dict:
+                cooldown: float = 0.0, flush_cb=None, ssn_extra: tuple = ()) -> dict:
     """Solve one problem with all three solvers in isolated subprocesses.
 
     worker_args are the problem-defining positional args for worker_ssn/
     worker_qpalm/worker_osqp, passed ahead of (tol, time_limit[, max_iter], conn).
+    ssn_extra: further keys of KSP-QP's result copied into the row (e.g. the profile columns).
     """
     if "ksp-qp" in solvers:
         ssn_out = _run_isolated(worker_ssn, (*worker_args, tol, time_limit, max_iter))
@@ -258,7 +259,9 @@ def run_solvers(result: dict, worker_args: tuple,
                 krylov_iter=r["krylov_iter"], fact=r["fact"], smw_count=r["smw_count"],
                 pmm_tol_achieved=r["pmm_tol_achieved"],
                 ssn_obj=r["obj_val"],
+                ssn_setup_time=r["setup_time"], ssn_solve_time=r["solve_time"],
             )
+            result.update({k: r[k] for k in ssn_extra if k in r})
             ok = "OK" if r["status"] == 0 else f"status={r['status']}"
             print(f"    KSP-QP  {ok:8s}  t={r['run_time']:.2f}s  "
                   f"{r['pmm_iter']}({r['ssn_iter']})[tol={r['pmm_tol_achieved']:.2e}]  "

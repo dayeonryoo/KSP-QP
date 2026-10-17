@@ -19,6 +19,10 @@ Outputs
   results/l2_poisson_state.csv
   results/l2_convdiff_both.csv
 
+  KSP-QP's columns also record ksp_mode (pcg or direct), refactor_ratio, ssn_git_sha, its setup/solve
+  time and its factorization log and run-time split (fact_*, t_*; experimental, include/solve_profile.hpp).
+  A rerun appends rows, so use one --out per KSP-QP setting.
+
 === HOW TO RUN FROM SCRATCH ===
 
 Step 1 - Install dependencies
@@ -48,6 +52,8 @@ Settings: tol = 1e-6, time limit = 600 s (10 min), max iterations = infinity by 
         --lumped-mass: 0 to use the consistent mass matrix (default), 1 to use the lumped mass matrix.
         --discretization: 'fem' (default) or 'fd' spatial discretization for the PDE operator.
         --direct:     to run KSP-QP with its experimental direct solver instead of PCG (default: PCG).
+        --refactor-ratio R: PCG keeps its preconditioner's factorization across mu/rho changes until
+                      max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R (default: 1, every change).
 """
 
 import sys
@@ -77,6 +83,7 @@ from benchmark_common import (
     run_qpalm,
     run_osqp,
     run_solvers,
+    provenance,
     _write_csv,
     _load_existing_rows,
 )
@@ -146,13 +153,14 @@ def _generate(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_
 
 
 def _worker_ssn(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass, discretization,
-                 tol, time_limit, max_iter, conn, direct=False):
+                 tol, time_limit, max_iter, conn, direct=False, refactor_ratio=1.0):
     result = {}
     try:
         pd_data = _generate(choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass,
                              discretization)
         result["n_vars"] = pd_data["n"]
-        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, direct=direct)
+        result["res"] = ksp_qp_bind.solve_from_data(pd_data, tol, max_iter, time_limit, direct=direct,
+                                                    refactor_ratio=refactor_ratio)
     except Exception as e:
         result["error"] = str(e)
     conn.send(result)
@@ -195,8 +203,10 @@ def run_one(result: dict, choice: str, nc: int, beta: float,
             y_lower: float, y_upper: float, u_lower: float, u_upper: float,
             eps: float, lumped_mass: bool, discretization: str,
             tol: float, time_limit: float, max_iter: int, solvers: set,
-            cooldown: float = 0.0, flush_cb=None, direct: bool = False) -> dict:
-    """Solve one problem with all three solvers in isolated subprocesses."""
+            cooldown: float = 0.0, flush_cb=None, direct: bool = False, refactor_ratio: float = 1.0,
+            run_cols: dict | None = None) -> dict:
+    """Solve one problem with all three solvers in isolated subprocesses. run_cols: KSP-QP's run settings
+    and provenance, recorded on the row when KSP-QP runs."""
     n_disp = _n_display(nc)
     print(f"  {choice} nc={nc} (n={n_disp:.2e})  alpha2={beta:.0e}  "
           f"y=[{_fmt_bound(y_lower)},{_fmt_bound(y_upper)}]  "
@@ -206,9 +216,13 @@ def run_one(result: dict, choice: str, nc: int, beta: float,
 
     worker_args = (choice, nc, beta, y_lower, y_upper, u_lower, u_upper, eps, lumped_mass,
                    discretization)
-    return run_solvers(result, worker_args, functools.partial(_worker_ssn, direct=direct),
+    if "ksp-qp" in solvers:
+        result.update(run_cols or {})
+    return run_solvers(result, worker_args,
+                       functools.partial(_worker_ssn, direct=direct, refactor_ratio=refactor_ratio),
                        _worker_qpalm, _worker_osqp,
-                       tol, time_limit, max_iter, solvers, cooldown, flush_cb)
+                       tol, time_limit, max_iter, solvers, cooldown, flush_cb,
+                       ssn_extra=tuple(ksp_qp_bind.profile_columns()))
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +236,8 @@ CSV_FIELDS = [
     "krylov_iter", "fact", "smw_count", "pmm_tol_achieved", "ssn_time", "ssn_obj",
     "qpalm_status", "qpalm_solved", "qpalm_iter", "qpalm_inner_iter", "qpalm_tol_achieved", "qpalm_time", "qpalm_obj",
     "osqp_status",  "osqp_solved",  "osqp_iter",  "osqp_tol_achieved",  "osqp_time",  "osqp_obj",
+    "ksp_mode", "refactor_ratio", "ssn_git_sha", "ssn_timestamp", "ssn_setup_time", "ssn_solve_time",
+    *ksp_qp_bind.profile_columns(),
 ]
 
 
@@ -230,7 +246,7 @@ CSV_FIELDS = [
 # ---------------------------------------------------------------------------
 
 def _run_poisson_control(nc_list, betas, lumped_mass, discretization, tol, time_limit, max_iter,
-                         result_dir, solvers, cooldown, name_prefix, direct):
+                         result_dir, solvers, cooldown, name_prefix, **ksp):
     label = "poisson_control"
     csv_path = result_dir / f"{name_prefix}l2_{label}.csv"
     rows: list[dict] = _load_existing_rows(csv_path)
@@ -252,13 +268,13 @@ def _run_poisson_control(nc_list, betas, lumped_mass, discretization, tol, time_
             rows.append(row)
             run_one(row, "poisson", nc, beta, -INF, INF, 0.0, u_upper, DEFAULT_EPS, lumped_mass,
                     discretization, tol, time_limit, max_iter, solvers, cooldown, flush_cb=_flush,
-                    direct=direct)
+                    **ksp)
     print(f"  Saved: {csv_path}")
     return rows
 
 
 def _run_poisson_state(nc_list, betas, lumped_mass, discretization, tol, time_limit, max_iter,
-                       result_dir, solvers, cooldown, name_prefix, direct):
+                       result_dir, solvers, cooldown, name_prefix, **ksp):
     label = "poisson_state"
     csv_path = result_dir / f"{name_prefix}l2_{label}.csv"
     rows: list[dict] = _load_existing_rows(csv_path)
@@ -280,13 +296,13 @@ def _run_poisson_state(nc_list, betas, lumped_mass, discretization, tol, time_li
             rows.append(row)
             run_one(row, "poisson_state", nc, beta, -0.1, y_upper, -INF, INF, DEFAULT_EPS,
                     lumped_mass, discretization, tol, time_limit, max_iter, solvers, cooldown,
-                    flush_cb=_flush, direct=direct)
+                    flush_cb=_flush, **ksp)
     print(f"  Saved: {csv_path}")
     return rows
 
 
 def _run_convdiff_both(nc_list, betas, lumped_mass, discretization, tol, time_limit, max_iter,
-                       result_dir, solvers, cooldown, name_prefix, direct):
+                       result_dir, solvers, cooldown, name_prefix, **ksp):
     label = "convdiff_both"
     csv_path = result_dir / f"{name_prefix}l2_{label}.csv"
     rows: list[dict] = _load_existing_rows(csv_path)
@@ -310,7 +326,7 @@ def _run_convdiff_both(nc_list, betas, lumped_mass, discretization, tol, time_li
             rows.append(row)
             run_one(row, "convdiff", nc, beta, 0.0, y_upper, -u_bound, u_bound, DEFAULT_EPS,
                     lumped_mass, discretization, tol, time_limit, max_iter, solvers, cooldown,
-                    flush_cb=_flush, direct=direct)
+                    flush_cb=_flush, **ksp)
     print(f"  Saved: {csv_path}")
     return rows
 
@@ -348,6 +364,10 @@ def main() -> None:
     parser.add_argument("--direct",    action="store_true",
                         help="Run KSP-QP with its experimental direct solver (LDLT on K or "
                              "Cholesky on its Schur complement) instead of PCG (default: PCG)")
+    parser.add_argument("--refactor-ratio", type=float, default=1.0, metavar="R",
+                        help="Experimental, PCG: keep the preconditioner's factorization across mu/rho changes "
+                             "until max(mu/mu_f, mu_f/mu) * max(rho/rho_f, rho_f/rho) exceeds R (default: 1, "
+                             "every change)")
     parser.add_argument("--out",       default="",
                         help="Prefix for output filenames (e.g. '0727' -> '0727_l2_poisson_control.csv')")
     args = parser.parse_args()
@@ -366,20 +386,32 @@ def main() -> None:
     discretization = args.discretization
     name_prefix = f"{args.out}_" if args.out else ""
 
+    if not args.refactor_ratio >= 1:
+        sys.exit("--refactor-ratio must be at least 1")
+    if args.refactor_ratio > 1 and args.direct:
+        print("WARNING: --refactor-ratio has no effect with --direct")
+    prov = provenance()
+    ksp_mode = "direct" if args.direct else "pcg"
+    ksp = {"direct": args.direct, "refactor_ratio": args.refactor_ratio,
+           "run_cols": {"ksp_mode": ksp_mode, "refactor_ratio": args.refactor_ratio,
+                        "ssn_git_sha": prov["git_sha"], "ssn_timestamp": prov["timestamp"]}}
+    print(f"git={prov['git_sha']}  ksp-qp={ksp_mode}  refactor_ratio={args.refactor_ratio}  "
+          f"solvers={','.join(sorted(solvers))}  time limit={time_limit:g} s")
+
     if "poisson_control" in tables:
         nc_list = args.nc or TABLE1_NC
         _run_poisson_control(nc_list, TABLE1_BETAS, lumped_mass, discretization, tol, time_limit,
-                             max_iter, result_dir, solvers, cooldown, name_prefix, args.direct)
+                             max_iter, result_dir, solvers, cooldown, name_prefix, **ksp)
 
     if "poisson_state" in tables:
         nc_list = args.nc or TABLE2_NC
         _run_poisson_state(nc_list, TABLE2_BETAS, lumped_mass, discretization, tol, time_limit,
-                           max_iter, result_dir, solvers, cooldown, name_prefix, args.direct)
+                           max_iter, result_dir, solvers, cooldown, name_prefix, **ksp)
 
     if "convdiff_both" in tables:
         nc_list = args.nc or TABLE3_NC
         _run_convdiff_both(nc_list, TABLE3_BETAS, lumped_mass, discretization, tol, time_limit,
-                           max_iter, result_dir, solvers, cooldown, name_prefix, args.direct)
+                           max_iter, result_dir, solvers, cooldown, name_prefix, **ksp)
 
 
 if __name__ == "__main__":
