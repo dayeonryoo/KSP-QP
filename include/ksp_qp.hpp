@@ -81,10 +81,9 @@ public:
     SpMat L;    // Cholesky factor of general Q
     SpMat A_tr, B_tr;
 
-    SpMat Q_ruiz, A_ruiz, B_ruiz;
-    Vec problem_Q_diag, Q_diag_ruiz, c_ruiz, b_ruiz, lx_ruiz, ux_ruiz, lw_ruiz, uw_ruiz;
-    Vec D1A_diag, D1B_diag, D2_diag;
-    Vec D1A_ext, D2_ext; // extended to size N, M
+    Vec problem_Q_diag;
+    Vec D1A_diag, D1B_diag, D2_diag; // D1A_diag, D2_diag: heads of D1A_ext, D2_ext
+    Vec D1A_ext, D2_ext; // Ruiz scalings of the (lifted) problem, size M, N
     Vec D1A_ext_inv, D2_ext_inv, D1B_diag_inv; // precomputed reciprocals
     Vec c_orig, b_orig, lx_orig, ux_orig, lw_orig, uw_orig; // unscaled problem data for termination/infeasibility check
     Vec x_sol, y1_sol, y2_sol, z_sol;
@@ -210,21 +209,11 @@ public:
                 Q.makeCompressed();
             }
             c_orig = (problem.c.size() == 0) ? Vec::Zero(n) : problem.c;
-            ruiz_scaling(problem, problem_Q_diag);
-            set_default(problem);
+            set_default(problem); // lifts a general Q before scaling
+            ruiz_scaling();
 
             // Clear temporary data to save memory.
-            SpMat().swap(Q_ruiz);
-            SpMat().swap(A_ruiz);
-            SpMat().swap(B_ruiz);
             Vec().swap(problem_Q_diag);
-            Vec().swap(Q_diag_ruiz);
-            Vec().swap(c_ruiz);
-            Vec().swap(b_ruiz);
-            Vec().swap(lx_ruiz);
-            Vec().swap(ux_ruiz);
-            Vec().swap(lw_ruiz);
-            Vec().swap(uw_ruiz);
 
             initialize_sols();
             if (check_bounds()) {
@@ -247,7 +236,7 @@ public:
     void get_Q_info(const SpMat& Q);
     void determine_dimensions(const Problem<T>& problem);
     void check_dimensions(const Problem<T>& problem);
-    void ruiz_scaling(const Problem<T>& problem, const Vec& Q_diag);
+    void ruiz_scaling();
     void set_L_from_LLT(const SpMat& Q);
     static void build_reformulated_vecs(int n, int m, int N, int M, T inf,
                                         const Vec& c_in, const Vec& b_in, const Vec& lx_in, const Vec& ux_in,

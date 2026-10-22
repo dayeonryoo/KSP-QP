@@ -291,32 +291,38 @@ TEST(KspQpConstruction, ReportsPrimalInfeasibleWhenLxExceedsUx) {
 }
 
 // ===================== ruiz_scaling =====================
-// ruiz_scaling() uses only the members n/m/l/Q_info and its `problem` argument, so these tests set
-// those members on an existing instance.
+// ruiz_scaling() scales the data set_default() builds, so these tests set those members on an
+// existing instance (Q zero, so N = n and M = m).
+
+namespace {
+void SetUnscaled(KSP_QP<double>& ns, int n, int m, int l, const SpMat& A, const SpMat& B) {
+  ns.n = ns.N = n;
+  ns.m = ns.M = m;
+  ns.l = l;
+  ns.Q_info = 0;
+  ns.Q_diag = Vec(0);
+  ns.A = A;
+  ns.B = B;
+  ns.c = Vec::Zero(n);
+  ns.b = Vec::Zero(m);
+  ns.lx = Vec::Constant(n, -kInf);
+  ns.ux = Vec::Constant(n, kInf);
+  ns.lw = Vec::Constant(l, -kInf);
+  ns.uw = Vec::Constant(l, kInf);
+}
+}  // namespace
 
 TEST(RuizScaling, ReturnsImmediatelyWhenNIsZero) {
   KSP_QP<double> ns = MakeValidInstance();
-  ns.n = 0;
-  ns.m = 0;
-  ns.l = 0;
-  ns.Q_info = 0;
-  auto problem = MakeProblem(0, 0, 0, SpMat(0, 0), SpMat(0, 0), SpMat(0, 0), Vec(0), Vec(0), 0.0,
-                              Vec(0), Vec(0), Vec(0), Vec(0));
-  Vec empty_q_diag(0);
-  ns.ruiz_scaling(problem, empty_q_diag);  // must not crash on n==0
+  SetUnscaled(ns, 0, 0, 0, SpMat(0, 0), SpMat(0, 0));
+  ns.ruiz_scaling();  // must not crash on n==0
   EXPECT_EQ(ns.D2_diag.size(), 0);
 }
 
 TEST(RuizScaling, MZeroLeavesD1ADiagEmptyAndSkipsRowScalingForA) {
   KSP_QP<double> ns = MakeValidInstance();
-  ns.n = 1;
-  ns.m = 0;
-  ns.l = 0;
-  ns.Q_info = 0;
-  auto problem = MakeProblem(1, 0, 0, SpMat(0, 0), SpMat(0, 1), SpMat(0, 1), Vec::Zero(1), Vec(0),
-                              0.0, Vec(0), Vec(0), Vec(0), Vec(0));
-  Vec empty_q_diag(0);
-  ns.ruiz_scaling(problem, empty_q_diag);
+  SetUnscaled(ns, 1, 0, 0, SpMat(0, 1), SpMat(0, 1));
+  ns.ruiz_scaling();
   EXPECT_EQ(ns.D1A_diag.size(), 0);
   EXPECT_NEAR(ns.D2_diag(0), 1.0, 1e-12);  // no A/B entries at all -> col_max stays 1 -> no scaling
 }
@@ -329,22 +335,43 @@ TEST(RuizScaling, BalancesAnUnevenSingleRowMatrixInOneIteration) {
   // D1A_diag=1/10=0.1; D2_diag=[1/10,1]=[0.1,1]. Iteration 2 then sees row_max_A=[1],
   // col_max=[1,1] (both already balanced) and breaks without further scaling.
   KSP_QP<double> ns = MakeValidInstance();
-  ns.n = 2;
-  ns.m = 1;
-  ns.l = 0;
-  ns.Q_info = 0;
   SpMat A = DenseToSparse((Eigen::MatrixXd(1, 2) << 100.0, 1.0).finished());
-  auto problem = MakeProblem(2, 1, 0, SpMat(0, 0), A, SpMat(0, 2), Vec::Zero(2), Vec::Zero(1), 0.0,
-                              Vec(0), Vec(0), Vec(0), Vec(0));
-  Vec empty_q_diag(0);
-  ns.ruiz_scaling(problem, empty_q_diag);
+  SetUnscaled(ns, 2, 1, 0, A, SpMat(0, 2));
+  ns.ruiz_scaling();
 
   EXPECT_NEAR(ns.D1A_diag(0), 0.1, 1e-12);
   EXPECT_NEAR(ns.D2_diag(0), 0.1, 1e-12);
   EXPECT_NEAR(ns.D2_diag(1), 1.0, 1e-12);
   Eigen::MatrixXd expected_A(1, 2);
   expected_A << 1.0, 0.1;
-  EXPECT_TRUE(Eigen::MatrixXd(ns.A_ruiz).isApprox(expected_A, 1e-12));
+  EXPECT_TRUE(Eigen::MatrixXd(ns.A).isApprox(expected_A, 1e-12));
+}
+
+TEST(RuizScaling, ScalesTheLiftedProblemBuiltFromTheUnscaledQ) {
+  // General Q with entries of very different size: L is the factor of Q itself, and Ruiz then
+  // scales the lifted [A 0; L^T -I], so its rows end up with inf-norms near 1 instead of ~100.
+  SpMat Q = DenseToSparse((Eigen::MatrixXd(2, 2) << 1e4, 10.0, 10.0, 1.0).finished());
+  SpMat A = DenseToSparse((Eigen::MatrixXd(1, 2) << 1.0, 1.0).finished());
+  auto problem = MakeProblem(2, 1, 0, Q, A, SpMat(0, 2), Vec::Zero(2), Vec::Ones(1), 0.0,
+                              Vec::Zero(2), Vec::Constant(2, kInf), Vec(0), Vec(0));
+  KSP_QP<double> ns(problem);
+  ASSERT_FALSE(ns.setup_failed);
+  ASSERT_EQ(ns.Q_info, 2);
+
+  Eigen::MatrixXd L(ns.L);
+  EXPECT_TRUE((L * L.transpose()).isApprox(Eigen::MatrixXd(Q), 1e-10));
+
+  Eigen::MatrixXd lifted(3, 4);
+  lifted << Eigen::MatrixXd(A), Eigen::MatrixXd::Zero(1, 2),
+            L.transpose(), -Eigen::MatrixXd::Identity(2, 2);
+  Eigen::MatrixXd expected = ns.D1A_ext.asDiagonal() * lifted * ns.D2_ext.asDiagonal();
+  EXPECT_TRUE(Eigen::MatrixXd(ns.A).isApprox(expected, 1e-12));
+  for (int i = 0; i < 3; ++i) EXPECT_LT(Eigen::MatrixXd(ns.A).row(i).cwiseAbs().maxCoeff(), 1.1);
+
+  // The v columns are never rescaled (their only entry is -1 times a row scaling <= 1), so the
+  // scaled Hessian keeps its identity block.
+  EXPECT_TRUE(ns.D2_ext.tail(2).isApprox(Vec::Ones(2)));
+  EXPECT_TRUE(ns.Q_diag.tail(2).isApprox(Vec::Ones(2)));
 }
 
 // ===================== set_L_from_LLT =====================
@@ -623,11 +650,12 @@ TEST(ComputeResidualUnscaledInfNorms, DualResidualIncludesQxTermWhenQInfoNonzero
 
 TEST(ComputeResidualUnscaledInfNorms, DualResidualUnaffectedByNullDirectionMagnitudeWhenQInfoIsTwo) {
   // Index 2 has zero row/column in Q, i.e. L's row 2 is exactly zero.
-  // With A = I and c, b = 0, the dual residual c+z-A_ruiz^T*y1_top-L*y_v=0 must vanish
-  // regardless of x_head(2)'s magnitude.
+  // With A = I and c, b = 0, the dual residual c+z-A^T*y1_top-L*y_v=0 must vanish
+  // regardless of x_head(2)'s magnitude. L's entries are at most 1, so Ruiz leaves the lifted
+  // problem unscaled.
   SpMat Q = DenseToSparse((Eigen::MatrixXd(3, 3) <<
-                            4.0, 1.0, 0.0,
-                            1.0, 3.0, 0.0,
+                            1.0, 0.25, 0.0,
+                            0.25, 0.75, 0.0,
                             0.0, 0.0, 0.0).finished());
   SpMat A = DenseToSparse(Eigen::MatrixXd::Identity(3, 3));
   Vec c = Vec::Zero(3);

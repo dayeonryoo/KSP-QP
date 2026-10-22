@@ -117,11 +117,12 @@ void KSP_QP<T>::check_dimensions(const Problem<T>& problem) {
 }
 
 template <typename T>
-void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_diag) {
+void KSP_QP<T>::ruiz_scaling() {
     /*
+    Scales the problem built by set_default() in place, lifted if Q is general:
     drA = Diag(sqrt(||A_{i.}||_inf))_i; drB = Diag(sqrt(||B_{i.}||_inf))_i; dc = Diag(sqrt(||[A; B; I]_{.j}||_inf))_j;
     D1A <- D1A / drA; D1B <- D1B / drB; D2 <- D2 / dc;
-    A <- D1A A D2; B <- D1B B D2; c <- D2 c; b <- D1A b; (lx ux) <- D2^{-1} (lx, ux); (lw, uw) <- D1B (lw, uw).
+    A <- D1A A D2; B <- D1B B D2; Q <- D2 Q D2; c <- D2 c; b <- D1A b; (lx ux) <- D2^{-1} (lx, ux); (lw, uw) <- D1B (lw, uw).
 
     Given scaled (x, y1, y2, z), unscale them as follows:
     x_unscaled = D2 x; y1_unscaled = D1A y1; y2_unscaled = D1B y2; z_unscaled = D2^{-1} z.
@@ -131,37 +132,20 @@ void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_dia
 
     const T eps = std::sqrt(std::numeric_limits<T>::epsilon()); // for sqrt of near-zero row/column max.
 
-    A_ruiz = problem.A;
-    B_ruiz = problem.B;
-    c_ruiz = problem.c;
-    b_ruiz = problem.b;
-    lx_ruiz = problem.lx;
-    ux_ruiz = problem.ux;
-    lw_ruiz = problem.lw;
-    uw_ruiz = problem.uw;
-
-    if (Q_info == 2) {
-        Q_ruiz = problem.Q;
-    } else {
-        Q_diag_ruiz = problem_Q_diag;
-    }
-
-    D2_diag = Vec::Ones(n);  // Column scalings for x
-    D1A_diag = Vec::Ones(m); // Row scalings for equality constraint matrix A
+    D2_ext = Vec::Ones(N);   // Column scalings for x
+    D1A_ext = Vec::Ones(M);  // Row scalings for equality constraint matrix A
     D1B_diag = Vec::Ones(l); // Row scalings for box constraint matrix B
 
-    if (n == 0) return;
-
-    for (int k = 0; k < kMaxRuizIter; ++k) {
+    for (int k = 0; k < kMaxRuizIter && N > 0; ++k) {
 
         // Compute row-/column-wise infinity norms of constraint matrices.
-        Vec row_max_A = Vec::Zero(m); // row_max(i) = max_j |A(i,j)|
+        Vec row_max_A = Vec::Zero(M); // row_max(i) = max_j |A(i,j)|
         Vec row_max_B = Vec::Zero(l); // row_max(i) = max_j |B(i,j)|
-        Vec col_max = Vec::Ones(n);   // col_max(j) = max_i |[A; B; I](i,j)| (starts at 1 due to I)
+        Vec col_max = Vec::Ones(N);   // col_max(j) = max_i |[A; B; I](i,j)| (starts at 1 due to I)
 
         // Contribution from A.
-        for (int col = 0; col < n; ++col) {
-            for (typename SpMat::InnerIterator it(A_ruiz, col); it; ++it) {
+        for (int col = 0; col < N; ++col) {
+            for (typename SpMat::InnerIterator it(A, col); it; ++it) {
                 const int i = it.row();
                 const T val = std::abs(it.value());
                 if (val > row_max_A(i)) row_max_A(i) = val;
@@ -170,8 +154,8 @@ void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_dia
         }
 
         // Contribution from B.
-        for (int col = 0; col < n; ++col) {
-            for (typename SpMat::InnerIterator it(B_ruiz, col); it; ++it) {
+        for (int col = 0; col < N; ++col) {
+            for (typename SpMat::InnerIterator it(B, col); it; ++it) {
                 const int i = it.row();
                 const T val = std::abs(it.value());
                 if (val > row_max_B(i)) row_max_B(i) = val;
@@ -181,16 +165,16 @@ void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_dia
 
         // Check convergence on [A; B; I].
         T row_dev = T(0);
-        if (m > 0) row_dev = std::max(row_dev, (row_max_A.array() - T(1)).abs().maxCoeff());
+        if (M > 0) row_dev = std::max(row_dev, (row_max_A.array() - T(1)).abs().maxCoeff());
         if (l > 0) row_dev = std::max(row_dev, (row_max_B.array() - T(1)).abs().maxCoeff());
         T col_dev = (col_max.array() - T(1)).abs().maxCoeff();
         if (row_dev < kRuizTol && col_dev < kRuizTol) break;
 
         // Scaling factors: dr, dc = sqrt(max_norms).
-        Vec drA(m), drA_inv(m);
+        Vec drA(M), drA_inv(M);
         Vec drB(l), drB_inv(l);
-        Vec dc(n),  dc_inv(n);
-        for (int i = 0; i < m; ++i) {
+        Vec dc(N),  dc_inv(N);
+        for (int i = 0; i < M; ++i) {
             drA(i)     = (row_max_A(i) > eps) ? std::sqrt(row_max_A(i)) : T(1);
             drA_inv(i) = T(1) / drA(i);
         }
@@ -198,23 +182,23 @@ void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_dia
             drB(i)     = (row_max_B(i) > eps) ? std::sqrt(row_max_B(i)) : T(1);
             drB_inv(i) = T(1) / drB(i);
         }
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0; j < N; ++j) {
             dc(j)     = (col_max(j) > eps) ? std::sqrt(col_max(j)) : T(1);
             dc_inv(j) = T(1) / dc(j);
         }
 
         // Scale A: A <- D1A A D2.
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0; j < N; ++j) {
             const T col_fac = dc_inv(j);
-            for (typename SpMat::InnerIterator it(A_ruiz, j); it; ++it) {
+            for (typename SpMat::InnerIterator it(A, j); it; ++it) {
                 const T row_fac = drA_inv(it.row());
                 it.valueRef() *= row_fac * col_fac;
             }
         }
         // Scale B: B <- D1B B D2.
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0; j < N; ++j) {
             const T col_fac = dc_inv(j);
-            for (typename SpMat::InnerIterator it(B_ruiz, j); it; ++it) {
+            for (typename SpMat::InnerIterator it(B, j); it; ++it) {
                 const T row_fac = drB_inv(it.row());
                 it.valueRef() *= row_fac * col_fac;
             }
@@ -222,53 +206,41 @@ void KSP_QP<T>::ruiz_scaling(const Problem<T>& problem, const Vec& problem_Q_dia
 
         // Scale I: I <- D1 I D2, represented through the variable substitution and scaling of lx, ux below.
 
-        // Scale Q if Q is nonzero: Q <- D2 Q D2.
-        if (Q_info == 2) {
-            for (int j = 0; j < n; ++j) {
-                const T col_fac = dc_inv(j);
-                for (typename SpMat::InnerIterator it(Q_ruiz, j); it; ++it) {
-                    const T row_fac = dc_inv(it.row());
-                    it.valueRef() *= row_fac * col_fac; // Q_ij *= 1/dc_i * 1/dc_j
-                }
-            }
-        } else if (Q_info == 1) {
-            Q_diag_ruiz.array() *= dc_inv.array().square(); // Q_ii *= 1/dc_i * 1/dc_i
-        }
+        // Scale Q if Q is nonzero: Q <- D2 Q D2. Q is diagonal here (lifted if general).
+        if (Q_info != 0) Q_diag.array() *= dc_inv.array().square(); // Q_ii *= 1/dc_i * 1/dc_i
 
         // Scale c: c <- D2 c.
-        if (c_ruiz.size() == n) c_ruiz.array() *= dc_inv.array();
+        c.array() *= dc_inv.array();
 
         // Scale b: b <- D1A b.
-        if (b_ruiz.size() == m) b_ruiz.array() *= drA_inv.array();
+        b.array() *= drA_inv.array();
 
         // Scale lw, uw: (lw, uw) <- D1B (lw, uw).
-        const bool has_lw = (lw_ruiz.size() == l);
-        const bool has_uw = (uw_ruiz.size() == l);
-        if (has_lw || has_uw) {
-            for (int i = 0; i < l; ++i) {
-                const T di = drB_inv(i);
-                if (has_lw && lw_ruiz(i) > -inf) lw_ruiz(i) *= di;
-                if (has_uw && uw_ruiz(i) <  inf) uw_ruiz(i) *= di;
-            }
+        for (int i = 0; i < l; ++i) {
+            const T di = drB_inv(i);
+            if (lw(i) > -inf) lw(i) *= di;
+            if (uw(i) <  inf) uw(i) *= di;
         }
 
         // Scale lx, ux: (lx, ux) <- D2^{-1} (lx, ux).
-        const bool has_lx = (lx_ruiz.size() == n);
-        const bool has_ux = (ux_ruiz.size() == n);
-        if (has_lx || has_ux) {
-            for (int i = 0; i < n; ++i) {
-                const T di = dc(i);
-                if (has_lx && lx_ruiz(i) > -inf) lx_ruiz(i) *= di;
-                if (has_ux && ux_ruiz(i) <  inf) ux_ruiz(i) *= di;
-            }
+        for (int i = 0; i < N; ++i) {
+            const T di = dc(i);
+            if (lx(i) > -inf) lx(i) *= di;
+            if (ux(i) <  inf) ux(i) *= di;
         }
 
         // Accumulate scaling factors (D <- D / diag(d)).
-        if (m > 0) D1A_diag.array() *= drA_inv.array();
+        if (M > 0) D1A_ext.array() *= drA_inv.array();
         if (l > 0) D1B_diag.array() *= drB_inv.array();
-        D2_diag.array() *= dc_inv.array();
+        D2_ext.array() *= dc_inv.array();
 
     }
+
+    D2_diag = D2_ext.head(n);
+    D1A_diag = D1A_ext.head(m);
+    D1A_ext_inv = D1A_ext.cwiseInverse();
+    D2_ext_inv = D2_ext.cwiseInverse();
+    D1B_diag_inv = D1B_diag.cwiseInverse();
 }
 
 template <typename T>
@@ -438,32 +410,36 @@ void KSP_QP<T>::set_default(const Problem<T>& problem) {
     using SpMat   = Eigen::SparseMatrix<T>;
     using Triplet = Eigen::Triplet<T>;
 
+    // Unscaled data; ruiz_scaling() scales it afterwards.
+    const bool has_A = problem.A.rows() != 0 && problem.A.cols() != 0;
+    const bool has_B = problem.B.rows() != 0 && problem.B.cols() != 0;
+
     // For general real, symmetric positive semidefinite Q, we use the reformulation:
     if (Q_info == 2) {
         N = 2 * n; M = m + n;
 
-        // L s.t. Q_ruiz = LL^T
-        set_L_from_LLT(Q_ruiz);
+        // L s.t. Q = LL^T, factorized before scaling
+        set_L_from_LLT(Q);
 
         // Q = [0 0; 0 I_n]
         Q_diag.resize(N);
         Q_diag << Vec::Zero(n), Vec::Ones(n);
 
-        // A = [A_ruiz, 0; L^T, -I]
+        // A = [A, 0; L^T, -I]
         A.resize(M, N);
         {
             std::vector<Triplet> trip;
-            trip.reserve(A_ruiz.nonZeros() + L.nonZeros() + n);
+            trip.reserve(problem.A.nonZeros() + L.nonZeros() + n);
 
-            // Top-left block: A (Ruiz scaled)
-            if (A_ruiz.rows() != 0 && A_ruiz.cols() != 0) {
+            // Top-left block: A
+            if (has_A) {
                 for (int k = 0; k < n; ++k) {
-                    for (typename SpMat::InnerIterator it(A_ruiz, k); it; ++it) {
+                    for (typename SpMat::InnerIterator it(problem.A, k); it; ++it) {
                         trip.emplace_back(it.row(), it.col(), it.value());
                     }
                 }
             }
-            // Bottom-left block: L^T (from Ruiz scaled Q)
+            // Bottom-left block: L^T
             for (int k = 0; k < n; ++k) {
                 for (typename SpMat::InnerIterator it(L, k); it; ++it) {
                     trip.emplace_back(m + it.col(), it.row(), it.value());
@@ -476,15 +452,15 @@ void KSP_QP<T>::set_default(const Problem<T>& problem) {
             A.setFromTriplets(trip.begin(), trip.end());
         }
 
-        // B = [B_ruiz, 0]
+        // B = [B, 0]
         B.resize(l, N);
         {
             std::vector<Triplet> trip;
-            trip.reserve(B_ruiz.nonZeros());
+            trip.reserve(problem.B.nonZeros());
 
-            if (B_ruiz.rows() != 0 && B_ruiz.cols() != 0) {
+            if (has_B) {
                 for (int k = 0; k < n; ++k) {
-                    for (typename SpMat::InnerIterator it(B_ruiz, k); it; ++it) {
+                    for (typename SpMat::InnerIterator it(problem.B, k); it; ++it) {
                         trip.emplace_back(it.row(), it.col(), it.value());
                     }
                 }
@@ -495,49 +471,16 @@ void KSP_QP<T>::set_default(const Problem<T>& problem) {
     } else { // Q is diagonal or zero; no reformulation needed.
         N = n; M = m;
 
-        Q_diag = Q_diag_ruiz;
-
-        if (problem.A.rows() == 0 || problem.A.cols() == 0) {
-            A = SpMat(M, N);
-        } else {
-            A = A_ruiz;
-        }
-
-        if (problem.B.rows() == 0 || problem.B.cols() == 0) {
-            B = SpMat(l, N);
-        } else {
-            B = B_ruiz;
-        }
+        Q_diag = problem_Q_diag;
+        A = has_A ? problem.A : SpMat(M, N);
+        B = has_B ? problem.B : SpMat(l, N);
     }
 
-    // Set up scaled and unscaled data, reformulated in case of general non-diagonal Q.
-    build_reformulated_vecs(n, m, N, M, inf, c_ruiz, b_ruiz, lx_ruiz, ux_ruiz, c, b, lx, ux);
-    Vec place_holder;
-    build_reformulated_vecs(n, m, N, M, inf, problem.c, problem.b, problem.lx, problem.ux, place_holder, b_orig, lx_orig, ux_orig);
-
-    // lw, uw remain the same for any Q.
-    if (problem.lw.size() == 0) {
-        lw = Vec::Constant(l, -inf);
-        lw_orig = Vec::Constant(l, -inf);
-    } else {
-        lw = lw_ruiz;
-        lw_orig = problem.lw;
-    }
-    if (problem.uw.size() == 0) {
-        uw = Vec::Constant(l, inf);
-        uw_orig = Vec::Constant(l, inf);
-    } else {
-        uw = uw_ruiz;
-        uw_orig = problem.uw;
-    }
-
-    // Extended scaling vectors for general Q reformulation.
-    D1A_ext = Vec::Ones(M); D1A_ext.head(m) = D1A_diag;
-    D2_ext = Vec::Ones(N); D2_ext.head(n) = D2_diag;
-    D1A_ext_inv = D1A_ext.cwiseInverse();
-    D2_ext_inv = D2_ext.cwiseInverse();
-    D1B_diag_inv = D1B_diag.cwiseInverse();
-
+    // Vectors, reformulated in case of general non-diagonal Q; *_orig stay unscaled for the checks.
+    build_reformulated_vecs(n, m, N, M, inf, problem.c, problem.b, problem.lx, problem.ux, c, b, lx, ux);
+    if (problem.lw.size() == 0) lw = Vec::Constant(l, -inf); else lw = problem.lw;
+    if (problem.uw.size() == 0) uw = Vec::Constant(l, inf);  else uw = problem.uw;
+    b_orig = b; lx_orig = lx; ux_orig = ux; lw_orig = lw; uw_orig = uw;
 }
 
 template <typename T>
@@ -788,7 +731,7 @@ bool KSP_QP<T>::dual_infeas(const Vec& delta_x, const Vec& Adx, const Vec& Bdx) 
     For general Q, delta_x = [delta_x_hat; delta_v] is the lifted change, but the certificate is
     checked on the original problem: delta_v and the L^T delta_x_hat - delta_v rows of Adx are
     ignored, ||delta_x||_inf is taken over the original n variables, and condition 1 uses the stored
-    original Q, as D2^{-1} Q_hat delta_x_hat = Q (D2 delta_x_hat).
+    original Q.
 
     Infeasibility is determined in unscaled scope.
     */
